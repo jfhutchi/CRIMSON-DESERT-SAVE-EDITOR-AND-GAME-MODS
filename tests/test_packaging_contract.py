@@ -39,3 +39,12 @@ def test_windows_docs_use_isolated_python_and_fixture_copy_only() -> None:
     assert "Microsoft Visual C++ 2015-2022 Redistributable (x64)" in docs
     assert "crimson_rs" in docs
     assert "not published on PyPI" in docs
+
+
+def test_game_mods_packages_dragon_wheel_modules() -> None:
+    spec = (ROOT / "CrimsonGameMods" / "CrimsonGameMods.spec").read_text(
+        encoding="utf-8"
+    )
+    assert "'dragon_wheel_patch'" in spec
+    assert "'dragon_wheel_deploy'" in spec
+    assert "'gui.tabs.reserveslot'" in spec
