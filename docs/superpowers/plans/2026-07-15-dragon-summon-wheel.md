@@ -406,7 +406,7 @@ def test_apply_creates_backup_marker_and_preserves_papgt(tmp_path, fake_crimson_
     backup_root = tmp_path / "backups"
     receipt = deploy_dragon_wheel(
         game_path=game,
-        overlay_group="0066",
+        overlay_group="0067",
         patch_result=patch_result,
         backup_root=backup_root,
         crimson_rs_module=fake_crimson_rs,
@@ -414,15 +414,15 @@ def test_apply_creates_backup_marker_and_preserves_papgt(tmp_path, fake_crimson_
     )
     assert receipt.backup_dir == backup_root / "20260715-210000"
     assert (receipt.backup_dir / "0.papgt").is_file()
-    assert (game / "0066" / ".se_dragon_wheel").is_file()
-    assert registered_groups(game, fake_crimson_rs) == {"0008", "0042", "0066"}
+    assert (game / "0067" / ".se_dragon_wheel").is_file()
+    assert registered_groups(game, fake_crimson_rs) == {"0008", "0042", "0067"}
 
 
 def test_apply_refuses_unmarked_existing_overlay(tmp_path, fake_crimson_rs, patch_result):
-    game = make_game_tree(tmp_path, groups=["0008", "0066"])
+    game = make_game_tree(tmp_path, groups=["0008", "0067"])
     with pytest.raises(DragonWheelDeploymentError, match="not owned"):
         deploy_dragon_wheel(
-            game, "0066", patch_result, tmp_path / "backups",
+            game, "0067", patch_result, tmp_path / "backups",
             fake_crimson_rs, "20260715-210000"
         )
 
@@ -432,17 +432,17 @@ def test_apply_rolls_back_after_papgt_failure(tmp_path, failing_crimson_rs, patc
     original_papgt = (game / "meta" / "0.papgt").read_bytes()
     with pytest.raises(DragonWheelDeploymentError, match="rolled back"):
         deploy_dragon_wheel(
-            game, "0066", patch_result, tmp_path / "backups",
+            game, "0067", patch_result, tmp_path / "backups",
             failing_crimson_rs, "20260715-210000"
         )
     assert (game / "meta" / "0.papgt").read_bytes() == original_papgt
-    assert not (game / "0066").exists()
+    assert not (game / "0067").exists()
 
 
 def test_restore_refuses_foreign_overlay(tmp_path, fake_crimson_rs):
-    game = make_game_tree(tmp_path, groups=["0008", "0066"])
+    game = make_game_tree(tmp_path, groups=["0008", "0067"])
     with pytest.raises(DragonWheelDeploymentError, match="ownership marker"):
-        restore_dragon_wheel(game, "0066", fake_crimson_rs)
+        restore_dragon_wheel(game, "0067", fake_crimson_rs)
 ```
 
 - [ ] **Step 2: Run deployer tests and verify RED**
@@ -659,21 +659,22 @@ def restore_dragon_wheel(
 
 
 def _validate_group(group: str) -> str:
-    if len(group) != 4 or not group.isdigit() or int(group) < 36:
+    if group != "0067":
         raise DragonWheelDeploymentError(
-            f"Overlay group must be four digits and outside vanilla range: {group}"
+            f"Dragon Wheel must use reserved group 0067, not {group}"
         )
     return group
 ```
 
-Build the PAZ in a temporary directory before mutation. Require a non-vanilla
-four-digit group. Refuse an existing directory without `.se_dragon_wheel`.
+Build the PAZ in a temporary directory before mutation. Require the dedicated
+group 0067 because 0066 is already owned by ItemBuffs. Refuse an existing
+directory without `.se_dragon_wheel`.
 Back up PAPGT and any owned overlay before mutation. Write and parse a temporary
 PAPGT, verify all prior groups remain, then atomically replace live PAPGT. Roll
 back PAPGT and the overlay on every failure. Restore must remove only a marked
 overlay and its PAPGT entry.
 
-Add `"0066": "Dragon Wheel (reserveslot)"` to
+Add `"0067": "Dragon Wheel (reserveslot)"` to
 `overlay_coordinator.OUR_GROUPS`, and call `pre_write`, `post_write`,
 `pre_restore`, and `post_restore` at the documented transaction boundaries.
 

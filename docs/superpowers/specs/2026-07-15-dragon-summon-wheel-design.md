@@ -128,7 +128,7 @@ The tab contains:
   in memory and reports the exact category and offset changes;
 - `Apply Dragon Wheel Patch`, disabled until a successful preview for the same
   source hashes;
-- an overlay group selector defaulting to 66; and
+- the fixed Dragon-only overlay group 0067 (0066 is reserved for ItemBuffs); and
 - `Restore Dragon Wheel Patch`, which removes only an overlay carrying this
   feature's ownership marker.
 
@@ -148,8 +148,9 @@ The transaction is:
 
 1. Re-extract and revalidate the supported source bytes.
 2. Rebuild the same in-memory candidate and compare it with the preview hashes.
-3. Resolve an unused non-vanilla overlay group. Never overwrite an unmarked
-   directory or a group owned by another tool.
+3. Require the dedicated 0067 overlay group. Never overwrite an unmarked
+   directory or a group owned by another tool, and never use ItemBuffs group
+   0066.
 4. Build `reserveslot.pabgb` and `reserveslot.pabgh` into a temporary PAZ group.
 5. Validate the generated PAMT checksum before touching the game directory.
 6. Create a timestamped backup directory next to the executable under
@@ -167,7 +168,7 @@ success message.
 
 ## Restore
 
-Restore must refuse unless the selected overlay contains `.se_dragon_wheel` and
+Restore must refuse unless overlay 0067 contains `.se_dragon_wheel` and
 the shared state does not identify another owner.
 
 Restore removes only that overlay's PAPGT entry and directory while preserving
@@ -178,7 +179,7 @@ for manual recovery.
 ## Logging
 
 Log source hashes, schema decision, analysis result, preview candidate hashes,
-selected overlay group, backup path, PAZ build result, PAPGT verification,
+fixed overlay group, backup path, PAZ build result, PAPGT verification,
 rollback, restore, and final success. Do not log arbitrary game-file contents.
 
 ## Testing
@@ -220,4 +221,3 @@ call the apply transaction.
 - Restore removes only the marked Dragon Wheel overlay.
 - The packaged `CrimsonGameMods.exe` visibly includes the `Dragon Wheel` tab.
 - All automated tests and the read-only installed-file integration check pass.
-

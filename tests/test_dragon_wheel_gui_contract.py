@@ -36,6 +36,19 @@ def test_tab_exposes_only_the_focused_dragon_workflow() -> None:
     assert "Does not edit save files or quest flags" in source
 
 
+def test_dragon_overlay_does_not_collide_with_itembuffs() -> None:
+    tab_source = (
+        ROOT / "CrimsonGameMods" / "gui" / "tabs" / "reserveslot.py"
+    ).read_text(encoding="utf-8")
+    coordinator_source = (
+        ROOT / "CrimsonGameMods" / "overlay_coordinator.py"
+    ).read_text(encoding="utf-8")
+
+    assert "OVERLAY_GROUP = DRAGON_OVERLAY_GROUP" in tab_source
+    assert '"0066": "ItemBuffs (index files)"' in coordinator_source
+    assert '"0067": "Dragon Wheel (reserveslot)"' in coordinator_source
+
+
 def test_apply_starts_disabled_and_path_change_invalidates_preview() -> None:
     app = QApplication.instance() or QApplication([])
     tab = ReserveSlotTab({}, lambda: "")

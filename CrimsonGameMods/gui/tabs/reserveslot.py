@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from dragon_wheel_deploy import (
+    DRAGON_OVERLAY_GROUP,
     INTERNAL_DIR,
     MARKER_NAME,
     DragonWheelDeploymentError,
@@ -37,7 +38,7 @@ from dragon_wheel_patch import (
 from gui.theme import COLORS
 
 
-OVERLAY_GROUP = "0066"
+OVERLAY_GROUP = DRAGON_OVERLAY_GROUP
 
 log = logging.getLogger(__name__)
 

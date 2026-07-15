@@ -18,6 +18,7 @@ from dragon_wheel_patch import DragonWheelPatchResult
 
 INTERNAL_DIR = "gamedata/binary__/client/bin"
 MARKER_NAME = ".se_dragon_wheel"
+DRAGON_OVERLAY_GROUP = "0067"
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +104,11 @@ def deploy_dragon_wheel(
                 raise DragonWheelDeploymentError("PAZ builder did not produce 0.paz")
             if not (build_overlay / "0.pamt").is_file():
                 raise DragonWheelDeploymentError("PAZ builder did not produce 0.pamt")
+            log.info(
+                "Dragon Wheel: built candidate overlay %s with PAMT checksum %s",
+                group,
+                checksum,
+            )
             (build_overlay / MARKER_NAME).write_text(
                 json.dumps(
                     {
@@ -120,6 +126,11 @@ def deploy_dragon_wheel(
             shutil.copy2(papgt_path, backup_dir / "0.papgt")
             if original_overlay_existed:
                 shutil.copytree(live_overlay, backup_dir / group)
+            log.info(
+                "Dragon Wheel: backed up PAPGT%s to %s",
+                " and the prior owned overlay" if original_overlay_existed else "",
+                backup_dir,
+            )
 
             before_doc = crimson_rs_module.parse_papgt_file(str(papgt_path))
             before_entries = list(before_doc.get("entries", []))
@@ -147,10 +158,16 @@ def deploy_dragon_wheel(
             verified_foreign = [
                 entry for entry in verified_entries if _entry_group(entry) != group
             ]
-            if verified_foreign != foreign_entries:
+            if _normalized_entries(verified_foreign) != _normalized_entries(
+                foreign_entries
+            ):
                 raise DragonWheelDeploymentError(
                     "Temporary PAPGT did not preserve every foreign entry"
                 )
+            log.info(
+                "Dragon Wheel: verified temporary PAPGT with %d preserved entries",
+                len(verified_foreign),
+            )
 
             shutil.copytree(build_overlay, staged_live)
 
@@ -160,6 +177,7 @@ def deploy_dragon_wheel(
         live_replaced = True
         os.replace(papgt_temp, papgt_path)
         papgt_replaced = True
+        log.info("Dragon Wheel: atomically installed overlay %s and PAPGT", group)
 
         coordinator.post_write(
             str(game),
@@ -169,7 +187,13 @@ def deploy_dragon_wheel(
             owner="CrimsonGameMods",
         )
         if rollback_overlay.exists():
-            shutil.rmtree(rollback_overlay)
+            try:
+                shutil.rmtree(rollback_overlay)
+            except OSError as exc:
+                log.warning(
+                    "Could not remove Dragon Wheel rollback directory after commit: %s",
+                    exc,
+                )
 
         return DeploymentReceipt(
             overlay_group=group,
@@ -180,19 +204,26 @@ def deploy_dragon_wheel(
             candidate_pabgb_sha256=patch_result.report.output_pabgb_sha256,
         )
     except Exception as exc:
-        papgt_temp.unlink(missing_ok=True)
-        if staged_live.exists():
-            shutil.rmtree(staged_live)
-        if papgt_replaced and (backup_dir / "0.papgt").is_file():
-            _atomic_restore_file(backup_dir / "0.papgt", papgt_path)
-        if live_replaced and live_overlay.exists():
-            shutil.rmtree(live_overlay)
-        if rollback_overlay.exists():
-            os.replace(rollback_overlay, live_overlay)
+        rollback_errors = _rollback_deployment(
+            papgt_temp=papgt_temp,
+            staged_live=staged_live,
+            papgt_replaced=papgt_replaced,
+            papgt_backup=backup_dir / "0.papgt",
+            papgt_path=papgt_path,
+            live_replaced=live_replaced,
+            live_overlay=live_overlay,
+            rollback_overlay=rollback_overlay,
+        )
+        if rollback_errors:
+            detail = "; rollback incomplete: " + "; ".join(rollback_errors)
+            log.error("Dragon Wheel deployment rollback incomplete: %s", detail)
+        else:
+            detail = "; rolled back"
+            log.warning("Dragon Wheel: deployment failed and was rolled back: %s", exc)
         if isinstance(exc, DragonWheelDeploymentError):
-            raise DragonWheelDeploymentError(f"{exc}; rolled back") from exc
+            raise DragonWheelDeploymentError(f"{exc}{detail}") from exc
         raise DragonWheelDeploymentError(
-            f"Deployment failed and rolled back: {exc}"
+            f"Deployment failed: {exc}{detail}"
         ) from exc
 
 
@@ -238,7 +269,9 @@ def restore_dragon_wheel(
         crimson_rs_module.write_papgt_file(document, str(papgt_temp))
         verified = crimson_rs_module.parse_papgt_file(str(papgt_temp))
         verified_entries = list(verified.get("entries", []))
-        if verified_entries != remaining_entries:
+        if _normalized_entries(verified_entries) != _normalized_entries(
+            remaining_entries
+        ):
             raise DragonWheelDeploymentError(
                 "Temporary PAPGT did not preserve the remaining entries"
             )
@@ -251,6 +284,7 @@ def restore_dragon_wheel(
         os.replace(papgt_temp, papgt_path)
         papgt_replaced = True
         coordinator.post_restore(str(game), group)
+        log.info("Dragon Wheel: removed overlay %s and updated PAPGT", group)
 
         try:
             shutil.rmtree(rollback_overlay)
@@ -258,26 +292,41 @@ def restore_dragon_wheel(
             log.warning("Could not remove Dragon Wheel rollback directory: %s", exc)
         return remaining
     except Exception as exc:
-        papgt_temp.unlink(missing_ok=True)
+        rollback_errors: list[str] = []
+        try:
+            papgt_temp.unlink(missing_ok=True)
+        except OSError as rollback_exc:
+            rollback_errors.append(f"temporary PAPGT cleanup failed: {rollback_exc}")
         if papgt_replaced:
-            restore_temp = papgt_path.with_name(
-                f".0.papgt.dragon-wheel-restore-{uuid.uuid4().hex}.tmp"
-            )
-            restore_temp.write_bytes(original_papgt)
-            os.replace(restore_temp, papgt_path)
+            try:
+                restore_temp = papgt_path.with_name(
+                    f".0.papgt.dragon-wheel-restore-{uuid.uuid4().hex}.tmp"
+                )
+                restore_temp.write_bytes(original_papgt)
+                os.replace(restore_temp, papgt_path)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"PAPGT restore failed: {rollback_exc}")
         if overlay_moved and rollback_overlay.exists() and not overlay.exists():
-            os.replace(rollback_overlay, overlay)
+            try:
+                os.replace(rollback_overlay, overlay)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"overlay restore failed: {rollback_exc}")
+        detail = (
+            "; rollback incomplete: " + "; ".join(rollback_errors)
+            if rollback_errors
+            else "; rolled back"
+        )
         if isinstance(exc, DragonWheelDeploymentError):
-            raise
+            raise DragonWheelDeploymentError(f"{exc}{detail}") from exc
         raise DragonWheelDeploymentError(
-            f"Restore failed and rolled back: {exc}"
+            f"Restore failed: {exc}{detail}"
         ) from exc
 
 
 def _validate_group(group: str) -> str:
-    if len(group) != 4 or not group.isdigit() or int(group) < 36:
+    if group != DRAGON_OVERLAY_GROUP:
         raise DragonWheelDeploymentError(
-            f"Overlay group must be four digits and outside vanilla range: {group}"
+            f"Dragon Wheel must use reserved group {DRAGON_OVERLAY_GROUP}, not {group}"
         )
     return group
 
@@ -302,6 +351,14 @@ def _entry_group(entry: dict[str, Any]) -> str:
     return group
 
 
+def _normalized_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ignore only the string-table offset recomputed by native serialization."""
+    return [
+        {key: value for key, value in entry.items() if key != "group_name_offset"}
+        for entry in entries
+    ]
+
+
 def _get_coordinator(module: ModuleType | Any | None) -> ModuleType | Any:
     if module is not None:
         return module
@@ -316,3 +373,42 @@ def _atomic_restore_file(source: Path, destination: Path) -> None:
     )
     shutil.copy2(source, temporary)
     os.replace(temporary, destination)
+
+
+def _rollback_deployment(
+    *,
+    papgt_temp: Path,
+    staged_live: Path,
+    papgt_replaced: bool,
+    papgt_backup: Path,
+    papgt_path: Path,
+    live_replaced: bool,
+    live_overlay: Path,
+    rollback_overlay: Path,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        papgt_temp.unlink(missing_ok=True)
+    except OSError as exc:
+        errors.append(f"temporary PAPGT cleanup failed: {exc}")
+    if staged_live.exists():
+        try:
+            shutil.rmtree(staged_live)
+        except OSError as exc:
+            errors.append(f"staged overlay cleanup failed: {exc}")
+    if papgt_replaced and papgt_backup.is_file():
+        try:
+            _atomic_restore_file(papgt_backup, papgt_path)
+        except OSError as exc:
+            errors.append(f"PAPGT restore failed: {exc}")
+    if live_replaced and live_overlay.exists():
+        try:
+            shutil.rmtree(live_overlay)
+        except OSError as exc:
+            errors.append(f"new overlay cleanup failed: {exc}")
+    if rollback_overlay.exists() and not live_overlay.exists():
+        try:
+            os.replace(rollback_overlay, live_overlay)
+        except OSError as exc:
+            errors.append(f"prior overlay restore failed: {exc}")
+    return errors

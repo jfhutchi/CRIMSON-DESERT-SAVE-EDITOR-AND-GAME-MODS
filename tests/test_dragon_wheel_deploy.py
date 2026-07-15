@@ -156,7 +156,7 @@ def test_apply_creates_backup_marker_and_preserves_papgt(tmp_path: Path) -> None
 
     receipt = deploy_dragon_wheel(
         game_path=game,
-        overlay_group="0066",
+        overlay_group="0067",
         patch_result=_patch_result(),
         backup_root=tmp_path / "backups",
         crimson_rs_module=crimson_rs,
@@ -166,18 +166,18 @@ def test_apply_creates_backup_marker_and_preserves_papgt(tmp_path: Path) -> None
 
     assert receipt.backup_dir == tmp_path / "backups" / "20260715-210000"
     assert (receipt.backup_dir / "0.papgt").read_bytes() == original_papgt
-    assert (game / "0066" / MARKER_NAME).is_file()
-    assert _groups(game, crimson_rs) == ("0008", "0042", "0066")
-    assert coordinator.calls == [("pre_write", "0066"), ("post_write", "0066")]
+    assert (game / "0067" / MARKER_NAME).is_file()
+    assert _groups(game, crimson_rs) == ("0008", "0042", "0067")
+    assert coordinator.calls == [("pre_write", "0067"), ("post_write", "0067")]
 
 
 def test_apply_refuses_unmarked_existing_overlay(tmp_path: Path) -> None:
-    game = _make_game_tree(tmp_path, groups=["0008", "0066"])
+    game = _make_game_tree(tmp_path, groups=["0008", "0067"])
 
     with pytest.raises(DragonWheelDeploymentError, match="not owned"):
         deploy_dragon_wheel(
             game,
-            "0066",
+            "0067",
             _patch_result(),
             tmp_path / "backups",
             FakeCrimsonRs(),
@@ -193,7 +193,7 @@ def test_apply_rolls_back_after_papgt_failure(tmp_path: Path) -> None:
     with pytest.raises(DragonWheelDeploymentError, match="rolled back"):
         deploy_dragon_wheel(
             game,
-            "0066",
+            "0067",
             _patch_result(),
             tmp_path / "backups",
             FakeCrimsonRs(fail_temp_write=True),
@@ -202,22 +202,22 @@ def test_apply_rolls_back_after_papgt_failure(tmp_path: Path) -> None:
         )
 
     assert (game / "meta" / "0.papgt").read_bytes() == original_papgt
-    assert not (game / "0066").exists()
+    assert not (game / "0067").exists()
 
 
 def test_apply_restores_owned_overlay_when_post_write_fails(tmp_path: Path) -> None:
-    game = _make_game_tree(tmp_path, groups=["0008", "0066"])
-    marker = game / "0066" / MARKER_NAME
+    game = _make_game_tree(tmp_path, groups=["0008", "0067"])
+    marker = game / "0067" / MARKER_NAME
     marker.write_text("old-marker", encoding="utf-8")
     original_overlay = {
-        path.name: path.read_bytes() for path in (game / "0066").iterdir()
+        path.name: path.read_bytes() for path in (game / "0067").iterdir()
     }
     original_papgt = (game / "meta" / "0.papgt").read_bytes()
 
     with pytest.raises(DragonWheelDeploymentError, match="rolled back"):
         deploy_dragon_wheel(
             game,
-            "0066",
+            "0067",
             _patch_result(),
             tmp_path / "backups",
             FakeCrimsonRs(),
@@ -227,32 +227,47 @@ def test_apply_restores_owned_overlay_when_post_write_fails(tmp_path: Path) -> N
 
     assert (game / "meta" / "0.papgt").read_bytes() == original_papgt
     assert {
-        path.name: path.read_bytes() for path in (game / "0066").iterdir()
+        path.name: path.read_bytes() for path in (game / "0067").iterdir()
     } == original_overlay
 
 
 def test_restore_removes_only_owned_overlay_and_preserves_groups(tmp_path: Path) -> None:
     crimson_rs = FakeCrimsonRs()
     coordinator = FakeCoordinator()
-    game = _make_game_tree(tmp_path, groups=["0008", "0042", "0066"])
-    (game / "0066" / MARKER_NAME).write_text("owned", encoding="utf-8")
+    game = _make_game_tree(tmp_path, groups=["0008", "0042", "0067"])
+    (game / "0067" / MARKER_NAME).write_text("owned", encoding="utf-8")
 
     remaining = restore_dragon_wheel(
         game,
-        "0066",
+        "0067",
         crimson_rs,
         coordinator_module=coordinator,
     )
 
     assert remaining == ("0008", "0042")
-    assert not (game / "0066").exists()
+    assert not (game / "0067").exists()
     assert (game / "0042" / "0.paz").is_file()
     assert _groups(game, crimson_rs) == ("0008", "0042")
-    assert coordinator.calls == [("pre_restore", "0066"), ("post_restore", "0066")]
+    assert coordinator.calls == [("pre_restore", "0067"), ("post_restore", "0067")]
 
 
 def test_restore_refuses_foreign_overlay(tmp_path: Path) -> None:
-    game = _make_game_tree(tmp_path, groups=["0008", "0066"])
+    game = _make_game_tree(tmp_path, groups=["0008", "0067"])
 
     with pytest.raises(DragonWheelDeploymentError, match="ownership marker"):
-        restore_dragon_wheel(game, "0066", FakeCrimsonRs(), FakeCoordinator())
+        restore_dragon_wheel(game, "0067", FakeCrimsonRs(), FakeCoordinator())
+
+
+def test_apply_refuses_itembuffs_overlay_group(tmp_path: Path) -> None:
+    game = _make_game_tree(tmp_path, groups=["0008"])
+
+    with pytest.raises(DragonWheelDeploymentError, match="reserved group 0067"):
+        deploy_dragon_wheel(
+            game,
+            "0066",
+            _patch_result(),
+            tmp_path / "backups",
+            FakeCrimsonRs(),
+            "20260715-210000",
+            FakeCoordinator(),
+        )

@@ -48,3 +48,4 @@ def test_game_mods_packages_dragon_wheel_modules() -> None:
     assert "'dragon_wheel_patch'" in spec
     assert "'dragon_wheel_deploy'" in spec
     assert "'gui.tabs.reserveslot'" in spec
+    assert "'reserveslot_parser'" not in spec
