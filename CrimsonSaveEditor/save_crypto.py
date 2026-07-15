@@ -2,13 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import datetime
+import logging
 import os
+import shutil
 import struct
-from typing import Tuple
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 import lz4.block
 
+from app_logging import new_operation_id, phase
 from models import SaveData
+from save_compat import (
+    SaveSchemaIdentity,
+    UnknownSaveSchemaError,
+    compute_schema_identity,
+    load_profiles,
+    require_supported_identity,
+)
+
+log = logging.getLogger(__name__)
 
 
 _SAVE_BASE_KEY = bytes.fromhex(
@@ -40,6 +55,14 @@ PAYLOAD_SIZE_OFFSET = 0x16
 NONCE_OFFSET = 0x1A
 HMAC_OFFSET = 0x2A
 PAYLOAD_OFFSET = 0x80
+
+
+@dataclass(frozen=True)
+class SaveWriteResult:
+    destination: Path
+    backup_path: Path
+    output_sha256: str
+    byte_count: int
 
 
 def _rotl32(v: int, n: int) -> int:
@@ -219,39 +242,139 @@ def write_save_file(
     edited_blob: bytes,
     original_header: bytes | None = None,
 ) -> None:
-    version = 2
-    if original_header and len(original_header) >= 6:
-        version = struct.unpack_from("<H", original_header, VERSION_OFFSET)[0]
-    key = _generate_save_key(version)
-
-    compressed = lz4.block.compress(
-        bytes(edited_blob),
-        store_size=False,
-        mode="high_compression",
-        compression=9,
+    destination = Path(path)
+    if destination.exists():
+        raise FileExistsError(
+            "Refusing to overwrite an existing save without a verified backup; "
+            "use transactional_write_save"
+        )
+    if original_header is None:
+        raise ValueError("An original save header is required for serialization")
+    destination.write_bytes(
+        serialize_save_bytes(
+            bytes(edited_blob),
+            original_header,
+            new_operation_id("compat-write"),
+        )
     )
 
+
+def serialize_save_bytes(
+    edited_blob: bytes,
+    original_header: bytes,
+    operation_id: str,
+) -> bytes:
+    if len(original_header) < HEADER_SIZE:
+        raise ValueError(f"Original save header must contain {HEADER_SIZE} bytes")
+    version = struct.unpack_from("<H", original_header, VERSION_OFFSET)[0]
+    key = _generate_save_key(version)
+    with phase(log, operation_id, "serialization", input_bytes=len(edited_blob)):
+        compressed = lz4.block.compress(
+            edited_blob,
+            store_size=False,
+            mode="high_compression",
+            compression=9,
+        )
+    with phase(log, operation_id, "hmac", compressed_bytes=len(compressed)):
+        digest = compute_hmac(compressed, key)
     nonce = os.urandom(16)
-
-    hmac_digest = compute_hmac(compressed, key)
-
-    encrypted = chacha20_crypt(compressed, nonce, key)
-
-    header = bytearray(HEADER_SIZE)
-
-    if original_header and len(original_header) >= 0x12:
-        header[:0x12] = original_header[:0x12]
-
+    with phase(log, operation_id, "encryption", compressed_bytes=len(compressed)):
+        encrypted = chacha20_crypt(compressed, nonce, key)
+    header = bytearray(original_header[:HEADER_SIZE])
     header[0:4] = b"SAVE"
-    struct.pack_into("<H", header, VERSION_OFFSET, 2)
+    struct.pack_into("<H", header, VERSION_OFFSET, version)
     struct.pack_into("<H", header, FLAGS_OFFSET, 0x0080)
-
     struct.pack_into("<I", header, UNCOMP_SIZE_OFFSET, len(edited_blob))
     struct.pack_into("<I", header, PAYLOAD_SIZE_OFFSET, len(compressed))
-
     header[NONCE_OFFSET:NONCE_OFFSET + 16] = nonce
-    header[HMAC_OFFSET:HMAC_OFFSET + 32] = hmac_digest
+    header[HMAC_OFFSET:HMAC_OFFSET + 32] = digest
+    return bytes(header) + encrypted
 
-    with open(path, "wb") as f:
-        f.write(bytes(header))
-        f.write(encrypted)
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def transactional_write_save(
+    destination: str | Path,
+    edited_blob: bytes,
+    original_header: bytes,
+    backup_source: str | Path,
+    expected_identity: SaveSchemaIdentity | None,
+    operation_id: str,
+) -> SaveWriteResult:
+    destination = Path(destination)
+    backup_source = Path(backup_source)
+    if expected_identity is None:
+        raise UnknownSaveSchemaError("Loaded save has no schema identity")
+    require_supported_identity(expected_identity, load_profiles())
+    candidate_identity = compute_schema_identity(edited_blob, original_header)
+    if candidate_identity != expected_identity:
+        raise UnknownSaveSchemaError("Edited blob schema differs from the loaded schema")
+    if not backup_source.is_file():
+        raise FileNotFoundError(f"Backup source does not exist: {backup_source}")
+
+    backup_dir = backup_source.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = backup_dir / f"{backup_source.name}.{stamp}.bak"
+    try:
+        with phase(
+            log,
+            operation_id,
+            "backup",
+            source=backup_source,
+            destination=backup_path,
+        ):
+            source_hash = _sha256_file(backup_source)
+            source_size = backup_source.stat().st_size
+            shutil.copy2(backup_source, backup_path)
+            if backup_path.stat().st_size != source_size:
+                raise OSError("Backup size verification failed")
+            if _sha256_file(backup_path) != source_hash:
+                raise OSError("Backup SHA-256 verification failed")
+            backup_data = load_save_file(str(backup_path))
+            if backup_data.schema_identity != expected_identity:
+                raise UnknownSaveSchemaError("Backup schema differs from loaded schema")
+    except Exception:
+        if backup_path.exists():
+            backup_path.unlink()
+        raise
+
+    serialized = serialize_save_bytes(edited_blob, original_header, operation_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with phase(
+            log,
+            operation_id,
+            "temporary_write",
+            destination=temp_path,
+            bytes=len(serialized),
+        ):
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+        with phase(log, operation_id, "temporary_validation", destination=temp_path):
+            reloaded = load_save_file(str(temp_path))
+            if hashlib.sha256(reloaded.decompressed_blob).digest() != hashlib.sha256(
+                edited_blob
+            ).digest():
+                raise ValueError("Temporary save decompressed hash mismatch")
+            if reloaded.schema_identity != expected_identity:
+                raise UnknownSaveSchemaError("Temporary save schema differs from loaded schema")
+        with phase(log, operation_id, "final_write", destination=destination):
+            os.replace(temp_path, destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return SaveWriteResult(
+        destination=destination,
+        backup_path=backup_path,
+        output_sha256=_sha256_file(destination),
+        byte_count=destination.stat().st_size,
+    )
