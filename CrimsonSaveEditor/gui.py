@@ -29,7 +29,12 @@ from PySide6.QtWidgets import (
 )
 
 from models import SaveItem, SaveData, UndoEntry
-from save_crypto import load_save_file, load_raw_stream, write_save_file
+from save_crypto import (
+    HEADER_SIZE,
+    load_save_file,
+    load_raw_stream,
+    transactional_write_save,
+)
 from item_scanner import (
     scan_items, apply_stack_edit, apply_enchant_edit,
     apply_endurance_edit, apply_sharpness_edit, apply_item_swap, apply_item_swap_all,
@@ -1476,24 +1481,53 @@ class QuestEditorWindow(QDialog):
             QMessageBox.critical(self, "Insert Error", str(e))
 
     def _save_file(self) -> None:
+        if not self._save_data.is_schema_supported:
+            QMessageBox.critical(
+                self,
+                "Unsupported Save Schema",
+                "Quest changes cannot be written because this save schema is unknown.",
+            )
+            return
         reply = QMessageBox.question(
             self, "Save Quest Changes",
-            "PLEASE MAKE SURE YOU HAVE A BACKUP OF YOUR SAVE.\n"
-            "Quest state changes are experimental.\n\n"
+            "Quest state changes are experimental. A verified backup is mandatory "
+            "and will be created automatically before writing.\n\n"
             f"Save to: {self._save_path}\n\n"
             "Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
+        from app_logging import new_operation_id
+
+        operation_id = new_operation_id("quest-save")
         try:
-            from save_crypto import write_save_file
-            write_save_file(self._save_path, bytes(self._save_data.decompressed_blob),
-                           self._save_data.raw_header)
+            result = transactional_write_save(
+                destination=self._save_path,
+                edited_blob=bytes(self._save_data.decompressed_blob),
+                original_header=self._save_data.raw_header,
+                backup_source=self._save_path,
+                expected_identity=self._save_data.schema_identity,
+                operation_id=operation_id,
+            )
+            with open(self._save_path, "rb") as stream:
+                self._save_data.raw_header = stream.read(HEADER_SIZE)
             self._status.setText(f"Saved to {os.path.basename(self._save_path)}")
-            QMessageBox.information(self, "Saved", f"Quest changes saved to:\n{self._save_path}")
+            QMessageBox.information(
+                self,
+                "Saved",
+                f"Quest changes saved to:\n{self._save_path}\n\n"
+                f"Verified backup:\n{result.backup_path}\n\n"
+                f"Operation ID: {operation_id}",
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
+            log.exception("operation=%s quest_save_failed", operation_id)
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"{e}\n\nNo destination replacement was accepted.\n"
+                f"Operation ID: {operation_id}",
+            )
 
 
 class DescriptionSearchDialog(QDialog):
@@ -9740,6 +9774,7 @@ QCheckBox::indicator {{
         self._blackstar_thread = None
         self._blackstar_previous_blob = None
         self._set_blackstar_busy(False)
+        self._update_schema_write_controls()
         if thread is not None:
             thread.deleteLater()
 
@@ -31228,6 +31263,31 @@ QCheckBox::indicator {{
             if hasattr(self, '_center_status'):
                 self._center_status.setText(action)
 
+    def _update_schema_write_controls(self) -> None:
+        supported = bool(
+            self._save_data
+            and not self._save_data.is_raw_stream
+            and self._save_data.is_schema_supported
+        )
+        busy = self._blackstar_thread is not None
+        enabled = supported and not busy
+        for action_name in ("_save_action", "_save_as_action"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(enabled)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(enabled)
+            if self._save_data and not supported:
+                self._quick_save_btn.setToolTip(
+                    "Read-only: the loaded save schema is not supported for writing."
+                )
+        if hasattr(self, "_blackstar_btn"):
+            self._blackstar_btn.setEnabled(enabled)
+        if hasattr(self, "_blackstar_dry_run"):
+            self._blackstar_dry_run.setEnabled(
+                bool(self._save_data and self._save_data.is_schema_supported) and not busy
+            )
+
 
     def _open_save_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -31253,6 +31313,7 @@ QCheckBox::indicator {{
             self._dirty = False
             self._undo_stack.clear()
             self._scan_and_populate()
+            self._update_schema_write_controls()
             self._update_status(f"Loaded raw stream: {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load raw stream:\n{e}")
@@ -31336,8 +31397,17 @@ QCheckBox::indicator {{
             self._save_config()
             self._refresh_sidebar()
 
-            self._quick_save_btn.setEnabled(True)
+            self._update_schema_write_controls()
             self._quick_save_btn.setToolTip(f"Save to: {path}")
+
+            if not self._save_data.is_schema_supported:
+                QMessageBox.warning(
+                    self,
+                    "Unknown Save Schema — Read Only",
+                    "This save loaded for inspection, but writing and Blackstar changes "
+                    "are disabled because its schema is not enrolled.\n\n"
+                    f"Schema SHA-256: {self._save_data.schema_identity.schema_sha256}",
+                )
 
             self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
             self._update_status(f"Loaded: {friendly} ({slot_dir})")
@@ -31386,26 +31456,54 @@ QCheckBox::indicator {{
         self._do_save(path)
 
     def _do_save(self, path: str) -> None:
-        try:
-            reply = QMessageBox.question(
-                self, "Backup Save?",
-                "Create a backup of your current save before writing changes?\n\n"
-                "Highly recommended — you can restore from Backup/Restore tab if anything goes wrong.",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
+        if not self._save_data or not self._loaded_path:
+            QMessageBox.warning(self, "Save", "No encrypted save is loaded.")
+            return
+        if not self._save_data.is_schema_supported:
+            QMessageBox.critical(
+                self,
+                "Unsupported Save Schema",
+                "This save is read-only because its schema is unknown. No file was written.",
             )
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Yes:
-                backup_path = self._create_backup(path)
-                if backup_path:
-                    self._update_status(f"Backup created: {os.path.basename(backup_path)}")
+            return
+        if not self._save_data.raw_header or self._save_data.schema_identity is None:
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                "The loaded save is missing its original header or schema identity.",
+            )
+            return
 
-            write_save_file(
-                path,
-                bytes(self._save_data.decompressed_blob),
-                self._save_data.raw_header if self._save_data.raw_header else None,
+        reply = QMessageBox.question(
+            self,
+            "Write Save with Verified Backup",
+            "A verified backup is mandatory and will be created automatically before "
+            "the destination is replaced. The temporary output will also be decrypted "
+            "and validated before the final write.\n\n"
+            f"Destination: {path}\n"
+            f"Backup source: {self._loaded_path}\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        from app_logging import new_operation_id
+
+        operation_id = new_operation_id("save")
+        try:
+            result = transactional_write_save(
+                destination=path,
+                edited_blob=bytes(self._save_data.decompressed_blob),
+                original_header=self._save_data.raw_header,
+                backup_source=self._loaded_path,
+                expected_identity=self._save_data.schema_identity,
+                operation_id=operation_id,
             )
+            with open(path, "rb") as stream:
+                self._save_data.raw_header = stream.read(HEADER_SIZE)
+            self._save_data.file_path = path
             self._loaded_path = path
             self._dirty = False
 
@@ -31414,24 +31512,29 @@ QCheckBox::indicator {{
             self._config["last_save_path"] = path
             self._config["last_slot"] = friendly
             self._save_config()
+            self._update_schema_write_controls()
 
             self._update_status(f"Saved: {friendly} ({slot_dir})")
             self._refresh_backups()
             self._refresh_sidebar()
-            QMessageBox.warning(
-                self, "Save",
+            QMessageBox.information(
+                self,
+                "Save Complete",
                 f"Save file written successfully.\n{path}\n\n"
-                "WARNING: It is recommended to save again in game after loading\n"
-                "the changes to have a new clean save to work with, before\n"
-                "applying another change."
+                f"Verified backup:\n{result.backup_path}\n\n"
+                f"Output SHA-256: {result.output_sha256}\n"
+                f"Operation ID: {operation_id}\n\n"
+                "Save once in game after loading these changes to create a clean new save.",
             )
-        except Exception as e:
+        except Exception as exc:
+            log.exception("operation=%s save_failed destination=%s", operation_id, path)
             QMessageBox.critical(
-                self, "Save Error",
-                f"Failed to save:\n\n{e}\n\n{traceback.format_exc()}"
+                self,
+                "Save Error",
+                f"Failed to save: {exc}\n\n"
+                "The destination was not accepted unless backup and temporary validation "
+                f"both succeeded.\n\nOperation ID: {operation_id}",
             )
-
-
     def _fix_duplicate_item_nos(self) -> None:
         if not self._items or not self._save_data:
             return

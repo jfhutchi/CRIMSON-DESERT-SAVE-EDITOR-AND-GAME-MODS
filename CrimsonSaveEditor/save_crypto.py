@@ -157,9 +157,11 @@ def verify_hmac(data: bytes, expected: bytes, key: bytes = None) -> bool:
     return hmac.compare_digest(compute_hmac(data, key), expected)
 
 
-def load_save_file(path: str) -> SaveData:
-    with open(path, "rb") as f:
-        file_data = f.read()
+def load_save_file(path: str, operation_id: str | None = None) -> SaveData:
+    operation_id = operation_id or new_operation_id("load")
+    with phase(log, operation_id, "file_read", path=path):
+        with open(path, "rb") as f:
+            file_data = f.read()
 
     if len(file_data) < HEADER_SIZE + 16:
         raise ValueError("File too small to be a save file.")
@@ -180,16 +182,28 @@ def load_save_file(path: str) -> SaveData:
         )
 
     key = _generate_save_key(version)
+    log.info(
+        "operation=%s save_header version=%s file_bytes=%s compressed_bytes=%s "
+        "decompressed_bytes=%s",
+        operation_id,
+        version,
+        len(file_data),
+        payload_size,
+        uncomp_size,
+    )
 
     ciphertext = file_data[PAYLOAD_OFFSET:PAYLOAD_OFFSET + payload_size]
 
-    compressed = chacha20_crypt(ciphertext, nonce, key)
+    with phase(log, operation_id, "decryption", encrypted_bytes=len(ciphertext)):
+        compressed = chacha20_crypt(ciphertext, nonce, key)
 
-    hmac_ok = verify_hmac(compressed, stored_hmac, key)
+    with phase(log, operation_id, "hmac_verification", compressed_bytes=len(compressed)):
+        hmac_ok = verify_hmac(compressed, stored_hmac, key)
 
-    decompressed = lz4.block.decompress(
-        compressed, uncompressed_size=uncomp_size
-    )
+    with phase(log, operation_id, "decompression", expected_bytes=uncomp_size):
+        decompressed = lz4.block.decompress(
+            compressed, uncompressed_size=uncomp_size
+        )
 
     if len(decompressed) != uncomp_size:
         raise ValueError(
@@ -209,11 +223,19 @@ def load_save_file(path: str) -> SaveData:
 
     from save_compat import compute_schema_identity, load_profiles, match_profile
 
-    identity = compute_schema_identity(bytes(save_data.decompressed_blob), header)
-    profile = match_profile(identity, load_profiles())
+    with phase(log, operation_id, "schema_detection"):
+        identity = compute_schema_identity(bytes(save_data.decompressed_blob), header)
+        profile = match_profile(identity, load_profiles())
     save_data.schema_identity = identity
     save_data.compatibility_profile_id = profile.profile_id if profile else None
     save_data.is_schema_supported = profile is not None
+    log.info(
+        "operation=%s schema_result supported=%s profile=%s schema_sha256=%s",
+        operation_id,
+        save_data.is_schema_supported,
+        save_data.compatibility_profile_id,
+        identity.schema_sha256,
+    )
 
     if not hmac_ok:
         raise Warning("HMAC mismatch - save may be corrupted but was loaded anyway.")
