@@ -129,6 +129,7 @@ from gui.tabs.world import (
 from gui.tabs.patches import GamePatchesTab
 from gui.tabs.field_edit import FieldEditTab
 from gui.tabs.bagspace import BagSpaceTab
+from gui.tabs.reserveslot import ReserveSlotTab
 from gui.tabs.skill_tree import SkillTreeTab
 from gui.tabs.pas_editor import PasEditorTab
 from gui.tabs.quest_mods import QuestModsTab
@@ -728,6 +729,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._mods_tabs.addTab(self._field_edit_tab_obj, tr("FieldEdit"))
+
+        self._reserve_slot_tab = ReserveSlotTab(
+            config=self._config,
+            game_path_getter=lambda: self._config.get("game_install_path", ""),
+        )
+        self._reserve_slot_tab.status_message.connect(self._update_status)
+        self._reserve_slot_tab.config_save_requested.connect(self._save_config)
+        _saved_gp_reserveslot = self._config.get("game_install_path", "")
+        if _saved_gp_reserveslot:
+            self._reserve_slot_tab.set_game_path(_saved_gp_reserveslot)
+        self._mods_tabs.addTab(self._reserve_slot_tab, "Dragon Wheel")
 
         self._iteminfo_cache = ItemInfoCache()
         self._iteminfo_cache.set_game_path(self._config.get("game_install_path", ""))
@@ -2483,6 +2495,8 @@ QCheckBox::indicator {{
             self._field_edit_tab_obj.set_game_path(path)
         if hasattr(self, '_bagspace_tab'):
             self._bagspace_tab.set_game_path(path)
+        if hasattr(self, '_reserve_slot_tab'):
+            self._reserve_slot_tab.set_game_path(path)
         if hasattr(self, '_load_manager_tab'):
             self._load_manager_tab.set_game_path(path)
         if hasattr(self, '_quest_mods_tab'):
