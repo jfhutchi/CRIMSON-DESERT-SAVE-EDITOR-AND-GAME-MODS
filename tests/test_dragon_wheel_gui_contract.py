@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from PySide6.QtWidgets import QApplication
-
-from gui.tabs.reserveslot import ReserveSlotTab
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,19 +47,35 @@ def test_dragon_overlay_does_not_collide_with_itembuffs() -> None:
 
 
 def test_apply_starts_disabled_and_path_change_invalidates_preview() -> None:
-    app = QApplication.instance() or QApplication([])
-    tab = ReserveSlotTab({}, lambda: "")
-    try:
-        assert tab._apply_btn.isEnabled() is False
-        tab._source_hashes = ("old-h", "old-b")
-        tab._preview_result = object()
-        tab._apply_btn.setEnabled(True)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "CrimsonGameMods")
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    script = r"""
+from PySide6.QtWidgets import QApplication
+from gui.tabs.reserveslot import ReserveSlotTab
 
-        tab.set_game_path(r"D:\Games\Crimson Desert")
+app = QApplication.instance() or QApplication([])
+tab = ReserveSlotTab({}, lambda: "")
+assert tab._apply_btn.isEnabled() is False
+tab._source_hashes = ("old-h", "old-b")
+tab._preview_result = object()
+tab._apply_btn.setEnabled(True)
+tab.set_game_path(r"D:\Games\Crimson Desert")
+assert tab._apply_btn.isEnabled() is False
+assert tab._source_hashes is None
+assert tab._preview_result is None
+tab.deleteLater()
+app.processEvents()
+"""
 
-        assert tab._apply_btn.isEnabled() is False
-        assert tab._source_hashes is None
-        assert tab._preview_result is None
-    finally:
-        tab.deleteLater()
-        app.processEvents()
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
