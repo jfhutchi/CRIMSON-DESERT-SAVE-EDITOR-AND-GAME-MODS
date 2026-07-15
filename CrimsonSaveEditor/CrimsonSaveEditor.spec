@@ -1,3 +1,15 @@
+from importlib.util import find_spec
+
+optional_hiddenimports = []
+if find_spec('crimson_rs') is not None:
+    optional_hiddenimports = [
+        'crimson_rs',
+        'crimson_rs.enums',
+        'crimson_rs.create_pack',
+        'crimson_rs.pack_mod',
+        'crimson_rs.validate_game_dir',
+    ]
+
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -27,6 +39,7 @@ a = Analysis(
         ('game_map.json', '.'),
         ('localizationstring_eng_items.tsv', '.'),
         ('editor_version_standalone.json', '.'),
+        ('save_schema_profiles.json', '.'),
         ('locale', 'locale'),
         ('knowledge_packs', 'knowledge_packs'),
     ],
@@ -46,12 +59,11 @@ a = Analysis(
         'questinfo_parser',
         'item_template_db',
         'ben_save_decrypt',
-        'crimson_rs',
-        'crimson_rs.enums',
-        'crimson_rs.create_pack',
-        'crimson_rs.pack_mod',
-        'crimson_rs.validate_game_dir',
-    ],
+        'app_logging',
+        'save_compat',
+        'blackstar_unlock',
+        'blackstar_worker',
+    ] + optional_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

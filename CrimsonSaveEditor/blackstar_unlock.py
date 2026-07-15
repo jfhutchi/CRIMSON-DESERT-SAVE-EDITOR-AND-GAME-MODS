@@ -6,9 +6,11 @@ import json
 import logging
 import re
 import struct
+import tempfile
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from app_logging import phase
@@ -593,12 +595,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze Blackstar unlock changes")
     parser.add_argument("--save", required=True)
     parser.add_argument("--dry-run", action="store_true", required=True)
+    parser.add_argument(
+        "--allow-any-copied-path",
+        action="store_true",
+        help="Allow a copied save outside tests/fixtures or the system temporary directory.",
+    )
     args = parser.parse_args()
     from app_logging import new_operation_id
     from save_compat import load_profiles, require_supported_identity
     from save_crypto import load_save_file
 
-    save = load_save_file(args.save)
+    save_path = Path(args.save).resolve()
+    fixture_root = (Path(__file__).resolve().parents[1] / "tests" / "fixtures").resolve()
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    safe_roots = (fixture_root, temporary_root)
+    if not args.allow_any_copied_path and not any(
+        save_path == root or root in save_path.parents for root in safe_roots
+    ):
+        parser.error(
+            "Dry-run input must be under tests/fixtures or the system temporary "
+            "directory. Use --allow-any-copied-path only for another copied save."
+        )
+    save = load_save_file(str(save_path))
     profile = require_supported_identity(save.schema_identity, load_profiles())
     result = unlock_blackstar(
         save.decompressed_blob,

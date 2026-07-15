@@ -49,23 +49,23 @@ Full feature list in the release notes.
 
 ## Build from source
 
-**Requires:** Python 3.12+ from [python.org](https://www.python.org/downloads/) (do NOT use the Microsoft Store version)
+The standalone save editor is verified with 64-bit Python 3.12 in an isolated
+virtual environment:
 
-```bash
-pip install PySide6 lz4 cryptography Pillow pyinstaller
-
-# Game Mods
-cd CrimsonGameMods
-python -m PyInstaller CrimsonGameMods.spec --noconfirm
-# Output: dist/CrimsonGameMods.exe
-
-# Save Editor
-cd ../CrimsonSaveEditor
-python -m PyInstaller CrimsonSaveEditor.spec --noconfirm
-# Output: dist/CrimsonSaveEditor.exe
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r CrimsonSaveEditor\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest tests -v --timeout=600
+Push-Location CrimsonSaveEditor
+..\.venv\Scripts\python.exe -m PyInstaller CrimsonSaveEditor.spec --noconfirm --clean
+Pop-Location
 ```
 
-See [BUILD_FROM_SOURCE.md](BUILD_FROM_SOURCE.md) for platform-specific details and troubleshooting.
+Output: `CrimsonSaveEditor\dist\CrimsonSaveEditorStandalone.exe`.
+
+See [BUILD_FROM_SOURCE.md](BUILD_FROM_SOURCE.md) for the exact Windows
+dependency list, copied-fixture dry-run, native runtime requirement, optional
+`crimson_rs` limitation, packaged files, and Game Mods notes.
 
 ## Source layout
 

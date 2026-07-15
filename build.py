@@ -66,7 +66,6 @@ def main() -> int:
 
     target = project["targets"][args.target]
     root = project["root"]
-    pyside_lib, shiboken_lib = find_qt_libs()
 
     for cache in root.rglob("__pycache__"):
         shutil.rmtree(cache, ignore_errors=True)
@@ -78,6 +77,7 @@ def main() -> int:
         run([sys.executable, "-m", "PyInstaller", str(spec), "--noconfirm"], cwd=root)
         return 0
 
+    pyside_lib, shiboken_lib = find_qt_libs()
     build_dir = root / target["out"]
     shutil.rmtree(build_dir, ignore_errors=True)
 
