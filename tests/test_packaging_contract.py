@@ -49,3 +49,25 @@ def test_game_mods_packages_dragon_wheel_modules() -> None:
     assert "'dragon_wheel_deploy'" in spec
     assert "'gui.tabs.reserveslot'" in spec
     assert "'reserveslot_parser'" not in spec
+
+
+def test_game_mods_windows_build_is_pinned_and_documents_native_dependencies() -> None:
+    game_mods = ROOT / "CrimsonGameMods"
+    runtime = (game_mods / "requirements.txt").read_text(encoding="utf-8")
+    development = (game_mods / "requirements-dev.txt").read_text(encoding="utf-8")
+    readme = (game_mods / "README.md").read_text(encoding="utf-8")
+
+    assert "PySide6==6.8.3" in runtime
+    assert "lz4==4.4.5" in runtime
+    assert "cryptography==49.0.0" in runtime
+    assert "-r requirements.txt" in development
+    assert "pyinstaller==6.21.0" in development
+    assert "pytest==9.1.1" in development
+    assert "pytest-timeout==2.4.0" in development
+    assert "py -3.12 -m venv .venv" in readme
+    assert "CrimsonGameMods\\requirements-dev.txt" in readme
+    assert "-m PyInstaller CrimsonGameMods.spec --noconfirm --clean" in readme
+    assert "Microsoft Visual C++ 2015-2022 Redistributable (x64)" in readme
+    assert "crimson_rs" in readme
+    assert "dmm_parser" in readme
+    assert "Pillow is not required" in readme

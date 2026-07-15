@@ -21,16 +21,59 @@ A PySide6 desktop tool for modifying **Crimson Desert** game data via PAZ archiv
 
 ## Build from source
 
-```bash
-pip install PySide6 lz4 cryptography Pillow pyinstaller
+These instructions are for 64-bit Windows. Install:
 
-# Game Mods
-cd CrimsonGameMods
-python -m PyInstaller CrimsonGameMods.spec --noconfirm
-# Output: dist/CrimsonGameMods.exe
+- 64-bit CPython 3.12 (the verified build used Python 3.12.6)
+- Microsoft Visual C++ 2015-2022 Redistributable (x64), required by the bundled native modules
+- Windows PowerShell 5.1 or newer
+- Git only if you need to clone the repository
+
+From the repository root, create an isolated environment and install the exact build set:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r CrimsonGameMods\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip check
 ```
 
-The single repo-root `build.sh` / `build.cmd` driver is the preferred entry point for builds.
+Runtime dependencies are pinned in `CrimsonGameMods\requirements.txt`:
+
+| Dependency | Version | Purpose |
+| --- | ---: | --- |
+| PySide6 | 6.8.3 | Windows GUI and worker-thread integration |
+| lz4 | 4.4.5 | Save/game-data compression support |
+| cryptography | 49.0.0 | Encrypted data support |
+
+Build and test dependencies are pinned in `CrimsonGameMods\requirements-dev.txt`: PyInstaller 6.21.0, pytest 9.1.1, and pytest-timeout 2.4.0. The complete resolved Python environment used for verification is: altgraph 0.17.5, cffi 2.1.0, colorama 0.4.6, cryptography 49.0.0, iniconfig 2.3.0, lz4 4.4.5, packaging 26.2, pefile 2024.8.26, pluggy 1.6.0, pycparser 3.0, Pygments 2.20.0, pyinstaller 6.21.0, pyinstaller-hooks-contrib 2026.6, PySide6 6.8.3, PySide6-Addons 6.8.3, PySide6-Essentials 6.8.3, pytest 9.1.1, pytest-timeout 2.4.0, pywin32-ctypes 0.2.3, setuptools 83.0.0, and shiboken6 6.8.3.
+
+The repository also contains required prebuilt native files that are bundled by the spec and are not installed from PyPI:
+
+| File | Size | SHA-256 | Purpose |
+| --- | ---: | --- | --- |
+| `CrimsonGameMods\crimson_rs\crimson_rs.pyd` | 7,133,696 bytes | `CCF25C5500E97F0C93D1A6E81CA96B80B64B2147FA2701A68245B11FD0533855` | PAZ extraction/building and PAPGT serialization |
+| `CrimsonGameMods\dmm_parser\dmm_parser.pyd` | 7,191,040 bytes | `596CCB0AF8A7582C1C404E562C3E72D77F673C78E5981BCC6BB35BA6866ABF70` | Native PABGB parsing used by game-mod features |
+| `CrimsonGameMods\parc_parser.dll` | 399,360 bytes | `AC7B26C8984E86FAE4C6982EFCC13A7201CE5788A386A354BD280D67274CDFD7` | PARC parsing support loaded by the application |
+
+Pillow is not required to run, test, or build the application; it is used only by the optional `tools\regen_splash.py` artwork utility. NumPy appears only in disconnected optional model helpers and is not part of the packaged application dependency set.
+
+To run the complete tests, use a copied fixture only. The installed game path is read for compatibility checks; tests that exercise writes create temporary copied game trees:
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path CrimsonGameMods).Path
+$env:CRIMSON_DESERT_GAME_PATH = 'D:\SteamLibrary\steamapps\common\Crimson Desert'
+.\.venv\Scripts\python.exe -m pytest tests -v --timeout=300
+```
+
+Omit `CRIMSON_DESERT_GAME_PATH` when the game is not installed; the installed-schema integration test will skip. Build the executable with:
+
+```powershell
+Push-Location CrimsonGameMods
+..\.venv\Scripts\python.exe -m PyInstaller CrimsonGameMods.spec --noconfirm --clean
+Pop-Location
+```
+
+The output is `CrimsonGameMods\dist\CrimsonGameMods.exe`. The repo-root `build.cmd` remains an alternative build entry point.
 
 ## Save File Integration
 
