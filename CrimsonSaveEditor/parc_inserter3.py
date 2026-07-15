@@ -3,6 +3,7 @@ import struct
 import json
 import os
 import logging
+from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any, Callable
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,51 @@ for _sub in ['Communitydump/desktopeditor', 'desktopeditor', 'Communitydump/sour
         sys.path.append(_p2)
 
 SENTINEL = b'\xff\xff\xff\xff\xff\xff\xff\xff'
+
+
+@dataclass(frozen=True)
+class ParsedInsertContext:
+    raw: bytes
+    parc: object
+    result: dict
+
+
+@dataclass(frozen=True)
+class FixupMetrics:
+    pointer_offsets: int = 0
+    trailing_sizes: int = 0
+    toc_offsets: int = 0
+    block_sizes: int = 0
+    stream_sizes: int = 0
+
+    def __add__(self, other: "FixupMetrics") -> "FixupMetrics":
+        return FixupMetrics(
+            pointer_offsets=self.pointer_offsets + other.pointer_offsets,
+            trailing_sizes=self.trailing_sizes + other.trailing_sizes,
+            toc_offsets=self.toc_offsets + other.toc_offsets,
+            block_sizes=self.block_sizes + other.block_sizes,
+            stream_sizes=self.stream_sizes + other.stream_sizes,
+        )
+
+
+def build_insert_context(blob: bytes | bytearray) -> ParsedInsertContext:
+    import parc_serializer
+    import save_parser
+
+    raw = bytes(blob)
+    return ParsedInsertContext(
+        raw=raw,
+        parc=parc_serializer.parse_parc_blob(raw),
+        result=save_parser.build_result_from_raw(raw, {"input_kind": "raw_blob"}),
+    )
+
+
+def iter_sentinels(data: bytes | bytearray, start: int = 0, end: int | None = None):
+    limit = len(data) if end is None else min(end, len(data))
+    position = data.find(SENTINEL, start, limit)
+    while position >= 0:
+        yield position
+        position = data.find(SENTINEL, position + len(SENTINEL), limit)
 
 
 import ctypes
@@ -597,10 +643,12 @@ def _fixup_trailing_sizes(
     insert_pos: int,
     growth: int,
     block_class_name: str,
+    result: dict | None = None,
 ) -> int:
-    import save_parser as sp
+    if result is None:
+        import save_parser as sp
 
-    result = sp.build_result_from_raw(orig_blob, {'input_kind': 'raw_blob'})
+        result = sp.build_result_from_raw(orig_blob, {'input_kind': 'raw_blob'})
     ts_positions = []
 
     def _find_containing(field, depth=0):
@@ -2305,6 +2353,118 @@ def inject_knowledge_locations_only(
         return True, blob, "All community knowledge already present"
 
     return _insert_knowledge_keys(blob, orig_blob, know_obj, know_field, to_insert, len(existing_keys), override_level=0)
+
+
+def insert_knowledge_keys_with_context(
+    context: ParsedInsertContext,
+    keys_to_insert: tuple[int, ...] | list[int],
+    override_level: int = -1,
+) -> tuple[bytes, FixupMetrics]:
+    orig_blob = context.raw
+    know_obj = know_field = None
+    for obj in context.result['objects']:
+        if obj.class_name == 'KnowledgeSaveData':
+            for field in obj.fields:
+                if field.name == '_list' and field.list_elements:
+                    know_obj = obj
+                    know_field = field
+                    break
+            break
+    if not know_obj or not know_field:
+        raise ValueError("KnowledgeSaveData._list not found")
+    if not keys_to_insert:
+        return orig_blob, FixupMetrics()
+
+    template_elem = know_field.list_elements[-1]
+    tmpl_raw = orig_blob[template_elem.start_offset:template_elem.end_offset]
+    tmpl_start = template_elem.start_offset
+    key_rel = level_rel = None
+    for child in (template_elem.child_fields or []):
+        if child.name == '_key' and child.present:
+            key_rel = child.start_offset - tmpl_start
+        elif child.name == '_level' and child.present:
+            level_rel = child.start_offset - tmpl_start
+    if key_rel is None:
+        raise ValueError("Could not find _key field in knowledge template")
+
+    mbc = struct.unpack_from('<H', tmpl_raw, 0)[0]
+    mask_len = mbc & 0xFF
+    locator_end = 2 + mask_len + 2 + 1 + 8 + 4
+    insert_abs = know_field.list_elements[-1].end_offset
+    all_new = bytearray()
+    cursor = insert_abs
+    for key in keys_to_insert:
+        clone = bytearray(tmpl_raw)
+        struct.pack_into('<I', clone, key_rel, key)
+        if override_level >= 0 and level_rel is not None:
+            struct.pack_into('<I', clone, level_rel, override_level)
+        original_main_po = struct.unpack_from('<I', tmpl_raw, locator_end - 4)[0]
+        po_delta = cursor + locator_end - original_main_po
+        for sentinel_pos in iter_sentinels(clone, 0, len(clone) - 4):
+            po_offset = sentinel_pos + len(SENTINEL)
+            if po_offset + 4 > len(clone):
+                continue
+            old_po = struct.unpack_from('<I', tmpl_raw, po_offset)[0]
+            if tmpl_start <= old_po < tmpl_start + len(tmpl_raw) + 4096:
+                struct.pack_into('<I', clone, po_offset, old_po + po_delta)
+        all_new.extend(clone)
+        cursor += len(clone)
+
+    total_growth = len(all_new)
+    block_start = know_obj.data_offset
+    block_end = block_start + know_obj.data_size
+    relative_insert = insert_abs - block_start
+    block_raw = bytearray(orig_blob[block_start:block_end])
+    new_block = block_raw[:relative_insert] + all_new + block_raw[relative_insert:]
+    list_relative = know_field.start_offset - block_start
+    new_count = len(know_field.list_elements) + len(keys_to_insert)
+    new_block[list_relative + 1] = new_count & 0xFF
+    new_block[list_relative + 2] = (new_count >> 8) & 0xFF
+    new_block[list_relative + 3] = (new_count >> 16) & 0xFF
+    for sentinel_pos in iter_sentinels(
+        new_block, relative_insert + total_growth, len(new_block) - 4
+    ):
+        po_offset = sentinel_pos + len(SENTINEL)
+        if po_offset + 4 > len(new_block):
+            continue
+        old_value = struct.unpack_from('<I', new_block, po_offset)[0]
+        if insert_abs <= old_value < insert_abs + 10_000_000:
+            struct.pack_into('<I', new_block, po_offset, old_value + total_growth)
+
+    blob = bytearray(orig_blob)
+    blob[block_start:block_end] = new_block
+    toc_index = next(
+        (
+            entry.index
+            for entry in context.parc.toc_entries
+            if context.parc.type_by_index.get(entry.class_index)
+            and context.parc.type_by_index[entry.class_index].name == 'KnowledgeSaveData'
+        ),
+        None,
+    )
+    if toc_index is None:
+        raise ValueError("KnowledgeSaveData not found in TOC")
+    pointer_count = _fixup_external(
+        blob, orig_blob, context.parc, toc_index, block_end, total_growth
+    )
+    trailing_count = _fixup_trailing_sizes(
+        blob,
+        orig_blob,
+        insert_abs,
+        total_growth,
+        'KnowledgeSaveData',
+        result=context.result,
+    )
+    toc_count = sum(
+        1 for entry in context.parc.toc_entries if entry.data_offset >= block_end
+    )
+    return bytes(blob), FixupMetrics(
+        pointer_offsets=pointer_count,
+        trailing_sizes=trailing_count,
+        toc_offsets=toc_count,
+        block_sizes=1,
+        stream_sizes=1,
+    )
 
 
 def _insert_knowledge_keys(

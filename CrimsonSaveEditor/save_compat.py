@@ -71,11 +71,15 @@ def extract_required_list_encodings(result: dict) -> dict[str, str]:
         )
         elements = field.list_elements if field and field.list_elements else []
         encodings[prefix_key] = str(field.list_prefix_u8) if field else "MISSING"
-        encodings[mask_key] = (
-            elements[-1].child_mask_bytes.hex()
-            if elements and elements[-1].child_mask_bytes
-            else "MISSING"
-        )
+        masks = sorted({
+            element.child_mask_bytes.hex()
+            for element in elements
+            if element.child_mask_bytes
+        })
+        if masks:
+            encodings[mask_key] = ",".join(masks)
+        else:
+            encodings[mask_key] = "MISSING"
     return encodings
 
 
@@ -120,7 +124,54 @@ def match_profile(
     identity: SaveSchemaIdentity,
     profiles: tuple[CompatibilityProfile, ...],
 ) -> CompatibilityProfile | None:
-    return next((profile for profile in profiles if profile.identity == identity), None)
+    for profile in profiles:
+        if not schema_structure_matches(identity, profile.identity):
+            continue
+        mount_prefix = identity.observed_encodings.get(
+            "MercenaryClanSaveData._mercenaryDataList.list_prefix"
+        )
+        knowledge_prefix = identity.observed_encodings.get(
+            "KnowledgeSaveData._list.list_prefix"
+        )
+        mount_masks = set(
+            identity.observed_encodings.get(
+                "MercenaryClanSaveData._mercenaryDataList.element_mask", ""
+            ).split(",")
+        )
+        knowledge_masks = set(
+            identity.observed_encodings.get(
+                "KnowledgeSaveData._list.element_mask", ""
+            ).split(",")
+        )
+        if (
+            mount_prefix == str(profile.mount_list_prefix)
+            and knowledge_prefix == str(profile.knowledge_list_prefix)
+            and profile.mount_element_mask_hex in mount_masks
+            and profile.knowledge_element_mask_hex in knowledge_masks
+        ):
+            return profile
+    return None
+
+
+def schema_structure_matches(
+    left: SaveSchemaIdentity,
+    right: SaveSchemaIdentity,
+) -> bool:
+    return (
+        left.container_version == right.container_version
+        and left.schema_sha256 == right.schema_sha256
+        and left.root_entry_count == right.root_entry_count
+        and left.type_count == right.type_count
+        and left.required_type_signatures == right.required_type_signatures
+        and left.observed_encodings.get(
+            "MercenaryClanSaveData._mercenaryDataList.list_prefix"
+        )
+        == right.observed_encodings.get(
+            "MercenaryClanSaveData._mercenaryDataList.list_prefix"
+        )
+        and left.observed_encodings.get("KnowledgeSaveData._list.list_prefix")
+        == right.observed_encodings.get("KnowledgeSaveData._list.list_prefix")
+    )
 
 
 def require_supported_identity(
@@ -146,15 +197,26 @@ def _profile_from_fixture(
     identity = save.schema_identity or compute_schema_identity(
         bytes(save.decompressed_blob), save.raw_header
     )
-    encodings = identity.observed_encodings
+    result = save_parser.build_result_from_raw(
+        bytes(save.decompressed_blob), {"input_kind": "profile_fixture"}
+    )
+    encodings = extract_required_list_encodings(result)
     mount_prefix = encodings[
         "MercenaryClanSaveData._mercenaryDataList.list_prefix"
     ]
-    mount_mask = encodings[
-        "MercenaryClanSaveData._mercenaryDataList.element_mask"
-    ]
     knowledge_prefix = encodings["KnowledgeSaveData._list.list_prefix"]
-    knowledge_mask = encodings["KnowledgeSaveData._list.element_mask"]
+    mount_obj = next(
+        obj for obj in result["objects"] if obj.class_name == "MercenaryClanSaveData"
+    )
+    knowledge_obj = next(
+        obj for obj in result["objects"] if obj.class_name == "KnowledgeSaveData"
+    )
+    mount_field = next(
+        item for item in mount_obj.fields if item.name == "_mercenaryDataList"
+    )
+    knowledge_field = next(item for item in knowledge_obj.fields if item.name == "_list")
+    mount_mask = mount_field.list_elements[-1].child_mask_bytes.hex()
+    knowledge_mask = knowledge_field.list_elements[-1].child_mask_bytes.hex()
     if "MISSING" in (mount_prefix, mount_mask, knowledge_prefix, knowledge_mask):
         raise UnknownSaveSchemaError("Fixture is missing a required Blackstar encoding")
     return CompatibilityProfile(

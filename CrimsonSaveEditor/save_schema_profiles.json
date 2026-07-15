@@ -4,9 +4,9 @@
       "identity": {
         "container_version": 2,
         "observed_encodings": {
-          "KnowledgeSaveData._list.element_mask": "03",
+          "KnowledgeSaveData._list.element_mask": "03,07,0f",
           "KnowledgeSaveData._list.list_prefix": "0",
-          "MercenaryClanSaveData._mercenaryDataList.element_mask": "1d19003e0806",
+          "MercenaryClanSaveData._mercenaryDataList.element_mask": "0501002b0800,0501002e0a06,051900200800,051900200a00,0519002e0800,0519002e0806,0519002e0a00,0519002e0e0f,0519002e1a0f,0579002e0800,0599002a0a00,0599002e0a00,0599002e0a01,0d19002e0a06,0d1900300c00,0d19003e0806,0d19003f0800,1d19003e0806",
           "MercenaryClanSaveData._mercenaryDataList.list_prefix": "1"
         },
         "required_type_signatures": {

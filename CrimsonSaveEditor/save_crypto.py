@@ -10,18 +10,15 @@ import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import lz4.block
 
 from app_logging import new_operation_id, phase
 from models import SaveData
-from save_compat import (
-    SaveSchemaIdentity,
-    UnknownSaveSchemaError,
-    compute_schema_identity,
-    load_profiles,
-    require_supported_identity,
-)
+
+if TYPE_CHECKING:
+    from save_compat import SaveSchemaIdentity
 
 log = logging.getLogger(__name__)
 
@@ -303,13 +300,21 @@ def transactional_write_save(
     expected_identity: SaveSchemaIdentity | None,
     operation_id: str,
 ) -> SaveWriteResult:
+    from save_compat import (
+        UnknownSaveSchemaError,
+        compute_schema_identity,
+        load_profiles,
+        require_supported_identity,
+        schema_structure_matches,
+    )
+
     destination = Path(destination)
     backup_source = Path(backup_source)
     if expected_identity is None:
         raise UnknownSaveSchemaError("Loaded save has no schema identity")
     require_supported_identity(expected_identity, load_profiles())
     candidate_identity = compute_schema_identity(edited_blob, original_header)
-    if candidate_identity != expected_identity:
+    if not schema_structure_matches(candidate_identity, expected_identity):
         raise UnknownSaveSchemaError("Edited blob schema differs from the loaded schema")
     if not backup_source.is_file():
         raise FileNotFoundError(f"Backup source does not exist: {backup_source}")
@@ -334,7 +339,9 @@ def transactional_write_save(
             if _sha256_file(backup_path) != source_hash:
                 raise OSError("Backup SHA-256 verification failed")
             backup_data = load_save_file(str(backup_path))
-            if backup_data.schema_identity != expected_identity:
+            if not schema_structure_matches(
+                backup_data.schema_identity, expected_identity
+            ):
                 raise UnknownSaveSchemaError("Backup schema differs from loaded schema")
     except Exception:
         if backup_path.exists():
@@ -365,7 +372,7 @@ def transactional_write_save(
                 edited_blob
             ).digest():
                 raise ValueError("Temporary save decompressed hash mismatch")
-            if reloaded.schema_identity != expected_identity:
+            if not schema_structure_matches(reloaded.schema_identity, expected_identity):
                 raise UnknownSaveSchemaError("Temporary save schema differs from loaded schema")
         with phase(log, operation_id, "final_write", destination=destination):
             os.replace(temp_path, destination)
