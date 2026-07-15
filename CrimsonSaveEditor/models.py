@@ -1,7 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from save_compat import SaveSchemaIdentity
 
 
 class QuestState(IntEnum):
@@ -53,6 +56,10 @@ class SaveData:
     original_decompressed_size: int = 0
     file_path: str = ""
     is_raw_stream: bool = False
+    schema_identity: SaveSchemaIdentity | None = None
+    compatibility_profile_id: str | None = None
+    is_schema_supported: bool = False
+    document_generation: int = 0
 
 
 @dataclass
@@ -71,3 +78,4 @@ class UndoEntry:
     old_bytes: bytes = b""
     new_bytes: bytes = b""
     patches: list = field(default_factory=list)
+    previous_blob: bytes | None = None

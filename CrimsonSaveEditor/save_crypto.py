@@ -187,6 +187,14 @@ def load_save_file(path: str) -> SaveData:
         is_raw_stream=False,
     )
 
+    from save_compat import compute_schema_identity, load_profiles, match_profile
+
+    identity = compute_schema_identity(bytes(save_data.decompressed_blob), header)
+    profile = match_profile(identity, load_profiles())
+    save_data.schema_identity = identity
+    save_data.compatibility_profile_id = profile.profile_id if profile else None
+    save_data.is_schema_supported = profile is not None
+
     if not hmac_ok:
         raise Warning("HMAC mismatch - save may be corrupted but was loaded anyway.")
 
