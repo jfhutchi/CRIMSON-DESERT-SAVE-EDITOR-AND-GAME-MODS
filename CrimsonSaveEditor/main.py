@@ -2,6 +2,8 @@ import sys
 import os
 import logging
 
+from app_logging import configure_logging
+
 
 def _splash(text: str) -> None:
     try:
@@ -21,11 +23,8 @@ def _splash_close() -> None:
 
 _splash("Starting up...")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+LOG_PATH = configure_logging()
+logging.getLogger(__name__).info("Application logging initialized: %s", LOG_PATH)
 
 _splash("Loading Qt framework...")
 from PySide6.QtWidgets import QApplication
