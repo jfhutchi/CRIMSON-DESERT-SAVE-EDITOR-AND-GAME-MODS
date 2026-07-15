@@ -124,6 +124,10 @@ class BlackstarValidationError(ValueError):
     pass
 
 
+class BlackstarCancelledError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class BlackstarSpec:
     character_key: int
@@ -456,6 +460,11 @@ def _emit(
         callback(BlackstarProgress(phase_name, completed, 6, message))
 
 
+def _check_cancelled(callback: Callable[[], bool] | None) -> None:
+    if callback and callback():
+        raise BlackstarCancelledError("Blackstar operation cancelled")
+
+
 def unlock_blackstar(
     blob: bytes | bytearray,
     profile: CompatibilityProfile,
@@ -463,6 +472,7 @@ def unlock_blackstar(
     operation_id: str,
     progress: Callable[[BlackstarProgress], None] | None = None,
     spec: BlackstarSpec = BLACKSTAR_SPEC,
+    cancelled: Callable[[], bool] | None = None,
 ) -> BlackstarResult:
     original = bytes(blob)
     input_hash = hashlib.sha256(original).hexdigest()
@@ -472,6 +482,7 @@ def unlock_blackstar(
         context = build_insert_context(original)
     timings["parse"] = (time.perf_counter() - started) * 1000
     _emit(progress, "parse", 1, "Parsed save structures")
+    _check_cancelled(cancelled)
 
     started = time.perf_counter()
     with phase(log, operation_id, "blackstar_detection"):
@@ -479,6 +490,7 @@ def unlock_blackstar(
         quest_before = canonical_quest_snapshot(context)
     timings["detection"] = (time.perf_counter() - started) * 1000
     _emit(progress, "detection", 2, "Detected mount and knowledge state")
+    _check_cancelled(cancelled)
 
     if plan.mount_count == 1 and not plan.knowledge_missing:
         report = BlackstarChangeReport(
@@ -513,6 +525,7 @@ def unlock_blackstar(
     ):
         applied = apply_blackstar_plan(context, profile, spec, plan)
     timings.update(applied.timings_ms)
+    _check_cancelled(cancelled)
     _emit(
         progress,
         "mount",
@@ -525,6 +538,7 @@ def unlock_blackstar(
         4,
         f"Inserted {len(plan.knowledge_missing)} knowledge entries",
     )
+    _check_cancelled(cancelled)
 
     started = time.perf_counter()
     with phase(log, operation_id, "blackstar_validation"):
