@@ -15,11 +15,11 @@ def qt_application():
     return QCoreApplication.instance() or QCoreApplication([])
 
 
-def _worker() -> BlackstarWorker:
+def _worker(*, dry_run: bool = True) -> BlackstarWorker:
     return BlackstarWorker(
         blob=b"fixture-copy",
         profile=SimpleNamespace(profile_id="fixture-current-20260714"),
-        dry_run=True,
+        dry_run=dry_run,
         operation_id="worker-test",
         generation=7,
         loaded_path="copied.save",
@@ -27,7 +27,8 @@ def _worker() -> BlackstarWorker:
 
 
 def test_worker_emits_ordered_progress_and_one_terminal_signal(monkeypatch) -> None:
-    expected = object()
+    expected = SimpleNamespace(output_blob=b"changed-candidate")
+    item = SimpleNamespace(item_no=1)
 
     def fake_unlock(**kwargs):
         kwargs["progress"](BlackstarProgress("parse", 1, 2, "Parsed"))
@@ -35,7 +36,14 @@ def test_worker_emits_ordered_progress_and_one_terminal_signal(monkeypatch) -> N
         return expected
 
     monkeypatch.setattr(blackstar_worker, "unlock_blackstar", fake_unlock)
-    worker = _worker()
+    monkeypatch.setattr(blackstar_worker, "scan_items", lambda _blob: [item], raising=False)
+    monkeypatch.setattr(
+        blackstar_worker,
+        "enrich_items_with_parc",
+        lambda _blob, _items: (1, "PARC mode: refreshed"),
+        raising=False,
+    )
+    worker = _worker(dry_run=False)
     progress = []
     completed = []
     failed = []
@@ -47,10 +55,35 @@ def test_worker_emits_ordered_progress_and_one_terminal_signal(monkeypatch) -> N
 
     worker.run()
 
-    assert [event.completed for event in progress] == [1, 2]
-    assert completed == [expected]
+    assert [event.completed for event in progress] == [1, 2, 6, 7]
+    assert completed[0].result is expected
+    assert completed[0].refreshed_items == (item,)
+    assert completed[0].parc_status == "PARC mode: refreshed"
     assert not failed
     assert not cancelled
+
+
+def test_dry_run_worker_does_not_refresh_items(monkeypatch) -> None:
+    expected = SimpleNamespace(output_blob=None)
+    monkeypatch.setattr(
+        blackstar_worker,
+        "unlock_blackstar",
+        lambda **_kwargs: expected,
+    )
+    monkeypatch.setattr(
+        blackstar_worker,
+        "scan_items",
+        lambda _blob: pytest.fail("dry run must not refresh items"),
+        raising=False,
+    )
+    worker = _worker(dry_run=True)
+    completed = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0].result is expected
+    assert completed[0].refreshed_items is None
 
 
 def test_worker_cancelled_before_start_emits_only_cancelled(monkeypatch) -> None:

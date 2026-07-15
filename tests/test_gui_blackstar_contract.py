@@ -42,3 +42,12 @@ def test_blackstar_completion_rejects_stale_results_and_supports_structural_undo
     assert "self._loaded_path != worker.loaded_path" in finish_source
     assert "previous_blob=current" in finish_source
     assert "entry.previous_blob" in undo_source
+
+
+def test_blackstar_completion_uses_worker_refresh_without_unreported_repairs() -> None:
+    finish_source = _method_source("_finish_blackstar_unlock")
+    refresh_source = _method_source("_apply_blackstar_refreshed_items")
+    assert "_scan_and_populate" not in finish_source
+    assert "_apply_blackstar_refreshed_items" in finish_source
+    assert "_fix_duplicate_item_nos" not in refresh_source
+    assert "_deferred_parc_enrich" not in refresh_source

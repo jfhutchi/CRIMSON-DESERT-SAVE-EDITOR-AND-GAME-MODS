@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 import save_crypto
+from blackstar_unlock import unlock_blackstar
+from save_compat import load_profiles, require_supported_identity
 from save_crypto import (
     VERSION_OFFSET,
     load_save_file,
@@ -83,3 +85,100 @@ def test_backup_failure_leaves_destination_untouched(
 
     assert _sha256(copied_save) == source_hash
     assert not list(copied_save.parent.glob(".save.save.*.tmp"))
+
+
+def test_save_as_backs_up_existing_destination_not_loaded_source(
+    copied_save: Path,
+    tmp_path: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    source_hash = _sha256(copied_save)
+    destination = tmp_path / "existing-slot" / "save.save"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(
+        serialize_save_bytes(
+            bytes(save.decompressed_blob),
+            save.raw_header,
+            "save-as-existing-destination-setup",
+        )
+    )
+    destination_hash = _sha256(destination)
+    assert destination_hash != source_hash
+
+    result = transactional_write_save(
+        destination=destination,
+        edited_blob=bytes(save.decompressed_blob),
+        original_header=save.raw_header,
+        backup_source=copied_save,
+        expected_identity=save.schema_identity,
+        operation_id="save-as-existing-destination-test",
+    )
+
+    assert result.backup_path.parent == destination.parent / "backups"
+    assert _sha256(result.backup_path) == destination_hash
+
+
+def test_destination_change_after_backup_aborts_replace(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    original_serialize = save_crypto.serialize_save_bytes
+    externally_changed = b"changed by another process"
+
+    def mutate_destination_after_backup(*args, **kwargs) -> bytes:
+        serialized = original_serialize(*args, **kwargs)
+        copied_save.write_bytes(externally_changed)
+        return serialized
+
+    monkeypatch.setattr(
+        save_crypto, "serialize_save_bytes", mutate_destination_after_backup
+    )
+    with pytest.raises(RuntimeError, match="changed after its verified backup"):
+        transactional_write_save(
+            destination=copied_save,
+            edited_blob=bytes(save.decompressed_blob),
+            original_header=save.raw_header,
+            backup_source=copied_save,
+            expected_identity=save.schema_identity,
+            operation_id="destination-race-test",
+        )
+
+    assert copied_save.read_bytes() == externally_changed
+
+
+def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
+    save = load_save_file(str(copied_save))
+    profile = require_supported_identity(save.schema_identity, load_profiles())
+    original_encrypted_hash = _sha256(copied_save)
+
+    applied = unlock_blackstar(
+        blob=save.decompressed_blob,
+        profile=profile,
+        dry_run=False,
+        operation_id="blackstar-transaction-test",
+    )
+    assert applied.output_blob is not None
+    assert applied.report.quest_changes == 0
+
+    write_result = transactional_write_save(
+        destination=copied_save,
+        edited_blob=applied.output_blob,
+        original_header=save.raw_header,
+        backup_source=copied_save,
+        expected_identity=save.schema_identity,
+        operation_id="blackstar-transaction-test",
+    )
+
+    assert _sha256(write_result.backup_path) == original_encrypted_hash
+    reloaded = load_save_file(str(copied_save))
+    second = unlock_blackstar(
+        blob=reloaded.decompressed_blob,
+        profile=profile,
+        dry_run=False,
+        operation_id="blackstar-transaction-second-run",
+    )
+    assert second.output_blob == bytes(reloaded.decompressed_blob)
+    assert second.report.byte_growth == 0
+    assert second.report.knowledge_added == ()
+    assert second.report.quest_changes == 0

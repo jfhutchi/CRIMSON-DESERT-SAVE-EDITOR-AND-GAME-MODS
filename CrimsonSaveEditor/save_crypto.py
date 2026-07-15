@@ -338,24 +338,31 @@ def transactional_write_save(
     candidate_identity = compute_schema_identity(edited_blob, original_header)
     if not schema_structure_matches(candidate_identity, expected_identity):
         raise UnknownSaveSchemaError("Edited blob schema differs from the loaded schema")
-    if not backup_source.is_file():
-        raise FileNotFoundError(f"Backup source does not exist: {backup_source}")
+    if destination.exists() and not destination.is_file():
+        raise IsADirectoryError(f"Save destination is not a file: {destination}")
 
-    backup_dir = backup_source.parent / "backups"
+    destination_was_present = destination.is_file()
+    # Save As may target another occupied slot. Preserve the bytes that are
+    # actually about to be replaced; for a new path, preserve the loaded source.
+    protected_source = destination if destination_was_present else backup_source
+    if not protected_source.is_file():
+        raise FileNotFoundError(f"Backup source does not exist: {protected_source}")
+
+    backup_dir = protected_source.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    backup_path = backup_dir / f"{backup_source.name}.{stamp}.bak"
+    backup_path = backup_dir / f"{protected_source.name}.{stamp}.bak"
     try:
         with phase(
             log,
             operation_id,
             "backup",
-            source=backup_source,
+            source=protected_source,
             destination=backup_path,
         ):
-            source_hash = _sha256_file(backup_source)
-            source_size = backup_source.stat().st_size
-            shutil.copy2(backup_source, backup_path)
+            source_hash = _sha256_file(protected_source)
+            source_size = protected_source.stat().st_size
+            shutil.copy2(protected_source, backup_path)
             if backup_path.stat().st_size != source_size:
                 raise OSError("Backup size verification failed")
             if _sha256_file(backup_path) != source_hash:
@@ -397,6 +404,20 @@ def transactional_write_save(
             if not schema_structure_matches(reloaded.schema_identity, expected_identity):
                 raise UnknownSaveSchemaError("Temporary save schema differs from loaded schema")
         with phase(log, operation_id, "final_write", destination=destination):
+            if destination_was_present:
+                if (
+                    not destination.is_file()
+                    or _sha256_file(destination) != source_hash
+                ):
+                    raise RuntimeError(
+                        "Save destination changed after its verified backup; "
+                        "refusing to overwrite newer bytes"
+                    )
+            elif destination.exists():
+                raise FileExistsError(
+                    "Save destination appeared after backup validation; refusing to "
+                    "overwrite an unprotected file"
+                )
             os.replace(temp_path, destination)
     finally:
         if temp_path.exists():

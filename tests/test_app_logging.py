@@ -1,6 +1,8 @@
 import logging
+import inspect
 from pathlib import Path
 
+import blackstar_unlock
 from app_logging import configure_logging, new_operation_id, phase
 
 
@@ -23,3 +25,9 @@ def test_phase_logs_start_success_and_elapsed_time(tmp_path: Path, caplog) -> No
     assert "phase_start" in text
     assert "phase_success" in text
     assert "elapsed_ms=" in text
+
+
+def test_blackstar_mount_and_knowledge_have_distinct_log_phases() -> None:
+    source = inspect.getsource(blackstar_unlock.apply_blackstar_plan)
+    assert '"blackstar_mount_insertion"' in source
+    assert '"blackstar_knowledge_insertion"' in source

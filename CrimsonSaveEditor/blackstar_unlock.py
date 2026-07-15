@@ -407,6 +407,7 @@ def apply_blackstar_plan(
     profile: CompatibilityProfile,
     spec: BlackstarSpec,
     plan: BlackstarPlan,
+    operation_id: str = "blackstar-plan",
 ) -> AppliedBlackstarPlan:
     blob = context.raw
     metrics = FixupMetrics()
@@ -414,18 +415,26 @@ def apply_blackstar_plan(
     knowledge_context = context
     if plan.mount_count == 0:
         started = time.perf_counter()
-        blob, mount_metrics = _insert_mount(context, profile, spec, plan)
+        with phase(log, operation_id, "blackstar_mount_insertion", bytes=206):
+            blob, mount_metrics = _insert_mount(context, profile, spec, plan)
         metrics += mount_metrics
         timings["mount_insertion"] = (time.perf_counter() - started) * 1000
         if plan.knowledge_missing:
             started = time.perf_counter()
-            knowledge_context = build_insert_context(blob)
+            with phase(log, operation_id, "blackstar_mount_reparse"):
+                knowledge_context = build_insert_context(blob)
             timings["mount_reparse"] = (time.perf_counter() - started) * 1000
     if plan.knowledge_missing:
         started = time.perf_counter()
-        blob, knowledge_metrics = insert_knowledge_keys_with_context(
-            knowledge_context, plan.knowledge_missing
-        )
+        with phase(
+            log,
+            operation_id,
+            "blackstar_knowledge_insertion",
+            count=len(plan.knowledge_missing),
+        ):
+            blob, knowledge_metrics = insert_knowledge_keys_with_context(
+                knowledge_context, plan.knowledge_missing
+            )
         metrics += knowledge_metrics
         timings["knowledge_insertion"] = (time.perf_counter() - started) * 1000
     return AppliedBlackstarPlan(blob, metrics, timings)
@@ -446,10 +455,14 @@ def _canonical_field(value) -> tuple:
 
 
 def canonical_quest_snapshot(context: ParsedInsertContext) -> tuple:
-    for obj in context.result["objects"]:
-        if obj.class_name == "QuestSaveData":
-            return tuple(_canonical_field(item) for item in obj.fields)
-    raise BlackstarValidationError("QuestSaveData is missing")
+    snapshots = tuple(
+        tuple(_canonical_field(item) for item in obj.fields)
+        for obj in context.result["objects"]
+        if obj.class_name == "QuestSaveData"
+    )
+    if not snapshots:
+        raise BlackstarValidationError("QuestSaveData is missing")
+    return snapshots
 
 
 def _emit(
@@ -522,10 +535,12 @@ def unlock_blackstar(
     with phase(
         log,
         operation_id,
-        "blackstar_mount_insertion",
+        "blackstar_candidate_build",
         needed=plan.mount_count == 0,
     ):
-        applied = apply_blackstar_plan(context, profile, spec, plan)
+        applied = apply_blackstar_plan(
+            context, profile, spec, plan, operation_id=operation_id
+        )
     timings.update(applied.timings_ms)
     _check_cancelled(cancelled)
     _emit(

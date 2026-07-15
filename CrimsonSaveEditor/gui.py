@@ -9687,10 +9687,11 @@ QCheckBox::indicator {{
         self._blackstar_progress.setLabelText(event.message)
         self._update_status(f"Blackstar: {event.message}")
 
-    def _finish_blackstar_unlock(self, result) -> None:
+    def _finish_blackstar_unlock(self, worker_result) -> None:
         worker = self._blackstar_worker
         if not worker or not self._save_data:
             return
+        result = worker_result.result
         current = bytes(self._save_data.decompressed_blob)
         if self._save_data.document_generation != worker.generation:
             return self._discard_stale_blackstar_result()
@@ -9701,6 +9702,10 @@ QCheckBox::indicator {{
 
         changed = result.output_blob is not None and result.output_blob != current
         if changed:
+            if worker_result.refreshed_items is None:
+                return self._fail_blackstar_unlock(
+                    "The background item-offset refresh did not complete.", ""
+                )
             self._undo_stack.append(
                 UndoEntry(
                     description="Blackstar unlock (no quest changes)",
@@ -9711,7 +9716,9 @@ QCheckBox::indicator {{
             self._document_generation_counter += 1
             self._save_data.document_generation = self._document_generation_counter
             self._dirty = True
-            self._scan_and_populate()
+            self._apply_blackstar_refreshed_items(
+                worker_result.refreshed_items, worker_result.parc_status
+            )
 
         report = result.report
         mode = "Dry run" if self._blackstar_dry_run_active else "Apply"
@@ -9738,6 +9745,29 @@ QCheckBox::indicator {{
         if self._blackstar_progress is not None:
             self._blackstar_progress.close()
         QMessageBox.information(self, "Blackstar Unlock Report", details)
+
+    def _apply_blackstar_refreshed_items(self, items, parc_status: str) -> None:
+        self._items = list(items)
+        for item in self._items:
+            item.name = self._name_db.get_name(item.item_key)
+            item.category = self._name_db.get_category(item.item_key)
+
+        self._parc_status = parc_status or "Legacy mode: pattern-based scanning"
+        self._status_parc_label.setText(self._parc_status)
+        status_color = (
+            COLORS["success"] if parc_status else COLORS["text_dim"]
+        )
+        self._status_parc_label.setStyleSheet(
+            f"color: {status_color}; padding: 0 8px;"
+        )
+        self._enrich_vendor_names()
+        self._update_inv_subtab_counts()
+        self._populate_inventory()
+        self._populate_equipment()
+        self._populate_repurchase()
+        self._populate_socket_items()
+        self._populate_faction_tab()
+        self._inv_count_label.setText(str(len(self._items)))
 
     def _discard_stale_blackstar_result(self) -> None:
         log.warning("Discarded stale Blackstar worker result")
@@ -31481,7 +31511,8 @@ QCheckBox::indicator {{
             "the destination is replaced. The temporary output will also be decrypted "
             "and validated before the final write.\n\n"
             f"Destination: {path}\n"
-            f"Backup source: {self._loaded_path}\n\n"
+            "Backup policy: preserve the existing destination; if this is a new path, "
+            f"preserve the loaded source ({self._loaded_path}).\n\n"
             "Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,

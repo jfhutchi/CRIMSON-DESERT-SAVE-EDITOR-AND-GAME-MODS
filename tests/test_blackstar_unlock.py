@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,3 +176,27 @@ def test_duplicate_requested_knowledge_is_refused(
 def test_production_service_has_no_quest_insertion_dependency() -> None:
     source = inspect.getsource(blackstar_unlock)
     assert "insert_quest" not in source
+
+
+def test_quest_snapshot_covers_every_quest_object() -> None:
+    def quest(value: str):
+        field = SimpleNamespace(
+            field_index=0,
+            name="_questStateList",
+            type_name="list",
+            present=True,
+            value_repr=value,
+            child_mask_bytes=b"",
+            child_fields=None,
+            list_elements=None,
+        )
+        return SimpleNamespace(class_name="QuestSaveData", fields=[field])
+
+    first = SimpleNamespace(
+        result={"objects": [quest("unchanged"), quest("second-before")]}
+    )
+    second = SimpleNamespace(
+        result={"objects": [quest("unchanged"), quest("second-after")]}
+    )
+
+    assert canonical_quest_snapshot(first) != canonical_quest_snapshot(second)

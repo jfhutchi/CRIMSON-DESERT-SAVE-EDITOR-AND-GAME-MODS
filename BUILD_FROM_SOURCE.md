@@ -47,6 +47,22 @@ the virtual environment before building; the spec includes it conditionally.
 Pillow is not a dependency: the source has no Pillow import and PyInstaller does
 not require it for this build.
 
+## Expected optional-module warnings
+
+PyInstaller's warning report includes Windows-inapplicable standard-library
+modules such as `pwd`, `grp`, `posix`, `resource`, `termios`, and `fcntl`; these
+are not Windows dependencies. It also reports optional `crimson_rs` imports and
+delayed game-mod helper imports such as `paz_parse`, `dropset_editor`,
+`pipeline_report`, `wantedinfo_parser`, and `mod_loader`. Those helpers belong to
+the separate `CrimsonGameMods` surface (or are absent experimental modules), so
+their related game-mod tabs may be unavailable in the Save Editor standalone.
+Build `CrimsonGameMods` separately if you need that surface.
+
+The Blackstar/save pipeline modules (`app_logging`, `blackstar_unlock`,
+`blackstar_worker`, `parc_inserter3`, `parc_serializer`, `save_compat`,
+`save_crypto`, and `save_parser`) must not appear as missing. They were all
+collected in the verified build.
+
 ## Create the environment
 
 ```powershell
@@ -125,8 +141,13 @@ hidden imports.
 - Logs are written to `%LOCALAPPDATA%\CrimsonSaveEditor\logs\crimson-save-editor.log`.
 - Unknown save schemas load read-only; the editor refuses Blackstar changes and writes.
 - Every GUI save creates and hash-verifies a backup before writing a sibling temp file.
+  Save As preserves an existing destination (the file at risk); a new destination
+  preserves the loaded source instead.
 - The temp file is decrypted and schema-validated before atomic replacement.
-- Blackstar defaults to dry-run and runs parsing/validation on a background thread.
+- A destination hash is rechecked immediately before replacement, so an external
+  change made after backup aborts the write instead of being overwritten.
+- Blackstar defaults to dry-run and runs parsing, validation, and post-edit item
+  offset enrichment on a background thread.
 
 If a build fails, keep the full PyInstaller output and the application operation
 ID from any error dialog. Do not work around a missing manifest, parser DLL,

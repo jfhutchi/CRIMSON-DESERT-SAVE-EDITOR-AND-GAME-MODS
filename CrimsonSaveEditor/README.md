@@ -12,10 +12,14 @@ unknown schemas, duplicate Blackstar mounts, duplicate requested knowledge, or
 any candidate whose canonical quest semantics change. Applying twice is a
 byte-identical no-op.
 
+After an apply, item offsets are refreshed on the same worker thread. This path
+does not run unrelated inventory repairs outside the reported Blackstar mutation.
+
 GUI writes require a known compatibility profile. Before every write the editor
 creates and SHA-256-verifies an encrypted backup, writes a sibling temporary
 file, decrypts and validates it, and only then atomically replaces the
-destination.
+destination. Save As backs up an existing destination rather than an unrelated
+loaded slot, and a last-moment destination hash check rejects concurrent changes.
 
 ## Windows build
 
