@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import traceback
 log = logging.getLogger(__name__)
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QBrush, QShortcut,
 )
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QSplitter, QFrame, QAbstractItemView,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QProgressBar, QTextEdit, QCheckBox, QApplication, QDockWidget,
-    QSlider,
+    QSlider, QProgressDialog,
 )
 
 from models import SaveItem, SaveData, UndoEntry
@@ -2439,6 +2440,13 @@ class MainWindow(QMainWindow):
         self._undo_stack: List[UndoEntry] = []
         self._loaded_path: str = ""
         self._dirty: bool = False
+        self._document_generation_counter = 0
+        self._blackstar_thread = None
+        self._blackstar_worker = None
+        self._blackstar_progress = None
+        self._blackstar_input_hash = ""
+        self._blackstar_previous_blob = None
+        self._blackstar_dry_run_active = True
         self._parc_status: str = ""
         self._config: dict = self._load_config()
 
@@ -3510,14 +3518,17 @@ class MainWindow(QMainWindow):
         open_save.setShortcut(QKeySequence("Ctrl+O"))
         open_save.triggered.connect(self._open_save_file)
         file_menu.addAction(open_save)
+        self._open_save_action = open_save
 
         open_raw = QAction("Open Raw Stream (.bin)...", self)
         open_raw.triggered.connect(self._open_raw_stream)
         file_menu.addAction(open_raw)
+        self._open_raw_action = open_raw
 
         auto_find = QAction("Auto-Find Save Files...", self)
         auto_find.triggered.connect(self._auto_find_save)
         file_menu.addAction(auto_find)
+        self._auto_find_action = auto_find
 
         file_menu.addSeparator()
 
@@ -3525,11 +3536,13 @@ class MainWindow(QMainWindow):
         save_act.setShortcut(QKeySequence("Ctrl+S"))
         save_act.triggered.connect(self._save_file)
         file_menu.addAction(save_act)
+        self._save_action = save_act
 
         save_as = QAction("Save As...", self)
         save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_as.triggered.connect(self._save_file_as)
         file_menu.addAction(save_as)
+        self._save_as_action = save_as
 
         file_menu.addSeparator()
 
@@ -3544,6 +3557,7 @@ class MainWindow(QMainWindow):
         undo_act.setShortcut(QKeySequence("Ctrl+Z"))
         undo_act.triggered.connect(self._undo)
         edit_menu.addAction(undo_act)
+        self._undo_action = undo_act
 
         edit_menu.addSeparator()
         font_menu = edit_menu.addMenu("Font Size")
@@ -7552,10 +7566,17 @@ QCheckBox::indicator {{
         dragon_334_btn.clicked.connect(self._unlock_dragon_mount)
         btn_row2.addWidget(dragon_334_btn)
 
-        dragon_nq_btn = QPushButton("Unlock Dragon (No Quest)")
-        dragon_nq_btn.setToolTip("Insert Dragon mount + filtered knowledge keys — no quest changes")
-        dragon_nq_btn.clicked.connect(self._unlock_dragon_mount_no_quests)
-        btn_row2.addWidget(dragon_nq_btn)
+        self._blackstar_dry_run = QCheckBox("Dry run (no changes)")
+        self._blackstar_dry_run.setChecked(True)
+        btn_row2.addWidget(self._blackstar_dry_run)
+
+        self._blackstar_btn = QPushButton("Unlock Blackstar (No Quest Changes)")
+        self._blackstar_btn.setToolTip(
+            "Analyze or insert Blackstar plus the filtered knowledge set. "
+            "Quest completion flags are never changed."
+        )
+        self._blackstar_btn.clicked.connect(self._start_blackstar_unlock)
+        btn_row2.addWidget(self._blackstar_btn)
 
         btn_row2.addStretch()
         layout.addLayout(btn_row2)
@@ -9518,200 +9539,209 @@ QCheckBox::indicator {{
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Dragon Mount Error", str(e))
 
-    def _unlock_dragon_mount_no_quests(self) -> None:
-        if not self._save_data:
-            QMessageBox.warning(self, "Dragon Mount", "Load a save file first.")
+    def _start_blackstar_unlock(self) -> None:
+        if not self._save_data or not self._loaded_path:
+            QMessageBox.warning(self, "Blackstar", "Load a save file first.")
+            return
+        if self._blackstar_thread is not None:
+            QMessageBox.information(self, "Blackstar", "A Blackstar operation is already running.")
+            return
+        if not self._save_data.is_schema_supported or self._save_data.schema_identity is None:
+            digest = (
+                self._save_data.schema_identity.schema_sha256
+                if self._save_data.schema_identity
+                else "unavailable"
+            )
+            QMessageBox.critical(
+                self,
+                "Unsupported Save Schema",
+                "This save is available for inspection only. Blackstar changes are "
+                f"disabled because its schema is unknown.\n\nSchema SHA-256: {digest}",
+            )
             return
 
-        reply = QMessageBox.warning(
-            self, "Unlock Dragon Mount (No Quests)",
-            "This will:\n"
-            "1. Add Dragon mercenary entry (charKey=1000799)\n"
-            "2. Inject ~150 filtered knowledge entries:\n"
-            "   - Riding, dragon, skills, UI, dyes, tools, minigames\n"
-            "   - No quests/abyss/nodes/factions/regions/NPCs/animals/bosses\n\n"
-            "NO quest changes.\n\n"
-            "Requirements:\n"
-            "- A save with at least one mercenary/horse\n\n"
-            "Continue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self._update_status("Unlocking Dragon mount (no quests)...")
-        QApplication.processEvents()
+        from app_logging import new_operation_id
+        from blackstar_worker import BlackstarWorker
+        from save_compat import load_profiles, require_supported_identity
 
         try:
-            import struct
-            import parc_inserter3 as pi
-            sys_path = __import__('sys').path
-            if 'Communitydump/desktopeditor' not in sys_path:
-                sys_path.insert(0, 'Communitydump/desktopeditor')
-            import save_parser as sp
-            import parc_serializer as ps
-
-            raw = bytes(self._save_data.decompressed_blob)
-            parc = ps.parse_parc_blob(raw)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            for obj in result['objects']:
-                if 'MercenaryClan' in obj.class_name:
-                    for f in obj.fields:
-                        if f.name == '_mercenaryDataList' and f.list_elements:
-                            for elem in f.list_elements:
-                                if hasattr(elem, 'child_fields') and elem.child_fields:
-                                    for cf in elem.child_fields:
-                                        if cf.name == '_characterKey' and cf.present:
-                                            if struct.unpack_from('<I', raw, cf.start_offset)[0] == 1000799:
-                                                QMessageBox.information(self, "Dragon Mount",
-                                                    "Dragon is already in your mercenary list!")
-                                                return
-
-            name_to_idx = {parc.types[i].name: i for i in range(len(parc.types))}
-            if 'MercenarySaveData' not in name_to_idx:
-                QMessageBox.critical(self, "Dragon Mount",
-                    "This save doesn't have the MercenarySaveData schema type.\n"
-                    "You need a save with mercenaries (at least one horse).")
-                return
-
-            DRAGON_HEX = (
-                "06000519801f0003380000ffffffffffffffff"
-                "591e1200000000005f450f00f90300000000000001"
-                "001c3a0000ffffffffffffffff7b1e120000000000"
-                "0100002e0000ffffffffffffffff911e12000000000004000000"
-                "0100002e0000ffffffffffffffffab1e12000000000004000000"
-                "0100002e0000ffffffffffffffffc51e12000000000004000000"
-                "520000001cdd8dc3000000001cdd8dc30000000001eb7b45c6"
-                "90098144e2862dc59e9c673f0100000001010101010101"
-                "c40900000000000000000000000000b4000000"
+            profile = require_supported_identity(
+                self._save_data.schema_identity, load_profiles()
             )
-            dragon_bytes = bytearray(bytes.fromhex(DRAGON_HEX))
+        except Exception as exc:
+            QMessageBox.critical(self, "Unsupported Save Schema", str(exc))
+            return
 
-            SOURCE_TYPES = {56: 'MercenarySaveData', 58: 'ExperienceLevelSaveData', 46: 'FriendlyDailyCountSaveData'}
-            mbc = struct.unpack_from('<H', dragon_bytes, 0)[0]
-            old_ti = struct.unpack_from('<H', dragon_bytes, 2 + mbc)[0]
-            new_ti = name_to_idx.get(SOURCE_TYPES.get(old_ti, ''), old_ti)
-            struct.pack_into('<H', dragon_bytes, 2 + mbc, new_ti)
+        current = bytes(self._save_data.decompressed_blob)
+        self._blackstar_input_hash = hashlib.sha256(current).hexdigest()
+        self._blackstar_previous_blob = current
+        self._blackstar_dry_run_active = self._blackstar_dry_run.isChecked()
+        operation_id = new_operation_id("blackstar")
+        thread = QThread(self)
+        worker = BlackstarWorker(
+            blob=current,
+            profile=profile,
+            dry_run=self._blackstar_dry_run_active,
+            operation_id=operation_id,
+            generation=self._save_data.document_generation,
+            loaded_path=self._loaded_path,
+        )
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Preparing Blackstar analysis...", "Cancel", 0, 6, self
+        )
+        progress.setWindowTitle("Blackstar Unlock")
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.setValue(0)
 
-            sentinel = b'\xff\xff\xff\xff\xff\xff\xff\xff'
-            for pos in range(23, len(dragon_bytes) - 8):
-                if dragon_bytes[pos:pos+8] == sentinel and pos >= 3:
-                    nested_ti = struct.unpack_from('<H', dragon_bytes, pos - 3)[0]
-                    if nested_ti in SOURCE_TYPES:
-                        target_name = SOURCE_TYPES[nested_ti]
-                        if target_name in name_to_idx:
-                            struct.pack_into('<H', dragon_bytes, pos - 3, name_to_idx[target_name])
+        self._blackstar_thread = thread
+        self._blackstar_worker = worker
+        self._blackstar_progress = progress
+        self._set_blackstar_busy(True)
 
-            insert_pos = None
-            list_start = None
-            orig_count = 0
-            for obj in result['objects']:
-                if 'MercenaryClan' in obj.class_name:
-                    for f in obj.fields:
-                        if f.name == '_mercenaryDataList' and f.list_elements:
-                            insert_pos = f.list_elements[-1].end_offset
-                            list_start = f.start_offset
-                            orig_count = len(f.list_elements)
-                            break
-                    break
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_blackstar_progress)
+        worker.completed.connect(self._finish_blackstar_unlock)
+        worker.failed.connect(self._fail_blackstar_unlock)
+        worker.cancelled.connect(self._cancel_blackstar_unlock)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._cleanup_blackstar_unlock)
+        progress.canceled.connect(lambda: worker.request_cancel())
+        log.info(
+            "operation=%s blackstar_worker_start dry_run=%s generation=%s "
+            "input_sha256=%s path=%s",
+            operation_id,
+            self._blackstar_dry_run_active,
+            worker.generation,
+            self._blackstar_input_hash,
+            self._loaded_path,
+        )
+        progress.show()
+        thread.start()
 
-            if insert_pos is None:
-                QMessageBox.critical(self, "Dragon Mount",
-                    "Could not find _mercenaryDataList in your save.")
-                return
+    def _set_blackstar_busy(self, busy: bool) -> None:
+        for action_name in (
+            "_open_save_action",
+            "_open_raw_action",
+            "_auto_find_action",
+            "_save_action",
+            "_save_as_action",
+            "_undo_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and self._save_data is not None)
+        if hasattr(self, "_tabs"):
+            self._tabs.setEnabled(not busy)
+        if hasattr(self, "_blackstar_btn"):
+            self._blackstar_btn.setEnabled(not busy)
+        if hasattr(self, "_blackstar_dry_run"):
+            self._blackstar_dry_run.setEnabled(not busy)
 
-            for pos in range(len(dragon_bytes) - 12):
-                if dragon_bytes[pos:pos+8] == sentinel:
-                    po_pos = pos + 8
-                    struct.pack_into('<I', dragon_bytes, po_pos, insert_pos + po_pos + 4)
+    def _update_blackstar_progress(self, event) -> None:
+        if self._blackstar_progress is None:
+            return
+        self._blackstar_progress.setMaximum(event.total)
+        self._blackstar_progress.setValue(event.completed)
+        self._blackstar_progress.setLabelText(event.message)
+        self._update_status(f"Blackstar: {event.message}")
 
-            blob = bytearray(raw)
-            blob[insert_pos:insert_pos] = dragon_bytes
-            growth = len(dragon_bytes)
+    def _finish_blackstar_unlock(self, result) -> None:
+        worker = self._blackstar_worker
+        if not worker or not self._save_data:
+            return
+        current = bytes(self._save_data.decompressed_blob)
+        if self._save_data.document_generation != worker.generation:
+            return self._discard_stale_blackstar_result()
+        if hashlib.sha256(current).hexdigest() != self._blackstar_input_hash:
+            return self._discard_stale_blackstar_result()
+        if self._loaded_path != worker.loaded_path:
+            return self._discard_stale_blackstar_result()
 
-            pi._fixup_trailing_sizes(blob, raw, insert_pos, growth, 'MercenaryClanSaveData')
-
-            prefix = blob[list_start]
-            if prefix == 1:
-                old_c = (blob[list_start+1] << 8) | blob[list_start+2]
-                blob[list_start+1] = ((old_c+1) >> 8) & 0xFF
-                blob[list_start+2] = (old_c+1) & 0xFF
-            elif prefix == 0:
-                old_c = blob[list_start+1] | (blob[list_start+2] << 8) | (blob[list_start+3] << 16)
-                blob[list_start+1] = (old_c+1) & 0xFF
-                blob[list_start+2] = ((old_c+1) >> 8) & 0xFF
-
-            merc_toc = None
-            for i, e in enumerate(parc.toc_entries):
-                td = parc.type_by_index.get(e.class_index)
-                if td and 'MercenaryClan' in td.name:
-                    merc_toc = i
-                    break
-
-            po_fixed = pi._fixup_external(blob, raw, parc, merc_toc, insert_pos, growth)
-
-            dragon_knowledge_keys = [
-                40038, 1000174, 1000175, 1000187, 1000189, 1000697, 1000720,
-                1000948, 1001892, 1003893, 1004138, 1004154, 1004176, 1004177,
-                1004178, 2147483119, 2147483121, 2147483122, 2147483123,
-                2147483124, 2147483125, 2147483126, 2147483127, 2147483128,
-                2147483130, 2147483131, 2147483132, 2147483133, 2147483134,
-                2147483135, 2601, 2602, 2603, 2617, 2618,
-                1000560, 1001083, 1003311,
-                40001, 40002, 40003, 40012, 40013, 40014, 40018, 40024, 40028,
-                40030, 40034, 40036, 40039, 40048, 40063, 40064, 40065, 40068,
-                40069, 40071, 40072, 40082, 40086, 40089, 40090, 40091, 40114,
-                1000000, 1000001, 1000013, 1000014, 1000024, 1000034, 1000037,
-                1000100, 1000101, 1000109, 1000134, 1000137, 1000138, 1000210,
-                1000230, 1000490, 1000493, 1000908, 1000929, 1001116, 1001117,
-                1001710, 1001744, 1001756, 1001760, 1001789, 1002348, 1002349,
-                1002351, 1002352, 1002710, 1002741, 1002743, 1003088, 1003090,
-                1003108, 1003245, 1003269, 1003273, 1003274, 1003279, 1003346,
-                1003359, 1003482, 1003505, 1003508, 1003512, 1003513, 1003518,
-                1003519, 1003521, 1003522, 1003523, 1003524, 1003525, 1003571,
-                1000372, 1000375, 1000738, 1001290, 1001297, 1001298, 1001434,
-                1001435, 1001436, 1001453, 1001463, 1001464, 1001465, 1001541,
-                1001542, 1001550, 1001553, 1001704, 1002592, 1003325, 1003334,
-                1003341, 1003467, 1003468, 1003470, 1003472, 1003473, 1003474,
-                1003475, 1003476, 1003477, 1003480, 1003481, 1003492, 1003494,
-                1003495, 1003500, 1003501, 1003502, 1003503, 1003504, 1003507,
-                1003510,
-                1000070, 1000574, 1001100, 1001422,
-                1000297, 1000464, 1000776, 1001287, 1001511, 1001516,
-                2147483447, 2147483454,
-                1001304, 1001664, 1001692, 1001695, 1001700, 1001895, 1001897,
-                1001651, 1002833, 1003658, 1003790,
-            ]
-            ok, new_blob, msg = pi.inject_all_knowledge(blob, keys_filter=dragon_knowledge_keys)
-            if ok:
-                blob = bytearray(new_blob)
-
-            self._save_data.decompressed_blob = bytearray(blob)
+        changed = result.output_blob is not None and result.output_blob != current
+        if changed:
+            self._undo_stack.append(
+                UndoEntry(
+                    description="Blackstar unlock (no quest changes)",
+                    previous_blob=current,
+                )
+            )
+            self._save_data.decompressed_blob = bytearray(result.output_blob)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
             self._dirty = True
+            self._scan_and_populate()
 
-            self._undo_stack.append(UndoEntry(
-                description="Dragon Mount unlock (no quests)",
-                patches=[],
-            ))
-
-            self._populate_equipment()
-            self._populate_inventory()
-            self._update_status(
-                f"Dragon unlocked (no quests)! {orig_count}→{orig_count+1} mercs, "
-                f"{po_fixed} POs fixed. Save with Ctrl+S."
+        report = result.report
+        mode = "Dry run" if self._blackstar_dry_run_active else "Apply"
+        action = "would be added" if self._blackstar_dry_run_active else "added"
+        details = (
+            f"Mode: {mode}\n"
+            f"Compatibility profile: {result.profile_id}\n"
+            f"Mounts: {report.mount_before} -> {report.mount_after}\n"
+            f"Knowledge {action}: {len(report.knowledge_added)}\n"
+            f"Knowledge already present: {len(report.knowledge_skipped)}\n"
+            f"Quest completion changes: {report.quest_changes}\n"
+            f"Byte growth: {report.byte_growth}\n"
+            f"Candidate SHA-256: {result.candidate_sha256}"
+        )
+        self._update_status(
+            "Blackstar dry run complete; no bytes changed."
+            if self._blackstar_dry_run_active
+            else (
+                "Blackstar candidate applied in memory; save with Ctrl+S."
+                if changed
+                else "Blackstar unlock was already complete."
             )
+        )
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.information(self, "Blackstar Unlock Report", details)
 
-            QMessageBox.information(self, "Dragon Mount Unlocked (No Quests)",
-                f"Dragon (Blackstar) added to your mercenary list!\n\n"
-                f"Mercenaries: {orig_count} → {orig_count + 1}\n"
-                f"Quests: NOT modified\n"
-                f"Knowledge: ~150 filtered entries injected\n\n"
-                f"Save (Ctrl+S) and reload in-game.")
+    def _discard_stale_blackstar_result(self) -> None:
+        log.warning("Discarded stale Blackstar worker result")
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.warning(
+            self,
+            "Blackstar Result Discarded",
+            "The loaded save changed while the operation was running. "
+            "No Blackstar result was applied.",
+        )
 
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "Dragon Mount Error", str(e))
+    def _fail_blackstar_unlock(self, message: str, traceback_text: str) -> None:
+        log.error("Blackstar worker failed: %s\n%s", message, traceback_text)
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.critical(
+            self,
+            "Blackstar Unlock Failed",
+            f"{message}\n\nThe save was not changed. See the application log for details.",
+        )
+
+    def _cancel_blackstar_unlock(self) -> None:
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        self._update_status("Blackstar operation cancelled; no result applied.")
+
+    def _cleanup_blackstar_unlock(self) -> None:
+        thread = self._blackstar_thread
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        self._blackstar_progress = None
+        self._blackstar_worker = None
+        self._blackstar_thread = None
+        self._blackstar_previous_blob = None
+        self._set_blackstar_busy(False)
+        if thread is not None:
+            thread.deleteLater()
 
     def _build_quest_placeholder(self) -> None:
         pass
@@ -31217,6 +31247,8 @@ QCheckBox::indicator {{
             return
         try:
             self._save_data = load_raw_stream(path)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
@@ -31281,6 +31313,8 @@ QCheckBox::indicator {{
         try:
             _step("Decrypting save file...", 1)
             self._save_data = load_save_file(path)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
@@ -34228,6 +34262,14 @@ QCheckBox::indicator {{
             return
 
         entry = self._undo_stack.pop()
+        if entry.previous_blob is not None:
+            self._save_data.decompressed_blob = bytearray(entry.previous_blob)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
+            self._scan_and_populate()
+            self._dirty = bool(self._undo_stack)
+            self._update_status(f"Undone: {entry.description}")
+            return
         blob = self._save_data.decompressed_blob
 
         for offset, old_bytes, _new_bytes in entry.patches:
