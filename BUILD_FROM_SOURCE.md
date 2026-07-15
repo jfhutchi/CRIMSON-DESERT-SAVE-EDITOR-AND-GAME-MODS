@@ -36,6 +36,33 @@ Development/build dependencies are pinned in
 and pytest-timeout 2.4.0. PyInstaller also installs altgraph, packaging,
 pefile, pyinstaller-hooks-contrib, pywin32-ctypes, and setuptools.
 
+For an exact reproducibility check, the verified virtual environment resolved
+to this complete package set (direct and transitive):
+
+```text
+altgraph==0.17.5
+cffi==2.1.0
+colorama==0.4.6
+cryptography==49.0.0
+iniconfig==2.3.0
+lz4==4.4.5
+packaging==26.2
+pefile==2024.8.26
+pluggy==1.6.0
+pycparser==3.0
+Pygments==2.20.0
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+PySide6==6.8.3
+PySide6_Addons==6.8.3
+PySide6_Essentials==6.8.3
+pytest==9.1.1
+pytest-timeout==2.4.0
+pywin32-ctypes==0.2.3
+setuptools==83.0.0
+shiboken6==6.8.3
+```
+
 `crimson_rs` is optional for the standalone save editor. It supports unrelated
 game-archive extraction and mod-packing features, is not published on PyPI, and
 is not included in this repository. The source build omits those optional
