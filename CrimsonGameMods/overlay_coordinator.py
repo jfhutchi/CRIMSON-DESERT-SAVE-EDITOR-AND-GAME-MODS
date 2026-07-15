@@ -49,6 +49,7 @@ OUR_GROUPS = {
     "0062": "Stacker (merged items)",
     "0063": "Stacker (equipslot) / SkillTree",
     "0064": "ItemBuffs (localization)",
+    "0066": "Dragon Wheel (reserveslot)",
 }
 
 # Prefixes that identify DMM-owned groups
