@@ -33,21 +33,19 @@ def test_blackstar_dry_run_defaults_on_and_uses_qthread() -> None:
     assert "insert_quest_completed" not in start_source
 
 
-def test_blackstar_completion_rejects_stale_results_and_supports_structural_undo() -> None:
+def test_blackstar_completion_rejects_stale_results_without_structural_undo() -> None:
     finish_source = _method_source("_finish_blackstar_unlock")
-    undo_source = _method_source("_undo")
     assert "document_generation" in finish_source
     assert "hashlib.sha256(current).hexdigest()" in finish_source
     assert "self._blackstar_input_hash" in finish_source
     assert "self._loaded_path != worker.loaded_path" in finish_source
-    assert "previous_blob=current" in finish_source
-    assert "entry.previous_blob" in undo_source
+    assert "_blackstar_preview_token" in finish_source
+    assert "previous_blob=current" not in finish_source
 
 
-def test_blackstar_completion_uses_worker_refresh_without_unreported_repairs() -> None:
+def test_blackstar_completion_reloads_atomic_write_without_gui_owned_mutation() -> None:
     finish_source = _method_source("_finish_blackstar_unlock")
-    refresh_source = _method_source("_apply_blackstar_refreshed_items")
+    full_source = GUI_PATH.read_text(encoding="utf-8")
     assert "_scan_and_populate" not in finish_source
-    assert "_apply_blackstar_refreshed_items" in finish_source
-    assert "_fix_duplicate_item_nos" not in refresh_source
-    assert "_deferred_parc_enrich" not in refresh_source
+    assert "_load_save(path)" in finish_source
+    assert "_apply_blackstar_refreshed_items" not in full_source

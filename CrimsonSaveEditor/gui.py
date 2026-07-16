@@ -9738,29 +9738,6 @@ QCheckBox::indicator {{
             self._blackstar_preview_token = None
             self._load_save(path)
 
-    def _apply_blackstar_refreshed_items(self, items, parc_status: str) -> None:
-        self._items = list(items)
-        for item in self._items:
-            item.name = self._name_db.get_name(item.item_key)
-            item.category = self._name_db.get_category(item.item_key)
-
-        self._parc_status = parc_status or "Legacy mode: pattern-based scanning"
-        self._status_parc_label.setText(self._parc_status)
-        status_color = (
-            COLORS["success"] if parc_status else COLORS["text_dim"]
-        )
-        self._status_parc_label.setStyleSheet(
-            f"color: {status_color}; padding: 0 8px;"
-        )
-        self._enrich_vendor_names()
-        self._update_inv_subtab_counts()
-        self._populate_inventory()
-        self._populate_equipment()
-        self._populate_repurchase()
-        self._populate_socket_items()
-        self._populate_faction_tab()
-        self._inv_count_label.setText(str(len(self._items)))
-
     def _discard_stale_blackstar_result(self) -> None:
         log.warning("Discarded stale Blackstar worker result")
         if self._blackstar_progress is not None:
@@ -31419,21 +31396,25 @@ QCheckBox::indicator {{
             self._refresh_sidebar()
 
             self._update_schema_write_controls()
-            self._quick_save_btn.setToolTip(f"Save to: {path}")
-
-            if not self._save_data.is_schema_supported:
-                QMessageBox.warning(
-                    self,
-                    "Unknown Save Schema — Read Only",
-                    "This save loaded for inspection, but writing and Blackstar changes "
-                    "are disabled because its schema is not enrolled.\n\n"
-                    f"Schema SHA-256: {self._save_data.schema_identity.schema_sha256}",
+            schema_notice = ""
+            if self._save_data.is_schema_supported:
+                self._quick_save_btn.setToolTip(f"Save to: {path}")
+            else:
+                schema_sha256 = self._save_data.schema_identity.schema_sha256
+                log.warning(
+                    "Loaded unknown full save schema %s read-only; General Save disabled; "
+                    "Blackstar Preview uses its own compatibility check.",
+                    schema_sha256,
+                )
+                schema_notice = (
+                    " | General Save disabled (unknown full schema); "
+                    "Blackstar Preview uses its own compatibility check"
                 )
 
             self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
-            self._update_status(f"Loaded: {friendly} ({slot_dir})")
-
             progress.setValue(5)
+            progress.close()
+            self._update_status(f"Loaded: {friendly} ({slot_dir}){schema_notice}")
         except Warning as w:
             self._update_status(f"Loaded (HMAC warning): {os.path.basename(path)}")
             progress.close()

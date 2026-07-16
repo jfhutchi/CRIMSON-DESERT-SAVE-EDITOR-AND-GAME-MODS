@@ -50,6 +50,14 @@ def test_load_applies_read_only_schema_controls() -> None:
     assert "_blackstar_btn" in controls_source
 
 
+def test_unknown_full_schema_notice_is_non_blocking_and_feature_scoped() -> None:
+    load_source = _methods("_load_save")[0]
+    assert "QMessageBox.warning" not in load_source
+    assert "General Save disabled" in load_source
+    assert "Blackstar Preview uses its own compatibility check" in load_source
+    assert "writing and Blackstar changes are disabled" not in load_source
+
+
 def test_blackstar_has_preview_bound_atomic_apply() -> None:
     start = _methods("_start_blackstar_unlock")[0]
     finish = _methods("_finish_blackstar_unlock")[0]
