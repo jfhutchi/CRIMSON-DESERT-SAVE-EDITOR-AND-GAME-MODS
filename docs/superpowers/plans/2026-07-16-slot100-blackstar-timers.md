@@ -135,6 +135,7 @@ from blackstar_unlock import (
     unlock_blackstar,
 )
 from parc_inserter3 import build_insert_context
+from save_compat import schema_structure_matches
 from save_crypto import load_save_file, transactional_write_save
 
 SOURCE_ENCRYPTED = "663a3c8522c12e33d0b1e43e68a7d5ba66dd4f2b40affcf18227d7420c5ccfb6"
@@ -199,7 +200,8 @@ assert write.backup_path.parent == out_dir / "backups"
 assert hashlib.sha256(write.backup_path.read_bytes()).hexdigest() == SOURCE_ENCRYPTED
 
 reloaded = load_save_file(str(destination), operation_id="slot100-generated-reload")
-assert reloaded.schema_identity == loaded.schema_identity
+assert schema_structure_matches(reloaded.schema_identity, loaded.schema_identity)
+assert reloaded.schema_identity.schema_sha256 == loaded.schema_identity.schema_sha256
 assert hashlib.sha256(reloaded.decompressed_blob).hexdigest() == CANDIDATE_DECOMPRESSED
 after = build_insert_context(reloaded.decompressed_blob)
 after_state, after_rows = _classify(after)
@@ -302,6 +304,7 @@ import json
 from pathlib import Path
 
 import crimson_rs
+import lz4.block
 from characterinfo_full_parser import parse_all_entries
 from mod_loader import CommunityModLoader
 
@@ -320,6 +323,10 @@ parsed = loader._parse_mod_file(str(path), path.name)
 assert parsed is not None
 assert len(parsed.patches) == 1
 assert len(parsed.patches[0].changes) == 2
+assert loader.resolve_mod(parsed), parsed.error_msg
+resolved = parsed.patches[0]
+assert resolved.compressed
+assert resolved.orig_size == 26431464
 
 game = r"D:\SteamLibrary\steamapps\common\Crimson Desert"
 directory = "gamedata/binary__/client/bin"
@@ -366,9 +373,17 @@ def stable_fields(row):
 
 assert stable_fields(after) == stable_fields(before)
 assert len(after_rows) == len(before_rows) == 7105
+recompressed = lz4.block.compress(
+    bytes(candidate), mode="high_compression", store_size=False
+)
+assert len(recompressed) <= resolved.comp_size
 print(json.dumps({
     "loader_name": parsed.name,
     "changes": len(parsed.patches[0].changes),
+    "resolved_paz": str(Path(resolved.paz_path).resolve()),
+    "paz_slot_bytes": resolved.comp_size,
+    "candidate_recompressed_bytes": len(recompressed),
+    "recompression_headroom_bytes": resolved.comp_size - len(recompressed),
     "raw_changed_offsets": changed,
     "candidate_body_sha256": hashlib.sha256(candidate).hexdigest(),
     "cooldown_seconds": after["_callMercenaryCoolTime"],
@@ -378,7 +393,7 @@ print(json.dumps({
 '@ | .\.venv\Scripts\python.exe -
 ```
 
-Expected: two loader changes, four raw changed offsets, cooldown `1`, duration `1800`, and installed-game writes `0`.
+Expected: two loader changes, four raw changed offsets, cooldown `1`, duration `1800`, positive recompression headroom, and installed-game writes `0`.
 
 ### Task 4: Produce the Independent Verification Report
 
@@ -410,6 +425,7 @@ from blackstar_unlock import (
 )
 from characterinfo_full_parser import parse_all_entries
 from parc_inserter3 import build_insert_context
+from save_compat import schema_structure_matches
 from save_crypto import load_save_file
 
 SOURCE_ENCRYPTED = "663a3c8522c12e33d0b1e43e68a7d5ba66dd4f2b40affcf18227d7420c5ccfb6"
@@ -433,7 +449,8 @@ source = load_save_file(str(source_path), operation_id="slot100-report-source")
 output = load_save_file(str(save_path), operation_id="slot100-report-output")
 assert hashlib.sha256(source.decompressed_blob).hexdigest() == SOURCE_DECOMPRESSED
 assert hashlib.sha256(output.decompressed_blob).hexdigest() == OUTPUT_DECOMPRESSED
-assert output.schema_identity == source.schema_identity
+assert schema_structure_matches(output.schema_identity, source.schema_identity)
+assert output.schema_identity.schema_sha256 == source.schema_identity.schema_sha256
 
 before = build_insert_context(source.decompressed_blob)
 after = build_insert_context(output.decompressed_blob)
