@@ -39,6 +39,11 @@ from gui.theme import COLORS
 
 
 OVERLAY_GROUP = DRAGON_OVERLAY_GROUP
+DRAGON_DEPLOYMENT_ENABLED = False
+DRAGON_DEPLOYMENT_DISABLED_REASON = (
+    "Dragon deployment is disabled after reproducible Crimson Desert startup "
+    "crashes. Analyze, Preview, and Restore remain available; Apply will not write."
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +99,8 @@ class ReserveSlotTab(QWidget):
 
         safety = QLabel(
             "Modifies game-data overlays only. Does not edit save files or quest flags.\n"
-            "Close Crimson Desert before Apply/Restore and fully restart it afterward."
+            "Apply is disabled after reproducible game startup crashes. Restore remains "
+            "available for an owned overlay."
         )
         safety.setWordWrap(True)
         safety.setStyleSheet(
@@ -115,6 +121,7 @@ class ReserveSlotTab(QWidget):
         self._apply_btn.clicked.connect(self._apply_patch)
         self._restore_btn.clicked.connect(self._restore_patch)
         self._apply_btn.setEnabled(False)
+        self._apply_btn.setToolTip(DRAGON_DEPLOYMENT_DISABLED_REASON)
         for button in (
             self._analyze_btn,
             self._preview_btn,
@@ -216,7 +223,9 @@ class ReserveSlotTab(QWidget):
                 result.report.source_pabgb_sha256,
             )
             self._preview_result = result
-            self._apply_btn.setEnabled(not result.report.already_enabled)
+            self._apply_btn.setEnabled(
+                DRAGON_DEPLOYMENT_ENABLED and not result.report.already_enabled
+            )
             lines = [
                 "DRY RUN - NOTHING WRITTEN",
                 f"Schema: {result.report.schema_id}",
@@ -234,7 +243,9 @@ class ReserveSlotTab(QWidget):
                 f"Planned overlay: {OVERLAY_GROUP}",
                 f"Backup root: {self._backup_root()}",
             ]
-            if result.report.already_enabled:
+            if not DRAGON_DEPLOYMENT_ENABLED:
+                lines.append(f"Apply disabled: {DRAGON_DEPLOYMENT_DISABLED_REASON}")
+            elif result.report.already_enabled:
                 lines.append("Dragon is already present; Apply remains disabled.")
             else:
                 lines.append("Preview verified. Apply is now enabled for this exact source.")
@@ -254,6 +265,14 @@ class ReserveSlotTab(QWidget):
             self._show_failure("Preview failed", exc)
 
     def _apply_patch(self) -> None:
+        if not DRAGON_DEPLOYMENT_ENABLED:
+            self._apply_btn.setEnabled(False)
+            self._show_refusal(
+                "Apply disabled",
+                DragonWheelDeploymentError(DRAGON_DEPLOYMENT_DISABLED_REASON),
+            )
+            return
+
         preview = self._preview_result
         source_hashes = self._source_hashes
         if preview is None or source_hashes is None:

@@ -79,3 +79,42 @@ app.processEvents()
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_confirmed_startup_crashes_kill_switch_dragon_apply() -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "CrimsonGameMods")
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    script = r"""
+from PySide6.QtWidgets import QApplication
+from gui.tabs.reserveslot import (
+    DRAGON_DEPLOYMENT_DISABLED_REASON,
+    DRAGON_DEPLOYMENT_ENABLED,
+    ReserveSlotTab,
+)
+
+app = QApplication.instance() or QApplication([])
+tab = ReserveSlotTab({}, lambda: "")
+refusals = []
+tab._show_refusal = lambda title, error: refusals.append((title, str(error)))
+tab._apply_btn.setEnabled(True)
+tab._apply_patch()
+
+assert DRAGON_DEPLOYMENT_ENABLED is False
+assert tab._apply_btn.isEnabled() is False
+assert refusals == [("Apply disabled", DRAGON_DEPLOYMENT_DISABLED_REASON)]
+tab.deleteLater()
+app.processEvents()
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
