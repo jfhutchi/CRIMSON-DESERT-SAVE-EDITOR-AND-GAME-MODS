@@ -793,6 +793,23 @@ assert "report.call_dragon_before" in finish
 assert "report.call_dragon_after" in finish
 ```
 
+Replace the obsolete `apply_blackstar_plan` source assertion in
+`tests/test_app_logging.py` with a contract against the current service:
+
+```python
+def test_blackstar_ownership_and_call_dragon_have_distinct_log_phases() -> None:
+    source = inspect.getsource(blackstar_unlock.unlock_blackstar)
+    for phase_name in (
+        "blackstar_mount_insertion",
+        "call_dragon_detection",
+        "call_dragon_template_selection",
+        "call_dragon_insertion",
+        "blackstar_final_reparse",
+        "blackstar_semantic_validation",
+    ):
+        assert f'"{phase_name}"' in source
+```
+
 - [ ] **Step 2: Run focused contracts and verify failure**
 
 Run:
