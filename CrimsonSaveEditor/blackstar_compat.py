@@ -4,6 +4,11 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 
+from blackstar_knowledge import (
+    CallDragonKnowledgeError,
+    inspect_call_dragon,
+    select_call_dragon_template,
+)
 from parc_inserter3 import ParsedInsertContext
 from save_compat import SaveSchemaIdentity, _type_signature
 
@@ -95,6 +100,12 @@ def require_blackstar_compatibility(
     for required in ("MercenaryClanSaveData", "KnowledgeSaveData", "QuestSaveData"):
         if required not in objects:
             raise BlackstarCompatibilityError(f"Required root object missing: {required}")
+    try:
+        call_dragon = inspect_call_dragon(context)
+        if call_dragon.status == "missing":
+            select_call_dragon_template(context)
+    except CallDragonKnowledgeError as exc:
+        raise BlackstarCompatibilityError(str(exc)) from exc
     mount_field = next(
         (field for field in objects["MercenaryClanSaveData"].fields
          if field.name == "_mercenaryDataList"), None
