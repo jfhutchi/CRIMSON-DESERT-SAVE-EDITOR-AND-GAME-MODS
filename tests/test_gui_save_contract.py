@@ -58,6 +58,12 @@ def test_unknown_full_schema_notice_is_non_blocking_and_feature_scoped() -> None
     assert "writing and Blackstar changes are disabled" not in load_source
 
 
+def test_loading_and_scanning_never_rewrite_duplicate_item_numbers() -> None:
+    scan_source = _methods("_scan_and_populate")[0]
+    assert "_fix_duplicate_item_nos" not in scan_source
+    assert "def _fix_duplicate_item_nos" not in _source()
+
+
 def test_blackstar_has_preview_bound_atomic_apply() -> None:
     start = _methods("_start_blackstar_unlock")[0]
     finish = _methods("_finish_blackstar_unlock")[0]

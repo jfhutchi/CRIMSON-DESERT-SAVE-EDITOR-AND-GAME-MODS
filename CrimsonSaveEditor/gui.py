@@ -31538,36 +31538,6 @@ QCheckBox::indicator {{
                 "The destination was not accepted unless backup and temporary validation "
                 f"both succeeded.\n\nOperation ID: {operation_id}",
             )
-    def _fix_duplicate_item_nos(self) -> None:
-        if not self._items or not self._save_data:
-            return
-
-        from collections import Counter
-        no_counts = Counter(it.item_no for it in self._items)
-        duplicated_nos = {no for no, count in no_counts.items() if count > 1}
-
-        if not duplicated_nos:
-            return
-
-        max_no = get_max_itemno(self._items)
-        next_no = max_no + 1
-        fixed = 0
-
-        for dup_no in duplicated_nos:
-            sharing = [it for it in self._items if it.item_no == dup_no]
-            for item in sharing[1:]:
-                apply_itemno_edit(
-                    self._save_data.decompressed_blob, item, next_no
-                )
-                next_no += 1
-                fixed += 1
-
-        if fixed > 0:
-            self._dirty = True
-            self._update_status(
-                f"Fixed {fixed} duplicate ItemNo(s) across "
-                f"{len(duplicated_nos)} group(s) — each item now has a unique ID."
-            )
 
     def _scan_and_populate(self) -> None:
         if not self._save_data:
@@ -31580,8 +31550,6 @@ QCheckBox::indicator {{
         for item in self._items:
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
-
-        self._fix_duplicate_item_nos()
 
         self._status_parc_label.setText("Loading... (PARC enriching in background)")
         self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
