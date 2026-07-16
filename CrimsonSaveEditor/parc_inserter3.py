@@ -2359,6 +2359,8 @@ def insert_knowledge_keys_with_context(
     context: ParsedInsertContext,
     keys_to_insert: tuple[int, ...] | list[int],
     override_level: int = -1,
+    *,
+    template_element=None,
 ) -> tuple[bytes, FixupMetrics]:
     orig_blob = context.raw
     know_obj = know_field = None
@@ -2375,7 +2377,22 @@ def insert_knowledge_keys_with_context(
     if not keys_to_insert:
         return orig_blob, FixupMetrics()
 
-    template_elem = know_field.list_elements[-1]
+    if template_element is None:
+        template_elem = know_field.list_elements[-1]
+    else:
+        template_elem = next(
+            (
+                element
+                for element in know_field.list_elements
+                if element.start_offset == template_element.start_offset
+                and element.end_offset == template_element.end_offset
+            ),
+            None,
+        )
+        if template_elem is None:
+            raise ValueError(
+                "Knowledge template is not from the target knowledge list"
+            )
     tmpl_raw = orig_blob[template_elem.start_offset:template_elem.end_offset]
     tmpl_start = template_elem.start_offset
     key_rel = level_rel = None
