@@ -48,3 +48,19 @@ def test_load_applies_read_only_schema_controls() -> None:
     assert "_save_action" in controls_source
     assert "_save_as_action" in controls_source
     assert "_blackstar_btn" in controls_source
+
+
+def test_blackstar_has_preview_bound_atomic_apply() -> None:
+    start = _methods("_start_blackstar_unlock")[0]
+    finish = _methods("_finish_blackstar_unlock")[0]
+    controls = _methods("_update_schema_write_controls")[0]
+    assert "_blackstar_preview_token" in start
+    assert "Apply is enabled only" in start
+    assert "make_blackstar_apply_token" in finish
+    assert "worker_result.write_result" in finish
+    assert "not self._save_data.is_raw_stream" in controls
+    assert "save with Ctrl+S" not in start + finish
+    label = _methods("_update_blackstar_mode_label")[0]
+    assert "Preview Blackstar" in label
+    assert "Apply & Save Blackstar" in label
+    assert "_blackstar_preview_token = None" in _methods("_load_save")[0]

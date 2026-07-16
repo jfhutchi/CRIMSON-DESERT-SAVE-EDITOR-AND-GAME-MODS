@@ -6,16 +6,17 @@ related PARC structures.
 
 ## Blackstar safety
 
-The no-quest Blackstar action defaults to dry-run, runs outside the Qt GUI
-thread, reports phase progress, inserts no quest completion entries, and rejects
-unknown schemas, duplicate Blackstar mounts, duplicate requested knowledge, or
-any candidate whose canonical quest semantics change. Applying twice is a
-byte-identical no-op.
+The no-quest Blackstar action defaults to Preview (dry run), runs outside the Qt
+GUI thread, and validates a legitimate 1.14 ownership record without changing
+quests or knowledge. A successful preview authorizes Apply & Save only for the
+exact unchanged source and candidate. Apply creates a verified encrypted backup,
+validates a temporary save, and atomically replaces the selected file. Running
+the operation twice is a byte-identical no-op; recognized obsolete 206-byte
+Blackstar records are replaced rather than duplicated.
 
-After an apply, item offsets are refreshed on the same worker thread. This path
-does not run unrelated inventory repairs outside the reported Blackstar mutation.
-
-GUI writes require a known compatibility profile. Before every write the editor
+General GUI writes require a known compatibility profile. Blackstar uses a
+narrow compatibility family covering only its mount/equipment structures and
+does not enable any other editor write on an unknown full schema. Before every write the editor
 creates and SHA-256-verifies an encrypted backup, writes a sibling temporary
 file, decrypts and validates it, and only then atomically replaces the
 destination. Save As backs up an existing destination rather than an unrelated

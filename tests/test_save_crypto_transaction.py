@@ -8,12 +8,13 @@ import pytest
 
 import save_crypto
 from blackstar_unlock import unlock_blackstar
-from save_compat import load_profiles, require_supported_identity
+from blackstar_compat import make_blackstar_apply_token
 from save_crypto import (
     VERSION_OFFSET,
     load_save_file,
     serialize_save_bytes,
     transactional_write_save,
+    transactional_write_blackstar,
 )
 
 
@@ -149,12 +150,11 @@ def test_destination_change_after_backup_aborts_replace(
 
 def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
     save = load_save_file(str(copied_save))
-    profile = require_supported_identity(save.schema_identity, load_profiles())
     original_encrypted_hash = _sha256(copied_save)
 
     applied = unlock_blackstar(
         blob=save.decompressed_blob,
-        profile=profile,
+        identity=save.schema_identity,
         dry_run=False,
         operation_id="blackstar-transaction-test",
     )
@@ -174,11 +174,37 @@ def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
     reloaded = load_save_file(str(copied_save))
     second = unlock_blackstar(
         blob=reloaded.decompressed_blob,
-        profile=profile,
+        identity=reloaded.schema_identity,
         dry_run=False,
         operation_id="blackstar-transaction-second-run",
     )
     assert second.output_blob == bytes(reloaded.decompressed_blob)
     assert second.report.byte_growth == 0
-    assert second.report.knowledge_added == ()
+    assert second.report.knowledge_changes == 0
     assert second.report.quest_changes == 0
+
+
+def test_scoped_blackstar_transaction_writes_unknown_schema_with_backup(
+    early_114_save_path: Path, tmp_path: Path
+) -> None:
+    destination = tmp_path / "early" / "save.save"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(early_114_save_path.read_bytes())
+    save = load_save_file(str(destination))
+    preview = unlock_blackstar(
+        save.decompressed_blob, save.schema_identity, True, "scoped-preview"
+    )
+    applied = unlock_blackstar(
+        save.decompressed_blob, save.schema_identity, False, "scoped-apply"
+    )
+    token = make_blackstar_apply_token(
+        destination, bytes(save.decompressed_blob), save.schema_identity,
+        preview.candidate_sha256, generation=3,
+    )
+    result = transactional_write_blackstar(
+        destination, applied.output_blob, save.raw_header, save.schema_identity,
+        token, generation=3, operation_id="scoped-write",
+    )
+    assert result.backup_path.exists()
+    reloaded = load_save_file(str(destination))
+    assert hashlib.sha256(reloaded.decompressed_blob).hexdigest() == preview.candidate_sha256

@@ -321,6 +321,7 @@ def transactional_write_save(
     backup_source: str | Path,
     expected_identity: SaveSchemaIdentity | None,
     operation_id: str,
+    scope_family_id: str | None = None,
 ) -> SaveWriteResult:
     from save_compat import (
         UnknownSaveSchemaError,
@@ -334,7 +335,12 @@ def transactional_write_save(
     backup_source = Path(backup_source)
     if expected_identity is None:
         raise UnknownSaveSchemaError("Loaded save has no schema identity")
-    require_supported_identity(expected_identity, load_profiles())
+    if scope_family_id is None:
+        require_supported_identity(expected_identity, load_profiles())
+    else:
+        from blackstar_compat import BLACKSTAR_FAMILY_ID
+        if scope_family_id != BLACKSTAR_FAMILY_ID:
+            raise UnknownSaveSchemaError("Unknown scoped write authorization")
     candidate_identity = compute_schema_identity(edited_blob, original_header)
     if not schema_structure_matches(candidate_identity, expected_identity):
         raise UnknownSaveSchemaError("Edited blob schema differs from the loaded schema")
@@ -427,4 +433,57 @@ def transactional_write_save(
         backup_path=backup_path,
         output_sha256=_sha256_file(destination),
         byte_count=destination.stat().st_size,
+    )
+
+
+def transactional_write_blackstar(
+    destination: str | Path,
+    edited_blob: bytes,
+    original_header: bytes,
+    expected_identity: SaveSchemaIdentity,
+    token,
+    generation: int,
+    operation_id: str,
+) -> SaveWriteResult:
+    from blackstar_compat import (
+        BLACKSTAR_FAMILY_ID,
+        BlackstarCompatibilityError,
+        require_blackstar_compatibility,
+    )
+    from parc_inserter3 import build_insert_context
+
+    destination = Path(destination).resolve()
+    if token.family_id != BLACKSTAR_FAMILY_ID:
+        raise BlackstarCompatibilityError("Apply token family mismatch")
+    if str(destination) != token.source_path:
+        raise BlackstarCompatibilityError("Apply token path mismatch")
+    if generation != token.document_generation:
+        raise BlackstarCompatibilityError("Apply token generation is stale")
+    if not destination.is_file():
+        raise FileNotFoundError(destination)
+    source_file_hash = _sha256_file(destination)
+    if source_file_hash != token.source_file_sha256:
+        raise BlackstarCompatibilityError("Source file changed after preview")
+    source = load_save_file(str(destination), operation_id=operation_id)
+    source_blob = bytes(source.decompressed_blob)
+    if hashlib.sha256(source_blob).hexdigest() != token.source_blob_sha256:
+        raise BlackstarCompatibilityError("Source blob changed after preview")
+    if source.schema_identity.schema_sha256 != token.source_schema_sha256:
+        raise BlackstarCompatibilityError("Source schema changed after preview")
+    if hashlib.sha256(edited_blob).hexdigest() != token.candidate_blob_sha256:
+        raise BlackstarCompatibilityError("Candidate hash differs from preview")
+    require_blackstar_compatibility(
+        build_insert_context(source_blob), source.schema_identity
+    )
+    require_blackstar_compatibility(
+        build_insert_context(edited_blob), expected_identity
+    )
+    return transactional_write_save(
+        destination=destination,
+        edited_blob=edited_blob,
+        original_header=original_header,
+        backup_source=destination,
+        expected_identity=expected_identity,
+        operation_id=operation_id,
+        scope_family_id=BLACKSTAR_FAMILY_ID,
     )

@@ -61,6 +61,8 @@ a = Analysis(
         'ben_save_decrypt',
         'app_logging',
         'save_compat',
+        'blackstar_compat',
+        'blackstar_template',
         'blackstar_unlock',
         'blackstar_worker',
     ] + optional_hiddenimports,

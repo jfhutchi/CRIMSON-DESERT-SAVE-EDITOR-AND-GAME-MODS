@@ -2479,7 +2479,7 @@ class MainWindow(QMainWindow):
         self._blackstar_worker = None
         self._blackstar_progress = None
         self._blackstar_input_hash = ""
-        self._blackstar_previous_blob = None
+        self._blackstar_preview_token = None
         self._blackstar_dry_run_active = True
         self._parc_status: str = ""
         self._config: dict = self._load_config()
@@ -7602,15 +7602,17 @@ QCheckBox::indicator {{
 
         self._blackstar_dry_run = QCheckBox("Dry run (no changes)")
         self._blackstar_dry_run.setChecked(True)
+        self._blackstar_dry_run.stateChanged.connect(self._update_blackstar_mode_label)
         btn_row2.addWidget(self._blackstar_dry_run)
 
         self._blackstar_btn = QPushButton("Unlock Blackstar (No Quest Changes)")
         self._blackstar_btn.setToolTip(
-            "Analyze or insert Blackstar plus the filtered knowledge set. "
-            "Quest completion flags are never changed."
+            "Preview or atomically apply legitimate Blackstar ownership. "
+            "Quest and knowledge data are never changed."
         )
         self._blackstar_btn.clicked.connect(self._start_blackstar_unlock)
         btn_row2.addWidget(self._blackstar_btn)
+        self._update_blackstar_mode_label()
 
         btn_row2.addStretch()
         layout.addLayout(btn_row2)
@@ -9580,49 +9582,38 @@ QCheckBox::indicator {{
         if self._blackstar_thread is not None:
             QMessageBox.information(self, "Blackstar", "A Blackstar operation is already running.")
             return
-        if not self._save_data.is_schema_supported or self._save_data.schema_identity is None:
-            digest = (
-                self._save_data.schema_identity.schema_sha256
-                if self._save_data.schema_identity
-                else "unavailable"
-            )
-            QMessageBox.critical(
-                self,
-                "Unsupported Save Schema",
-                "This save is available for inspection only. Blackstar changes are "
-                f"disabled because its schema is unknown.\n\nSchema SHA-256: {digest}",
-            )
+        if self._save_data.is_raw_stream or self._save_data.schema_identity is None:
+            QMessageBox.critical(self, "Blackstar", "Blackstar requires an encrypted save file.")
             return
 
         from app_logging import new_operation_id
         from blackstar_worker import BlackstarWorker
-        from save_compat import load_profiles, require_supported_identity
-
-        try:
-            profile = require_supported_identity(
-                self._save_data.schema_identity, load_profiles()
+        dry_run = self._blackstar_dry_run.isChecked()
+        if not dry_run and self._blackstar_preview_token is None:
+            QMessageBox.warning(
+                self, "Blackstar Preview Required",
+                "Run Dry run first. Apply is enabled only for that exact unchanged save.",
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Unsupported Save Schema", str(exc))
             return
 
         current = bytes(self._save_data.decompressed_blob)
         self._blackstar_input_hash = hashlib.sha256(current).hexdigest()
-        self._blackstar_previous_blob = current
-        self._blackstar_dry_run_active = self._blackstar_dry_run.isChecked()
+        self._blackstar_dry_run_active = dry_run
         operation_id = new_operation_id("blackstar")
         thread = QThread(self)
         worker = BlackstarWorker(
             blob=current,
-            profile=profile,
+            identity=self._save_data.schema_identity,
             dry_run=self._blackstar_dry_run_active,
             operation_id=operation_id,
             generation=self._save_data.document_generation,
             loaded_path=self._loaded_path,
+            original_header=self._save_data.raw_header,
+            apply_token=None if dry_run else self._blackstar_preview_token,
         )
         worker.moveToThread(thread)
         progress = QProgressDialog(
-            "Preparing Blackstar analysis...", "Cancel", 0, 6, self
+            "Preparing Blackstar analysis...", "Cancel", 0, 7, self
         )
         progress.setWindowTitle("Blackstar Unlock")
         progress.setMinimumDuration(0)
@@ -9657,6 +9648,14 @@ QCheckBox::indicator {{
         )
         progress.show()
         thread.start()
+
+    def _update_blackstar_mode_label(self) -> None:
+        if not hasattr(self, "_blackstar_btn") or not hasattr(self, "_blackstar_dry_run"):
+            return
+        self._blackstar_btn.setText(
+            "Preview Blackstar" if self._blackstar_dry_run.isChecked()
+            else "Apply & Save Blackstar"
+        )
 
     def _set_blackstar_busy(self, busy: bool) -> None:
         for action_name in (
@@ -9700,35 +9699,24 @@ QCheckBox::indicator {{
         if self._loaded_path != worker.loaded_path:
             return self._discard_stale_blackstar_result()
 
-        changed = result.output_blob is not None and result.output_blob != current
-        if changed:
-            if worker_result.refreshed_items is None:
-                return self._fail_blackstar_unlock(
-                    "The background item-offset refresh did not complete.", ""
-                )
-            self._undo_stack.append(
-                UndoEntry(
-                    description="Blackstar unlock (no quest changes)",
-                    previous_blob=current,
-                )
-            )
-            self._save_data.decompressed_blob = bytearray(result.output_blob)
-            self._document_generation_counter += 1
-            self._save_data.document_generation = self._document_generation_counter
-            self._dirty = True
-            self._apply_blackstar_refreshed_items(
-                worker_result.refreshed_items, worker_result.parc_status
+        if self._blackstar_dry_run_active:
+            from blackstar_compat import make_blackstar_apply_token
+            self._blackstar_preview_token = make_blackstar_apply_token(
+                self._loaded_path, current, self._save_data.schema_identity,
+                result.candidate_sha256, self._save_data.document_generation,
             )
 
         report = result.report
         mode = "Dry run" if self._blackstar_dry_run_active else "Apply"
-        action = "would be added" if self._blackstar_dry_run_active else "added"
         details = (
             f"Mode: {mode}\n"
-            f"Compatibility profile: {result.profile_id}\n"
+            f"Compatibility family: {result.profile_id}\n"
+            f"State: {report.classification_before}\n"
+            f"Action: {report.action}\n"
             f"Mounts: {report.mount_before} -> {report.mount_after}\n"
-            f"Knowledge {action}: {len(report.knowledge_added)}\n"
-            f"Knowledge already present: {len(report.knowledge_skipped)}\n"
+            f"Mercenary number: {report.mercenary_no}\n"
+            f"Equipment item number: {report.item_no}\n"
+            f"Knowledge changes: {report.knowledge_changes}\n"
             f"Quest completion changes: {report.quest_changes}\n"
             f"Byte growth: {report.byte_growth}\n"
             f"Candidate SHA-256: {result.candidate_sha256}"
@@ -9737,14 +9725,18 @@ QCheckBox::indicator {{
             "Blackstar dry run complete; no bytes changed."
             if self._blackstar_dry_run_active
             else (
-                "Blackstar candidate applied in memory; save with Ctrl+S."
-                if changed
+                "Blackstar was backed up and written atomically."
+                if worker_result.write_result
                 else "Blackstar unlock was already complete."
             )
         )
         if self._blackstar_progress is not None:
             self._blackstar_progress.close()
         QMessageBox.information(self, "Blackstar Unlock Report", details)
+        if not self._blackstar_dry_run_active and worker_result.write_result:
+            path = self._loaded_path
+            self._blackstar_preview_token = None
+            self._load_save(path)
 
     def _apply_blackstar_refreshed_items(self, items, parc_status: str) -> None:
         self._items = list(items)
@@ -9802,7 +9794,6 @@ QCheckBox::indicator {{
         self._blackstar_progress = None
         self._blackstar_worker = None
         self._blackstar_thread = None
-        self._blackstar_previous_blob = None
         self._set_blackstar_busy(False)
         self._update_schema_write_controls()
         if thread is not None:
@@ -31311,12 +31302,11 @@ QCheckBox::indicator {{
                 self._quick_save_btn.setToolTip(
                     "Read-only: the loaded save schema is not supported for writing."
                 )
+        blackstar_enabled = bool(self._save_data and not self._save_data.is_raw_stream) and not busy
         if hasattr(self, "_blackstar_btn"):
-            self._blackstar_btn.setEnabled(enabled)
+            self._blackstar_btn.setEnabled(blackstar_enabled)
         if hasattr(self, "_blackstar_dry_run"):
-            self._blackstar_dry_run.setEnabled(
-                bool(self._save_data and self._save_data.is_schema_supported) and not busy
-            )
+            self._blackstar_dry_run.setEnabled(blackstar_enabled)
 
 
     def _open_save_file(self) -> None:
@@ -31386,6 +31376,7 @@ QCheckBox::indicator {{
             self._load_save(saves[idx]["path"])
 
     def _load_save(self, path: str) -> None:
+        self._blackstar_preview_token = None
         from PySide6.QtWidgets import QProgressDialog
         progress = QProgressDialog("Loading save file...", None, 0, 5, self)
         progress.setWindowTitle("Loading")

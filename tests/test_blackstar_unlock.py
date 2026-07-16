@@ -1,202 +1,92 @@
 from __future__ import annotations
 
-import inspect
-from dataclasses import replace
-from pathlib import Path
-from types import SimpleNamespace
+import hashlib
+import struct
 
-import pytest
-
-import blackstar_unlock
-from blackstar_unlock import (
-    BLACKSTAR_CHARACTER_KEY,
-    BLACKSTAR_KNOWLEDGE_KEYS,
-    BLACKSTAR_MOUNT_TEMPLATE,
-    BLACKSTAR_SPEC,
-    BlackstarSpec,
-    BlackstarValidationError,
-    apply_blackstar_plan,
-    build_blackstar_plan,
-    canonical_quest_snapshot,
-    unlock_blackstar,
-)
+from blackstar_unlock import canonical_root_snapshot, unlock_blackstar
 from parc_inserter3 import build_insert_context
-from save_compat import load_profiles, require_supported_identity
 from save_crypto import load_save_file
 
 
-@pytest.fixture(scope="module")
-def blackstar_fixture(fixture_save_path: Path):
-    save = load_save_file(str(fixture_save_path))
-    profile = require_supported_identity(save.schema_identity, load_profiles())
-    return bytes(save.decompressed_blob), profile
+def _load(path):
+    save = load_save_file(str(path))
+    return save, bytes(save.decompressed_blob)
 
 
-def test_dry_run_reports_exact_changes_without_mutating_input(blackstar_fixture) -> None:
-    blob, profile = blackstar_fixture
-    mutable_input = bytearray(blob)
-    before = bytes(mutable_input)
-    events = []
-
-    result = unlock_blackstar(
-        blob=mutable_input,
-        profile=profile,
-        dry_run=True,
-        operation_id="test-blackstar-dry-run",
-        progress=events.append,
-    )
-
-    assert result.output_blob is None
-    assert result.candidate_sha256 != result.input_sha256
-    assert result.report.mount_before == 0
-    assert result.report.mount_after == 1
-    assert result.report.knowledge_added
-    assert result.report.quest_changes == 0
-    assert bytes(mutable_input) == before
-    assert [event.completed for event in events] == sorted(
-        event.completed for event in events
-    )
-    assert events[-1].phase == "complete"
-
-
-@pytest.fixture(scope="module")
-def applied_blackstar(blackstar_fixture):
-    blob, profile = blackstar_fixture
-    return unlock_blackstar(
-        blob=blob,
-        profile=profile,
-        dry_run=False,
-        operation_id="test-blackstar-apply",
-    )
-
-
-def test_first_run_changes_only_mount_and_requested_knowledge(
-    blackstar_fixture,
-    applied_blackstar,
-) -> None:
-    blob, _profile = blackstar_fixture
-    assert applied_blackstar.output_blob is not None
-    assert applied_blackstar.report.mount_before == 0
-    assert applied_blackstar.report.mount_after == 1
-    assert set(applied_blackstar.report.knowledge_added).issubset(BLACKSTAR_KNOWLEDGE_KEYS)
-    assert (
-        len(applied_blackstar.report.knowledge_added)
-        + len(applied_blackstar.report.knowledge_skipped)
-        == len(BLACKSTAR_KNOWLEDGE_KEYS)
-    )
-    assert applied_blackstar.report.quest_changes == 0
-    assert canonical_quest_snapshot(build_insert_context(blob)) == canonical_quest_snapshot(
-        build_insert_context(applied_blackstar.output_blob)
-    )
-
-
-def test_second_run_is_byte_identical(blackstar_fixture, applied_blackstar) -> None:
-    _blob, profile = blackstar_fixture
-    first = applied_blackstar.output_blob
-    assert first is not None
-    second = unlock_blackstar(
-        blob=first,
-        profile=profile,
-        dry_run=False,
-        operation_id="test-blackstar-second-run",
-    )
-    assert second.output_blob == first
-    assert second.candidate_sha256 == applied_blackstar.candidate_sha256
-    assert second.report.byte_growth == 0
-    assert second.report.knowledge_added == ()
-
-
-def test_mount_present_knowledge_missing_is_repaired(blackstar_fixture) -> None:
-    blob, profile = blackstar_fixture
-    mount_only = unlock_blackstar(
-        blob=blob,
-        profile=profile,
-        dry_run=False,
-        operation_id="test-blackstar-mount-only",
-        spec=BlackstarSpec(
-            character_key=BLACKSTAR_CHARACTER_KEY,
-            mount_template=BLACKSTAR_MOUNT_TEMPLATE,
-            knowledge_keys=(),
-        ),
-    )
-    assert mount_only.output_blob is not None
-    repaired = unlock_blackstar(
-        blob=mount_only.output_blob,
-        profile=profile,
-        dry_run=False,
-        operation_id="test-blackstar-repair",
-    )
-    assert repaired.report.mount_before == 1
-    assert repaired.report.mount_after == 1
-    assert repaired.report.knowledge_added
-
-
-def test_duplicate_mounts_are_refused(blackstar_fixture) -> None:
-    blob, profile = blackstar_fixture
-    fake_target = BlackstarSpec(
-        character_key=BLACKSTAR_CHARACTER_KEY + 1,
-        mount_template=BLACKSTAR_MOUNT_TEMPLATE,
-        knowledge_keys=(),
-    )
+def _blackstar_elements(blob: bytes):
     context = build_insert_context(blob)
-    first = apply_blackstar_plan(
-        context, profile, fake_target, build_blackstar_plan(context, profile, fake_target)
-    )
-    context = build_insert_context(first.output_blob)
-    second = apply_blackstar_plan(
-        context, profile, fake_target, build_blackstar_plan(context, profile, fake_target)
-    )
-    with pytest.raises(BlackstarValidationError, match="Blackstar mounts"):
-        unlock_blackstar(
-            second.output_blob,
-            profile,
-            dry_run=True,
-            operation_id="test-blackstar-duplicate-mount",
-        )
+    clan = next(o for o in context.result["objects"] if o.class_name == "MercenaryClanSaveData")
+    mounts = next(f for f in clan.fields if f.name == "_mercenaryDataList")
+    found = []
+    for element in mounts.list_elements:
+        fields = {f.name: f for f in element.child_fields or []}
+        key = fields.get("_characterKey")
+        if key and struct.unpack_from("<I", blob, key.start_offset)[0] == 1000799:
+            found.append((element, fields))
+    return context, found
 
 
-def test_duplicate_requested_knowledge_is_refused(
-    blackstar_fixture,
-    applied_blackstar,
+def test_early_dry_run_plans_legitimate_idle_record_without_mutation(early_114_save_path) -> None:
+    save, blob = _load(early_114_save_path)
+    before = hashlib.sha256(blob).hexdigest()
+    result = unlock_blackstar(blob, save.schema_identity, True, "early-preview")
+    assert result.output_blob is None
+    assert hashlib.sha256(blob).hexdigest() == before
+    assert result.report.classification_before == "absent"
+    assert result.report.action == "insert"
+    assert (result.report.mercenary_no, result.report.item_no) == (1000003, 1000004)
+    assert result.report.quest_changes == 0
+    assert result.report.knowledge_changes == 0
+
+
+def test_apply_inserts_one_legitimate_record_and_is_idempotent(early_114_save_path) -> None:
+    save, blob = _load(early_114_save_path)
+    quest_before = canonical_root_snapshot(build_insert_context(blob), "QuestSaveData")
+    knowledge_before = canonical_root_snapshot(build_insert_context(blob), "KnowledgeSaveData")
+    first = unlock_blackstar(blob, save.schema_identity, False, "early-apply")
+    assert first.output_blob is not None
+    context, found = _blackstar_elements(first.output_blob)
+    assert len(found) == 1
+    element, fields = found[0]
+    assert element.end_offset - element.start_offset == 437
+    assert fields["_ownedCharacterKey"].value_repr == "1"
+    equipment = fields["_equipItemList"].list_elements
+    assert len(equipment) == 1
+    item_fields = {f.name: f for f in equipment[0].child_fields or []}
+    assert item_fields["_itemKey"].value_repr == "1002269"
+    assert canonical_root_snapshot(context, "QuestSaveData") == quest_before
+    assert canonical_root_snapshot(context, "KnowledgeSaveData") == knowledge_before
+    second = unlock_blackstar(first.output_blob, save.schema_identity, False, "second")
+    assert second.output_blob == first.output_blob
+    assert second.report.action == "none"
+
+
+def test_legitimate_reference_states_are_no_change(
+    legit_idle_114_save_path, legit_active_114_save_path
 ) -> None:
-    _blob, profile = blackstar_fixture
-    context = build_insert_context(applied_blackstar.output_blob)
-    plan = build_blackstar_plan(context, profile, BLACKSTAR_SPEC)
-    forced = replace(plan, knowledge_missing=(BLACKSTAR_KNOWLEDGE_KEYS[0],))
-    duplicate = apply_blackstar_plan(context, profile, BLACKSTAR_SPEC, forced)
-    with pytest.raises(BlackstarValidationError, match="knowledge"):
-        unlock_blackstar(
-            duplicate.output_blob,
-            profile,
-            dry_run=True,
-            operation_id="test-blackstar-duplicate-knowledge",
-        )
+    for path, expected in ((legit_idle_114_save_path, "legitimate_idle"),
+                           (legit_active_114_save_path, "legitimate_active")):
+        save, blob = _load(path)
+        result = unlock_blackstar(blob, save.schema_identity, False, str(path))
+        assert result.output_blob == blob
+        assert result.report.classification_before == expected
+        assert result.report.action == "none"
 
 
-def test_production_service_has_no_quest_insertion_dependency() -> None:
-    source = inspect.getsource(blackstar_unlock)
-    assert "insert_quest" not in source
+def test_failed_legacy_record_is_replaced_not_duplicated(legacy_failed_save_path) -> None:
+    save, blob = _load(legacy_failed_save_path)
+    before_context, before = _blackstar_elements(blob)
+    assert len(before) == 1
+    assert before[0][0].end_offset - before[0][0].start_offset == 206
+    result = unlock_blackstar(blob, save.schema_identity, False, "legacy-repair")
+    assert result.report.classification_before == "legacy"
+    assert result.report.action == "replace"
+    after_context, after = _blackstar_elements(result.output_blob)
+    assert len(after) == 1
+    assert after[0][0].end_offset - after[0][0].start_offset == 437
+    assert len(_mount_rows_for_test(before_context)) == len(_mount_rows_for_test(after_context))
 
 
-def test_quest_snapshot_covers_every_quest_object() -> None:
-    def quest(value: str):
-        field = SimpleNamespace(
-            field_index=0,
-            name="_questStateList",
-            type_name="list",
-            present=True,
-            value_repr=value,
-            child_mask_bytes=b"",
-            child_fields=None,
-            list_elements=None,
-        )
-        return SimpleNamespace(class_name="QuestSaveData", fields=[field])
-
-    first = SimpleNamespace(
-        result={"objects": [quest("unchanged"), quest("second-before")]}
-    )
-    second = SimpleNamespace(
-        result={"objects": [quest("unchanged"), quest("second-after")]}
-    )
-
-    assert canonical_quest_snapshot(first) != canonical_quest_snapshot(second)
+def _mount_rows_for_test(context):
+    clan = next(o for o in context.result["objects"] if o.class_name == "MercenaryClanSaveData")
+    return next(f for f in clan.fields if f.name == "_mercenaryDataList").list_elements

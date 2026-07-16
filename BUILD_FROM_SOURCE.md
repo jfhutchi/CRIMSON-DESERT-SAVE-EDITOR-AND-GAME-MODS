@@ -85,7 +85,8 @@ the separate `CrimsonGameMods` surface (or are absent experimental modules), so
 their related game-mod tabs may be unavailable in the Save Editor standalone.
 Build `CrimsonGameMods` separately if you need that surface.
 
-The Blackstar/save pipeline modules (`app_logging`, `blackstar_unlock`,
+The Blackstar/save pipeline modules (`app_logging`, `blackstar_compat`,
+`blackstar_template`, `blackstar_unlock`,
 `blackstar_worker`, `parc_inserter3`, `parc_serializer`, `save_compat`,
 `save_crypto`, and `save_parser`) must not appear as missing. They were all
 collected in the verified build.
@@ -114,12 +115,12 @@ analyzes the copy but never serializes or writes it:
 $scratch = Join-Path ([IO.Path]::GetTempPath()) "crimson-blackstar-build-test"
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 $copiedSave = Join-Path $scratch "save.save"
-Copy-Item -LiteralPath tests\fixtures\save.save -Destination $copiedSave -Force
+Copy-Item -LiteralPath tests\fixtures\slot102\save.save -Destination $copiedSave -Force
 $env:PYTHONPATH = (Resolve-Path CrimsonSaveEditor).Path
 .\.venv\Scripts\python.exe -m blackstar_unlock --dry-run --save $copiedSave
 ```
 
-The report must show `quest_changes: 0`. The copied encrypted file hash must be
+The report must show `quest_changes: 0` and `knowledge_changes: 0`. The copied encrypted file hash must be
 unchanged because dry-run returns no output blob and has no write path.
 
 Run the complete automated suite:
@@ -166,15 +167,16 @@ hidden imports.
 ## Runtime safety behavior
 
 - Logs are written to `%LOCALAPPDATA%\CrimsonSaveEditor\logs\crimson-save-editor.log`.
-- Unknown save schemas load read-only; the editor refuses Blackstar changes and writes.
+- Unknown full schemas load read-only for general editing. Blackstar Preview may
+  grant only its feature-scoped operation when all seven touched type signatures match.
 - Every GUI save creates and hash-verifies a backup before writing a sibling temp file.
   Save As preserves an existing destination (the file at risk); a new destination
   preserves the loaded source instead.
 - The temp file is decrypted and schema-validated before atomic replacement.
 - A destination hash is rechecked immediately before replacement, so an external
   change made after backup aborts the write instead of being overwritten.
-- Blackstar defaults to dry-run and runs parsing, validation, and post-edit item
-  offset enrichment on a background thread.
+- Blackstar defaults to Preview and runs parsing, validation, mandatory backup,
+  and its explicitly authorized Apply & Save transaction on a background thread.
 
 If a build fails, keep the full PyInstaller output and the application operation
 ID from any error dialog. Do not work around a missing manifest, parser DLL,

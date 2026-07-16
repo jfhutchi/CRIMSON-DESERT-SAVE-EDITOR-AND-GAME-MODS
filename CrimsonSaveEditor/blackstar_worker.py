@@ -5,19 +5,14 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from blackstar_unlock import (
-    BlackstarCancelledError,
-    BlackstarProgress,
-    unlock_blackstar,
-)
-from item_scanner import enrich_items_with_parc, scan_items
+from blackstar_unlock import BlackstarCancelledError, BlackstarProgress, unlock_blackstar
+from save_crypto import transactional_write_blackstar
 
 
 @dataclass(frozen=True)
 class BlackstarWorkerResult:
     result: object
-    refreshed_items: tuple[object, ...] | None
-    parc_status: str
+    write_result: object | None
 
 
 class BlackstarWorker(QObject):
@@ -26,23 +21,18 @@ class BlackstarWorker(QObject):
     failed = Signal(str, str)
     cancelled = Signal()
 
-    def __init__(
-        self,
-        *,
-        blob,
-        profile,
-        dry_run: bool,
-        operation_id: str,
-        generation: int,
-        loaded_path: str,
-    ) -> None:
+    def __init__(self, *, blob, identity, dry_run: bool, operation_id: str,
+                 generation: int, loaded_path: str, original_header: bytes,
+                 apply_token=None) -> None:
         super().__init__()
         self._blob = bytes(blob)
-        self._profile = profile
+        self._identity = identity
         self._dry_run = dry_run
         self._operation_id = operation_id
         self.generation = generation
         self.loaded_path = loaded_path
+        self._original_header = bytes(original_header)
+        self._apply_token = apply_token
         self._cancel_requested = False
 
     @Slot()
@@ -59,30 +49,21 @@ class BlackstarWorker(QObject):
             return
         try:
             result = unlock_blackstar(
-                blob=self._blob,
-                profile=self._profile,
-                dry_run=self._dry_run,
-                operation_id=self._operation_id,
-                progress=self._forward_progress,
+                blob=self._blob, identity=self._identity, dry_run=self._dry_run,
+                operation_id=self._operation_id, progress=self._forward_progress,
                 cancelled=lambda: self._cancel_requested,
             )
-            refreshed_items = None
-            parc_status = ""
-            if result.output_blob is not None and result.output_blob != self._blob:
-                self.progress.emit(
-                    BlackstarProgress(
-                        "refresh", 6, 7, "Refreshing item offsets in background"
-                    )
+            write_result = None
+            if not self._dry_run and result.output_blob != self._blob:
+                if self._apply_token is None:
+                    raise ValueError("A matching Blackstar preview is required before apply")
+                self.progress.emit(BlackstarProgress("write", 6, 7, "Backing up and writing Blackstar"))
+                write_result = transactional_write_blackstar(
+                    destination=self.loaded_path, edited_blob=result.output_blob,
+                    original_header=self._original_header,
+                    expected_identity=self._identity, token=self._apply_token,
+                    generation=self.generation, operation_id=self._operation_id,
                 )
-                if self._cancel_requested:
-                    raise BlackstarCancelledError("Blackstar operation cancelled")
-                items = scan_items(result.output_blob)
-                _enriched, parc_status = enrich_items_with_parc(
-                    result.output_blob, items
-                )
-                refreshed_items = tuple(items)
-                if self._cancel_requested:
-                    raise BlackstarCancelledError("Blackstar operation cancelled")
         except BlackstarCancelledError:
             self.cancelled.emit()
             return
@@ -91,10 +72,6 @@ class BlackstarWorker(QObject):
             return
         if self._cancel_requested:
             self.cancelled.emit()
-        else:
-            self.progress.emit(
-                BlackstarProgress("complete", 7, 7, "Blackstar operation complete")
-            )
-            self.completed.emit(
-                BlackstarWorkerResult(result, refreshed_items, parc_status)
-            )
+            return
+        self.progress.emit(BlackstarProgress("complete", 7, 7, "Blackstar operation complete"))
+        self.completed.emit(BlackstarWorkerResult(result, write_result))
