@@ -473,14 +473,73 @@ class CommunityModLoader:
             f.seek(patch.paz_base_offset)
             f.write(padded)
 
-        try:
-            self._update_checksums_for_paz(patch.paz_path)
-        except Exception as ex:
-            log.warning("Checksum update failed for %s: %s", patch.game_file, ex)
+        self._update_pamt_compressed_size(patch, len(recompressed))
+        self._update_checksums_for_paz(patch.paz_path)
+        self._verify_compressed_patch(patch, bytes(decompressed), len(recompressed))
 
         log.info("In-place patch: %d changes applied to %s (%d -> %d bytes compressed)",
                  applied, patch.game_file, len(recompressed), patch.comp_size)
         return applied, ""
+
+    def _update_pamt_compressed_size(self, patch: ModPatch,
+                                     new_comp_size: int) -> None:
+        pamt_path = os.path.join(os.path.dirname(patch.paz_path), '0.pamt')
+        if not os.path.isfile(pamt_path):
+            raise FileNotFoundError(f"PAMT not found: {pamt_path}")
+        pamt_backup = pamt_path + ".sebak"
+        if not os.path.isfile(pamt_backup):
+            shutil.copy2(pamt_path, pamt_backup)
+        with open(pamt_path, 'rb') as f:
+            pamt_data = bytearray(f.read())
+        target = struct.pack(
+            '<III', patch.paz_base_offset, patch.comp_size, patch.orig_size)
+        positions = []
+        start = 0
+        while True:
+            position = pamt_data.find(target, start)
+            if position < 0:
+                break
+            positions.append(position)
+            start = position + 1
+        if len(positions) != 1:
+            raise ValueError(
+                f"Expected one PAMT record for {patch.game_file}; "
+                f"found {len(positions)}")
+        struct.pack_into('<I', pamt_data, positions[0] + 4, new_comp_size)
+        with open(pamt_path, 'wb') as f:
+            f.write(pamt_data)
+
+    def _verify_compressed_patch(self, patch: ModPatch, expected_body: bytes,
+                                 expected_comp_size: int) -> None:
+        import crimson_rs
+
+        pamt_path = os.path.join(os.path.dirname(patch.paz_path), '0.pamt')
+        pamt = crimson_rs.parse_pamt_file(pamt_path)
+        matches = []
+        for directory in pamt.get('directories', []):
+            for entry in directory.get('files', []):
+                if (int(entry.get('chunk_offset', -1)) == patch.paz_base_offset
+                        and int(entry.get('uncompressed_size', -1)) == patch.orig_size):
+                    matches.append(entry)
+        if len(matches) != 1:
+            raise ValueError(
+                f"Post-write PAMT record is ambiguous for {patch.game_file}")
+        entry = matches[0]
+        if int(entry['compressed_size']) != expected_comp_size:
+            raise ValueError(
+                f"Post-write compressed size is {entry['compressed_size']}; "
+                f"expected {expected_comp_size}")
+        with open(patch.paz_path, 'rb') as f:
+            f.seek(patch.paz_base_offset)
+            compressed = f.read(expected_comp_size)
+        verified = crimson_rs.decompress_data(
+            compressed,
+            int(entry['compression']),
+            int(entry['uncompressed_size']),
+        )
+        if bytes(verified) != expected_body:
+            raise ValueError(
+                f"Post-write decompression mismatch for {patch.game_file}")
 
     def _update_checksums_for_paz(self, paz_path: str) -> None:
         import struct
