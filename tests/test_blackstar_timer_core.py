@@ -5,6 +5,7 @@ from pathlib import Path
 from blackstar_timer_archive import make_timer_archive
 from crimson_common.blackstar_timer import (
     BlackstarTimerService,
+    StalePreviewError,
     TimerProfile,
     TimerStatus,
 )
@@ -78,3 +79,51 @@ def test_detection_is_strictly_read_only(tmp_path: Path) -> None:
     service.detect(archive.game_dir)
 
     assert _snapshot(archive.game_dir) == before
+
+
+def test_preview_builds_and_verifies_candidate_without_writes(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    before = _snapshot(archive.game_dir)
+
+    preview = service.preview(archive.game_dir)
+
+    assert preview.status is TimerStatus.VANILLA
+    assert preview.token is not None
+    assert preview.cooldown_before == 3600
+    assert preview.cooldown_after == 1
+    assert preview.duration_before == 600
+    assert preview.duration_after == 1800
+    assert preview.candidate_body_sha256 == service.profile.applied_body_sha256
+    assert preview.candidate_compressed_size <= preview.slot_capacity
+    assert _snapshot(archive.game_dir) == before
+
+
+def test_preview_token_is_bound_to_all_source_files(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    service.validate_preview_token(preview.token)
+    paz = archive.game_dir / "0008" / "0.paz"
+    paz.write_bytes(paz.read_bytes() + b"unrelated-change")
+
+    try:
+        service.validate_preview_token(preview.token)
+    except StalePreviewError as exc:
+        assert "changed after preview" in str(exc)
+    else:
+        raise AssertionError("Changed source archive was accepted")
+
+
+def test_preview_refuses_unknown_schema_without_token(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    body = bytearray(archive.vanilla_body)
+    body[100] ^= 0xFF
+    archive.rebuild(bytes(body))
+
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
+
+    assert preview.status is TimerStatus.UNKNOWN
+    assert preview.token is None

@@ -17,6 +17,10 @@ class TimerStatus(str, Enum):
     GAME_RUNNING = "game_running"
 
 
+class StalePreviewError(RuntimeError):
+    """Raised when an archive changed after a successful preview."""
+
+
 @dataclass(frozen=True)
 class TimerProfile:
     profile_id: str
@@ -55,6 +59,41 @@ class DetectionReport:
     entry_offset: int | None = None
     compressed_size: int | None = None
     uncompressed_size: int | None = None
+
+
+@dataclass(frozen=True)
+class ArchiveFileHash:
+    relative_path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PreviewToken:
+    profile_id: str
+    game_dir: Path
+    archive_hashes: tuple[ArchiveFileHash, ...]
+    source_body_sha256: str
+    candidate_body_sha256: str
+    entry_offset: int
+    source_compressed_size: int
+    candidate_compressed_size: int
+
+
+@dataclass(frozen=True)
+class PreviewReport:
+    status: TimerStatus
+    reason: str
+    profile_id: str
+    game_dir: Path
+    token: PreviewToken | None
+    cooldown_before: int | None
+    cooldown_after: int | None
+    duration_before: int | None
+    duration_after: int | None
+    source_body_sha256: str | None
+    candidate_body_sha256: str | None
+    candidate_compressed_size: int | None
+    slot_capacity: int | None
 
 
 BLACKSTAR_114_PROFILE = TimerProfile(
@@ -159,6 +198,136 @@ class BlackstarTimerService:
             "Characterinfo body hash is not enrolled for this game version",
             **details,
         )
+
+    def preview(self, game_dir: str | Path) -> PreviewReport:
+        detection = self.detect(game_dir)
+        if detection.status is not TimerStatus.VANILLA:
+            return PreviewReport(
+                status=detection.status,
+                reason=detection.reason,
+                profile_id=self.profile.profile_id,
+                game_dir=detection.game_dir,
+                token=None,
+                cooldown_before=detection.cooldown_seconds,
+                cooldown_after=None,
+                duration_before=detection.duration_seconds,
+                duration_after=None,
+                source_body_sha256=detection.body_sha256,
+                candidate_body_sha256=None,
+                candidate_compressed_size=None,
+                slot_capacity=detection.compressed_size,
+            )
+
+        entry = self._find_entry(detection.game_dir)
+        source = self._read_body(detection.game_dir, entry)
+        candidate = self._build_candidate(source)
+        candidate_hash = hashlib.sha256(candidate).hexdigest()
+        if candidate_hash != self.profile.applied_body_sha256:
+            raise ValueError(
+                "Candidate body hash does not match the enrolled applied schema"
+            )
+        candidate_compressed = bytes(
+            crimson_rs.compress_data(candidate, int(entry["compression"]))
+        )
+        slot_capacity = int(entry["compressed_size"])
+        if len(candidate_compressed) > slot_capacity:
+            raise ValueError(
+                "Candidate compressed stream does not fit the enrolled PAZ slot"
+            )
+        verified = bytes(
+            crimson_rs.decompress_data(
+                candidate_compressed,
+                int(entry["compression"]),
+                int(entry["uncompressed_size"]),
+            )
+        )
+        if verified != candidate:
+            raise ValueError("Candidate failed independent compression verification")
+        source_paths = self._source_paths(detection.game_dir, entry)
+        token = PreviewToken(
+            profile_id=self.profile.profile_id,
+            game_dir=detection.game_dir,
+            archive_hashes=tuple(
+                ArchiveFileHash(
+                    relative_path=path.relative_to(detection.game_dir).as_posix(),
+                    sha256=self._hash_file(path),
+                )
+                for path in source_paths
+            ),
+            source_body_sha256=hashlib.sha256(source).hexdigest(),
+            candidate_body_sha256=candidate_hash,
+            entry_offset=int(entry["chunk_offset"]),
+            source_compressed_size=int(entry["compressed_size"]),
+            candidate_compressed_size=len(candidate_compressed),
+        )
+        return PreviewReport(
+            status=TimerStatus.VANILLA,
+            reason="Verified preview; Apply is enabled for this exact source",
+            profile_id=self.profile.profile_id,
+            game_dir=detection.game_dir,
+            token=token,
+            cooldown_before=detection.cooldown_seconds,
+            cooldown_after=self.profile.preset_cooldown_seconds,
+            duration_before=detection.duration_seconds,
+            duration_after=self.profile.preset_duration_seconds,
+            source_body_sha256=detection.body_sha256,
+            candidate_body_sha256=candidate_hash,
+            candidate_compressed_size=len(candidate_compressed),
+            slot_capacity=slot_capacity,
+        )
+
+    def validate_preview_token(self, token: PreviewToken) -> None:
+        if token.profile_id != self.profile.profile_id:
+            raise StalePreviewError("Preview profile does not match this service")
+        game = token.game_dir.expanduser().resolve()
+        if game != token.game_dir:
+            raise StalePreviewError("Preview game path is no longer normalized")
+        for expected in token.archive_hashes:
+            path = game / Path(expected.relative_path)
+            if not path.is_file() or self._hash_file(path) != expected.sha256:
+                raise StalePreviewError(
+                    f"Source archive changed after preview: {expected.relative_path}"
+                )
+        detection = self.detect(game)
+        if (
+            detection.status is not TimerStatus.VANILLA
+            or detection.body_sha256 != token.source_body_sha256
+            or detection.entry_offset != token.entry_offset
+            or detection.compressed_size != token.source_compressed_size
+        ):
+            raise StalePreviewError("Source archive changed after preview")
+
+    def _build_candidate(self, source: bytes) -> bytes:
+        candidate = bytearray(source)
+        cooldown_end = self.profile.cooldown_offset + 8
+        duration_end = self.profile.duration_offset + 8
+        if min(self.profile.cooldown_offset, self.profile.duration_offset) < 0 or max(
+            cooldown_end, duration_end
+        ) > len(candidate):
+            raise ValueError("Enrolled timer offsets are outside characterinfo")
+        candidate[self.profile.cooldown_offset:cooldown_end] = (
+            self.profile.preset_cooldown_seconds.to_bytes(8, "little")
+        )
+        candidate[self.profile.duration_offset:duration_end] = (
+            self.profile.preset_duration_seconds.to_bytes(8, "little")
+        )
+        return bytes(candidate)
+
+    def _source_paths(self, game: Path, entry: dict) -> tuple[Path, Path, Path]:
+        group = game / self.profile.group_name
+        return (
+            group / f"{int(entry['chunk_id'])}.paz",
+            group / "0.pamt",
+            game / "meta" / "0.papgt",
+        )
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _find_entry(self, game: Path) -> dict:
         pamt_path = game / self.profile.group_name / "0.pamt"
