@@ -16,12 +16,14 @@ from .blackstar_timer import (
     TransactionReport,
     is_crimson_desert_running,
 )
+from .blackstar_timer_worker import BlackstarTimerWorker
 
 __all__ = [
     "BLACKSTAR_114_PROFILE",
     "ArchiveFileHash",
     "BackupConflictError",
     "BlackstarTimerService",
+    "BlackstarTimerWorker",
     "DetectionReport",
     "GameRunningError",
     "PreviewReport",

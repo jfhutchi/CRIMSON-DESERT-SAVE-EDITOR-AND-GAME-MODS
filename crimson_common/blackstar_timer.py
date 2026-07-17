@@ -279,7 +279,12 @@ class BlackstarTimerService:
             **details,
         )
 
-    def preview(self, game_dir: str | Path) -> PreviewReport:
+    def preview(
+        self,
+        game_dir: str | Path,
+        progress: Callable[[str, int], None] | None = None,
+    ) -> PreviewReport:
+        self._emit_progress(progress, "process_check", 5)
         detection = self.detect(game_dir)
         if detection.status is not TimerStatus.VANILLA:
             return PreviewReport(
@@ -298,8 +303,10 @@ class BlackstarTimerService:
                 slot_capacity=detection.compressed_size,
             )
 
+        self._emit_progress(progress, "pamt_lookup", 20)
         entry = self._find_entry(detection.game_dir)
         source = self._read_body(detection.game_dir, entry)
+        self._emit_progress(progress, "decompression", 40)
         candidate = self._build_candidate(source)
         candidate_hash = hashlib.sha256(candidate).hexdigest()
         if candidate_hash != self.profile.applied_body_sha256:
@@ -309,6 +316,7 @@ class BlackstarTimerService:
         candidate_compressed = bytes(
             crimson_rs.compress_data(candidate, int(entry["compression"]))
         )
+        self._emit_progress(progress, "candidate_compression", 70)
         slot_capacity = int(entry["compressed_size"])
         if len(candidate_compressed) > slot_capacity:
             raise ValueError(
@@ -323,6 +331,7 @@ class BlackstarTimerService:
         )
         if verified != candidate:
             raise ValueError("Candidate failed independent compression verification")
+        self._emit_progress(progress, "candidate_verification", 90)
         source_paths = self._source_paths(detection.game_dir, entry)
         token = PreviewToken(
             profile_id=self.profile.profile_id,
@@ -377,7 +386,12 @@ class BlackstarTimerService:
         ):
             raise StalePreviewError("Source archive changed after preview")
 
-    def apply(self, token: PreviewToken) -> TransactionReport:
+    def apply(
+        self,
+        token: PreviewToken,
+        progress: Callable[[str, int], None] | None = None,
+    ) -> TransactionReport:
+        self._emit_progress(progress, "process_check", 5)
         self._ensure_game_closed()
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
@@ -407,6 +421,7 @@ class BlackstarTimerService:
             )
 
         self.validate_preview_token(token)
+        self._emit_progress(progress, "source_revalidation", 15)
         entry = self._find_entry(game)
         source = self._read_body(game, entry)
         candidate = self._build_candidate(source)
@@ -437,6 +452,7 @@ class BlackstarTimerService:
             post_hashes,
             token,
         )
+        self._emit_progress(progress, "backup_verification", 30)
         manifest_path = backup_dir / "manifest.json"
         wrote_source = False
         try:
@@ -451,12 +467,16 @@ class BlackstarTimerService:
                 handle.flush()
                 os.fsync(handle.fileno())
             wrote_source = True
+            self._emit_progress(progress, "paz_write", 50)
             self._inject_fault("after_paz_write")
             self._atomic_write(pamt_path, new_bytes[1])
+            self._emit_progress(progress, "pamt_update", 65)
             self._inject_fault("after_pamt_write")
             self._atomic_write(papgt_path, new_bytes[2])
+            self._emit_progress(progress, "papgt_update", 80)
             self._inject_fault("after_papgt_write")
             self._verify_post_apply(game, post_hashes, token)
+            self._emit_progress(progress, "post_write_verification", 95)
             manifest = self._read_manifest(manifest_path)
             manifest["finalized"] = True
             manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
@@ -495,7 +515,12 @@ class BlackstarTimerService:
             duration_seconds=verified.duration_seconds,
         )
 
-    def restore(self, game_dir: str | Path) -> TransactionReport:
+    def restore(
+        self,
+        game_dir: str | Path,
+        progress: Callable[[str, int], None] | None = None,
+    ) -> TransactionReport:
+        self._emit_progress(progress, "process_check", 5)
         self._ensure_game_closed()
         game = Path(game_dir).expanduser().resolve()
         backup_dir = self._latest_finalized_backup(game)
@@ -513,6 +538,7 @@ class BlackstarTimerService:
             backup_file = backup_dir / Path(relative)
             if not backup_file.is_file() or self._hash_file(backup_file) != expected:
                 raise BackupConflictError(f"Backup file is missing or altered: {relative}")
+        self._emit_progress(progress, "backup_verification", 30)
         for relative, expected in post_hashes.items():
             current_file = game / Path(relative)
             if not current_file.is_file() or self._hash_file(current_file) != expected:
@@ -520,11 +546,13 @@ class BlackstarTimerService:
                     f"Game archive changed after this preset was applied: {relative}"
                 )
         self._restore_backup_files(game, backup_dir, source_hashes)
+        self._emit_progress(progress, "archive_restore", 70)
         detection = self.detect(game)
         if detection.status is not TimerStatus.VANILLA:
             raise TimerTransactionError(
                 f"Restore completed but vanilla verification failed: {detection.reason}"
             )
+        self._emit_progress(progress, "restore_verification", 95)
         manifest["restored"] = True
         manifest["restored_at"] = datetime.now(timezone.utc).isoformat()
         self._write_manifest(manifest_path, manifest)
@@ -806,6 +834,21 @@ class BlackstarTimerService:
     def _inject_fault(self, phase: str) -> None:
         if self._fault_injector is not None:
             self._fault_injector(phase)
+
+    def _emit_progress(
+        self,
+        callback: Callable[[str, int], None] | None,
+        phase: str,
+        value: int,
+    ) -> None:
+        log.info(
+            "blackstar_timer profile=%s phase=%s progress=%d",
+            self.profile.profile_id,
+            phase,
+            value,
+        )
+        if callback is not None:
+            callback(phase, value)
 
     def _ensure_game_closed(self) -> None:
         try:
