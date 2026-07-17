@@ -1,5 +1,12 @@
 import sys
 import os
+from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    value = str(REPO_ROOT)
+    if value not in sys.path:
+        sys.path.insert(0, value)
 
 
 def _splash(text: str) -> None:

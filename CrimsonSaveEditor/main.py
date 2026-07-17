@@ -1,6 +1,14 @@
 import sys
 import os
 import logging
+from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    for shared_path in (REPO_ROOT, REPO_ROOT / "CrimsonGameMods"):
+        value = str(shared_path)
+        if value not in sys.path:
+            sys.path.insert(0, value)
 
 from app_logging import configure_logging
 

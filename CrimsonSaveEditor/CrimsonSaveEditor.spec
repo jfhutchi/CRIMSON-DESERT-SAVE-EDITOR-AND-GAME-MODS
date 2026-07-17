@@ -1,18 +1,12 @@
-from importlib.util import find_spec
+from pathlib import Path
 
-optional_hiddenimports = []
-if find_spec('crimson_rs') is not None:
-    optional_hiddenimports = [
-        'crimson_rs',
-        'crimson_rs.enums',
-        'crimson_rs.create_pack',
-        'crimson_rs.pack_mod',
-        'crimson_rs.validate_game_dir',
-    ]
+SPEC_DIR = Path(SPECPATH).resolve()
+REPO_ROOT = SPEC_DIR.parent
+GAME_MODS_ROOT = REPO_ROOT / 'CrimsonGameMods'
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=[str(SPEC_DIR), str(REPO_ROOT), str(GAME_MODS_ROOT)],
     binaries=[],
     datas=[
         ('parc_parser.dll', '.'),
@@ -42,6 +36,8 @@ a = Analysis(
         ('save_schema_profiles.json', '.'),
         ('locale', 'locale'),
         ('knowledge_packs', 'knowledge_packs'),
+        (str(REPO_ROOT / 'crimson_common'), 'crimson_common'),
+        (str(GAME_MODS_ROOT / 'crimson_rs'), 'crimson_rs'),
     ],
     hiddenimports=[
         'lz4',
@@ -65,7 +61,16 @@ a = Analysis(
         'blackstar_template',
         'blackstar_unlock',
         'blackstar_worker',
-    ] + optional_hiddenimports,
+        'crimson_common',
+        'crimson_common.blackstar_timer',
+        'crimson_common.blackstar_timer_worker',
+        'crimson_common.blackstar_timer_ui',
+        'crimson_rs',
+        'crimson_rs.enums',
+        'crimson_rs.create_pack',
+        'crimson_rs.pack_mod',
+        'crimson_rs.validate_game_dir',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

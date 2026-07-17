@@ -63,23 +63,23 @@ setuptools==83.0.0
 shiboken6==6.8.3
 ```
 
-`crimson_rs` is optional for the standalone save editor. It supports unrelated
+`crimson_rs` is required for the shared Blackstar game-timer feature. It supports
 game-archive extraction and mod-packing features, is not published on PyPI, and
-is not included in this repository. The source build omits those optional
-features when the module is absent. Save loading, encryption, Blackstar dry-run,
-Blackstar unlock, compatibility checks, backups, and atomic writes do not depend
-on `crimson_rs`. If you have a compatible module from its author, install it into
-the virtual environment before building; the spec includes it conditionally.
+is included in this repository as a prebuilt native package. Save loading,
+encryption, Blackstar ownership unlock, compatibility checks, backups, and atomic
+save writes do not depend on it; the Blackstar game-timer preset does. The
+compatible native module is bundled under
+`CrimsonGameMods\crimson_rs` and the standalone PyInstaller spec packages it.
 
 Pillow is not a dependency: the source has no Pillow import and PyInstaller does
 not require it for this build.
 
 ## Expected optional-module warnings
 
-PyInstaller's warning report includes Windows-inapplicable standard-library
+PyInstaller's warning report may include Windows-inapplicable standard-library
 modules such as `pwd`, `grp`, `posix`, `resource`, `termios`, and `fcntl`; these
-are not Windows dependencies. It also reports optional `crimson_rs` imports and
-delayed game-mod helper imports such as `paz_parse`, `dropset_editor`,
+are not Windows dependencies. It may also report delayed game-mod helper imports
+such as `paz_parse`, `dropset_editor`,
 `pipeline_report`, `wantedinfo_parser`, and `mod_loader`. Those helpers belong to
 the separate `CrimsonGameMods` surface (or are absent experimental modules), so
 their related game-mod tabs may be unavailable in the Save Editor standalone.

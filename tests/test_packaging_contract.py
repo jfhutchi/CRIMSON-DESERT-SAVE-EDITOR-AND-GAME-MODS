@@ -71,3 +71,48 @@ def test_game_mods_windows_build_is_pinned_and_documents_native_dependencies() -
     assert "crimson_rs" in readme
     assert "dmm_parser" in readme
     assert "Pillow is not required" in readme
+
+
+def test_both_specs_bundle_shared_timer_and_native_archive_runtime() -> None:
+    specs = [
+        ROOT / "CrimsonSaveEditor" / "CrimsonSaveEditor.spec",
+        ROOT / "CrimsonGameMods" / "CrimsonGameMods.spec",
+    ]
+    for path in specs:
+        spec = path.read_text(encoding="utf-8")
+        assert "REPO_ROOT" in spec
+        assert "crimson_common" in spec
+        assert "crimson_common.blackstar_timer" in spec
+        assert "crimson_common.blackstar_timer_worker" in spec
+        assert "crimson_common.blackstar_timer_ui" in spec
+        assert "crimson_rs" in spec
+        assert "lz4.block" in spec
+
+
+def test_source_entry_points_bootstrap_repository_shared_packages() -> None:
+    for relative in ("CrimsonSaveEditor/main.py", "CrimsonGameMods/main.py"):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert 'if not getattr(sys, "frozen", False):' in source
+        assert "REPO_ROOT" in source
+        assert "sys.path.insert" in source
+
+
+def test_unified_windows_build_guide_lists_every_timer_dependency() -> None:
+    guide = (ROOT / "docs" / "windows-build.md").read_text(encoding="utf-8")
+    for expected in (
+        "CPython 3.12",
+        "PySide6==6.8.3",
+        "lz4==4.4.5",
+        "cryptography==49.0.0",
+        "pyinstaller==6.21.0",
+        "pytest==9.1.1",
+        "pytest-timeout==2.4.0",
+        "crimson_rs.pyd",
+        "dmm_parser.pyd",
+        "parc_parser.dll",
+        "CrimsonSaveEditorStandalone.exe",
+        "CrimsonGameMods.exe",
+    ):
+        assert expected in guide
+    assert "copied synthetic game directory" in guide
+    assert "Do not select the installed game directory" in guide
