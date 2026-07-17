@@ -266,8 +266,8 @@ def unlock_blackstar(
         report = BlackstarChangeReport(classification, "none", 1, 1, None, None,
                                        None, 0, 0, 0, FixupMetrics(),
                                        {"total": (time.perf_counter() - started) * 1000})
-        for value, phase in ((3, "allocation"), (4, "candidate"), (5, "validation"), (6, "complete")):
-            _emit(progress, phase, value, "No changes required")
+        for value, phase_name in ((3, "allocation"), (4, "candidate"), (5, "validation"), (6, "complete")):
+            _emit(progress, phase_name, value, "No changes required")
         digest = hashlib.sha256(original).hexdigest()
         return BlackstarResult(digest, digest, None if dry_run else original,
                                grant.family_id, report)
