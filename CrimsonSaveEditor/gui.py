@@ -7617,6 +7617,16 @@ QCheckBox::indicator {{
         btn_row2.addStretch()
         layout.addLayout(btn_row2)
 
+        from crimson_common.blackstar_timer_ui import BlackstarTimerPanel
+        self._blackstar_timer_panel = BlackstarTimerPanel(
+            title="Blackstar Game Settings", parent=self
+        )
+        self._blackstar_timer_panel.status_message.connect(self._update_status)
+        self._blackstar_timer_panel.set_game_path(
+            self._config.get("game_install_path", "")
+        )
+        layout.addWidget(self._blackstar_timer_panel)
+
         mount_grp = QGroupBox("Unlock Mounts (Experimental)")
         mount_grid = QGridLayout(mount_grp)
         mount_grid.setSpacing(4)
@@ -20180,6 +20190,8 @@ QCheckBox::indicator {{
             self._paz_game_path.setText(path)
         if hasattr(self, '_paz_manager'):
             self._paz_manager.game_path = path
+        if hasattr(self, '_blackstar_timer_panel'):
+            self._blackstar_timer_panel.set_game_path(path)
         if hasattr(self, '_global_game_path'):
             self._global_game_path.setText(path)
             self._global_game_path.setToolTip(path)

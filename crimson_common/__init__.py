@@ -17,6 +17,7 @@ from .blackstar_timer import (
     is_crimson_desert_running,
 )
 from .blackstar_timer_worker import BlackstarTimerWorker
+from .blackstar_timer_ui import BlackstarTimerPanel
 
 __all__ = [
     "BLACKSTAR_114_PROFILE",
@@ -24,6 +25,7 @@ __all__ = [
     "BackupConflictError",
     "BlackstarTimerService",
     "BlackstarTimerWorker",
+    "BlackstarTimerPanel",
     "DetectionReport",
     "GameRunningError",
     "PreviewReport",

@@ -27,6 +27,7 @@ from gui.theme import COLORS
 from gui.utils import make_scope_label, make_help_btn
 from i18n import tr
 from paz_patcher import PazPatch, PazPatchManager, VehiclePatcher
+from crimson_common.blackstar_timer_ui import BlackstarTimerPanel
 
 log = logging.getLogger(__name__)
 
@@ -55,11 +56,13 @@ class GamePatchesTab(QWidget):
         if path and hasattr(self, '_paz_game_path'):
             self._paz_game_path.setText(path)
             self._paz_manager.game_path = path
+            self._blackstar_timer_panel.set_game_path(path)
             self._paz_refresh_status()
 
     def _apply_game_path(self, path: str) -> None:
         self._paz_game_path.setText(path)
         self._paz_manager.game_path = path
+        self._blackstar_timer_panel.set_game_path(path)
         self._paz_refresh_status()
         self.game_path_changed.emit(path)
 
@@ -108,6 +111,12 @@ class GamePatchesTab(QWidget):
         path_row.addWidget(detect_btn)
 
         layout.addLayout(path_row)
+
+        self._blackstar_timer_panel = BlackstarTimerPanel(
+            title="Blackstar Timer", parent=self
+        )
+        self._blackstar_timer_panel.status_message.connect(self.status_message)
+        layout.addWidget(self._blackstar_timer_panel)
 
 
         self._paz_patch_table = QTableWidget()
@@ -200,6 +209,7 @@ class GamePatchesTab(QWidget):
         if saved_path and os.path.isdir(saved_path):
             self._paz_game_path.setText(saved_path)
             self._paz_manager.game_path = saved_path
+            self._blackstar_timer_panel.set_game_path(saved_path)
         else:
             self._paz_auto_detect_path()
 

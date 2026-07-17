@@ -714,6 +714,7 @@ class MainWindow(QMainWindow):
         self._patches_tab.status_message.connect(self._update_status)
         self._patches_tab.game_path_changed.connect(self._set_game_path)
         self._patches_tab.config_save_requested.connect(self._save_config)
+        self._mods_tabs.addTab(self._patches_tab, "Game Patches")
 
         self._field_edit_tab_obj = FieldEditTab(
             config=self._config,
