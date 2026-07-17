@@ -6,6 +6,7 @@ from .blackstar_timer import (
     BackupConflictError,
     BlackstarTimerService,
     DetectionReport,
+    GameRunningError,
     PreviewReport,
     PreviewToken,
     StalePreviewError,
@@ -13,6 +14,7 @@ from .blackstar_timer import (
     TimerProfile,
     TimerStatus,
     TransactionReport,
+    is_crimson_desert_running,
 )
 
 __all__ = [
@@ -21,6 +23,7 @@ __all__ = [
     "BackupConflictError",
     "BlackstarTimerService",
     "DetectionReport",
+    "GameRunningError",
     "PreviewReport",
     "PreviewToken",
     "StalePreviewError",
@@ -28,4 +31,5 @@ __all__ = [
     "TimerProfile",
     "TimerStatus",
     "TransactionReport",
+    "is_crimson_desert_running",
 ]

@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import struct
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,6 +38,30 @@ class TimerTransactionError(RuntimeError):
 
 class BackupConflictError(RuntimeError):
     """Raised when Restore cannot prove ownership of the current files."""
+
+
+class GameRunningError(RuntimeError):
+    """Raised when an archive write is requested while the game is open."""
+
+
+def is_crimson_desert_running() -> bool:
+    if os.name != "nt":
+        return False
+    completed = subprocess.run(
+        [
+            "tasklist",
+            "/FI",
+            "IMAGENAME eq CrimsonDesert.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=0x08000000,
+    )
+    return '"crimsondesert.exe"' in completed.stdout.lower()
 
 
 @dataclass(frozen=True)
@@ -159,12 +184,27 @@ class BlackstarTimerService:
         self,
         profile: TimerProfile = BLACKSTAR_114_PROFILE,
         fault_injector: Callable[[str], None] | None = None,
+        process_checker: Callable[[], bool] | None = None,
     ) -> None:
         self.profile = profile
         self._fault_injector = fault_injector
+        self._process_checker = process_checker or is_crimson_desert_running
 
     def detect(self, game_dir: str | Path) -> DetectionReport:
         game = Path(game_dir).expanduser().resolve()
+        try:
+            if self._process_checker():
+                return self._report(
+                    TimerStatus.GAME_RUNNING,
+                    game,
+                    "Crimson Desert is running; close it before previewing or writing",
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return self._report(
+                TimerStatus.UNKNOWN,
+                game,
+                f"Could not verify whether Crimson Desert is running: {exc}",
+            )
         try:
             entry = self._find_entry(game)
             self._validate_entry(entry)
@@ -338,6 +378,7 @@ class BlackstarTimerService:
             raise StalePreviewError("Source archive changed after preview")
 
     def apply(self, token: PreviewToken) -> TransactionReport:
+        self._ensure_game_closed()
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
         game = token.game_dir.expanduser().resolve()
@@ -455,6 +496,7 @@ class BlackstarTimerService:
         )
 
     def restore(self, game_dir: str | Path) -> TransactionReport:
+        self._ensure_game_closed()
         game = Path(game_dir).expanduser().resolve()
         backup_dir = self._latest_finalized_backup(game)
         if backup_dir is None:
@@ -764,6 +806,18 @@ class BlackstarTimerService:
     def _inject_fault(self, phase: str) -> None:
         if self._fault_injector is not None:
             self._fault_injector(phase)
+
+    def _ensure_game_closed(self) -> None:
+        try:
+            running = self._process_checker()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GameRunningError(
+                f"Could not verify whether Crimson Desert is running: {exc}"
+            ) from exc
+        if running:
+            raise GameRunningError(
+                "Crimson Desert is running; close it before changing game archives"
+            )
 
     @staticmethod
     def _sha256_bytes(data: bytes) -> str:

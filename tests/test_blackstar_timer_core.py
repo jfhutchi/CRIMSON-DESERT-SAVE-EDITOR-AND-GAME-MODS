@@ -7,14 +7,21 @@ import crimson_rs
 import pytest
 
 from blackstar_timer_archive import make_timer_archive
+import crimson_common.blackstar_timer as timer_module
 from crimson_common.blackstar_timer import (
     BackupConflictError,
     BlackstarTimerService,
+    GameRunningError,
     StalePreviewError,
     TimerTransactionError,
     TimerProfile,
     TimerStatus,
 )
+
+
+@pytest.fixture(autouse=True)
+def _never_query_live_game_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(timer_module, "is_crimson_desert_running", lambda: False)
 
 
 def _snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
@@ -298,6 +305,51 @@ def test_restore_refuses_unrelated_post_apply_change_without_writing(
     before = _snapshot(archive.game_dir)
 
     with pytest.raises(BackupConflictError, match="changed after"):
+        service.restore(archive.game_dir)
+
+    assert _snapshot(archive.game_dir) == before
+
+
+def test_running_game_disables_preview_and_apply_without_writes(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    running = {"value": False}
+    service = BlackstarTimerService(
+        TimerProfile(**archive.profile_kwargs()),
+        process_checker=lambda: running["value"],
+    )
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    running["value"] = True
+    before = _snapshot(archive.game_dir)
+
+    blocked_preview = service.preview(archive.game_dir)
+    assert blocked_preview.status is TimerStatus.GAME_RUNNING
+    assert blocked_preview.token is None
+    with pytest.raises(GameRunningError, match="running"):
+        service.apply(preview.token)
+
+    assert _snapshot(archive.game_dir) == before
+    assert not (
+        archive.game_dir / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
+    ).exists()
+
+
+def test_running_game_disables_restore_without_writes(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    running = {"value": False}
+    service = BlackstarTimerService(
+        TimerProfile(**archive.profile_kwargs()),
+        process_checker=lambda: running["value"],
+    )
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    service.apply(preview.token)
+    running["value"] = True
+    before = _snapshot(archive.game_dir)
+
+    with pytest.raises(GameRunningError, match="running"):
         service.restore(archive.game_dir)
 
     assert _snapshot(archive.game_dir) == before
