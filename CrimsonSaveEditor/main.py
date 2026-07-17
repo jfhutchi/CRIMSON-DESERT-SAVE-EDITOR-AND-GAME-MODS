@@ -53,8 +53,9 @@ def main() -> None:
     app.setApplicationName("Crimson Desert Save Editor")
     app.setApplicationVersion(APP_VERSION)
 
-    font = QFont("Consolas", 10)
-    font.setStyleHint(QFont.Monospace)
+    font = QFont("Bahnschrift", 10)
+    font.setStyleName("SemiCondensed")
+    font.setStyleHint(QFont.SansSerif)
     app.setFont(font)
 
     _splash("Building main window...")

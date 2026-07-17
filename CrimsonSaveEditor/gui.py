@@ -288,6 +288,20 @@ QCheckBox::indicator {{
 }}
 """
 
+from crimson_theme import (
+    CRIMSON_DARK_TOKENS,
+    apply_crimson_theme,
+    build_stylesheet,
+    legacy_colors,
+)
+
+COLORS.clear()
+COLORS.update(legacy_colors(CRIMSON_DARK_TOKENS))
+_TAB_SELECTED_BG = CRIMSON_DARK_TOKENS["selection"]
+_TAB_SELECTED_COLOR = CRIMSON_DARK_TOKENS["parchment"]
+_TAB_SELECTED_BORDER = CRIMSON_DARK_TOKENS["bronze_bright"]
+DARK_STYLESHEET = build_stylesheet(CRIMSON_DARK_TOKENS)
+
 
 def find_save_files() -> List[dict]:
     results = []
@@ -2441,6 +2455,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("crimsonWindow")
+        apply_crimson_theme(QApplication.instance(), "dark")
         self._splash("Initializing main window...")
         self.setWindowTitle("Crimson Desert - Offline Save Editor")
         self._ui_scale = 1.0
@@ -2554,7 +2570,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
 
         sidebar = QFrame()
-        sidebar.setMinimumWidth(40)
+        sidebar.setObjectName("saveBrowser")
+        sidebar.setMinimumWidth(210)
         sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-right: 1px solid {COLORS['border']};")
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(8, 8, 8, 8)
@@ -2572,23 +2589,25 @@ class MainWindow(QMainWindow):
         self._sb_collapse_btn.clicked.connect(self._toggle_save_sidebar)
         hdr_row.addWidget(self._sb_collapse_btn)
         hdr = QLabel("Save Browser")
+        hdr.setProperty("heading", True)
         hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 4px 0;")
         hdr_row.addWidget(hdr)
         hdr_row.addStretch()
+        sb_layout.addLayout(hdr_row)
 
+        nav_row = QHBoxLayout()
         home_btn = QPushButton("Home")
         home_btn.setFixedHeight(22)
         home_btn.setToolTip("Go to Inventory tab (Tab 1)")
         home_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(0))
-        hdr_row.addWidget(home_btn)
+        nav_row.addWidget(home_btn)
 
         backup_nav_btn = QPushButton("Backup")
         backup_nav_btn.setFixedHeight(22)
         backup_nav_btn.setToolTip("Go to Backup/Restore tab")
         backup_nav_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(self._tabs.count() - 1))
-        hdr_row.addWidget(backup_nav_btn)
-
-        sb_layout.addLayout(hdr_row)
+        nav_row.addWidget(backup_nav_btn)
+        sb_layout.addLayout(nav_row)
 
         path_row = QHBoxLayout()
         self._save_root_label = QLabel("(auto-detect)")
@@ -2625,6 +2644,7 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(ref_btn)
 
         self._quick_save_btn = QPushButton("SAVE EDIT TO SELECTED FILE")
+        self._quick_save_btn.setProperty("primaryAction", True)
         self._quick_save_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLORS['accent']}; color: white; font-weight: bold; "
             f"padding: 8px; border-radius: 4px; font-size: 11px; }}"
@@ -2655,6 +2675,7 @@ class MainWindow(QMainWindow):
 
         self._save_sidebar = sidebar
         self._save_dock = QDockWidget("Save Browser", self)
+        self._save_dock.setMinimumWidth(218)
         self._save_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._save_dock.setFeatures(
             QDockWidget.DockWidgetMovable |
@@ -2689,6 +2710,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._center_status)
 
         self._global_info_widget = QWidget()
+        self._global_info_widget.setObjectName("contextStrip")
         info_layout = QHBoxLayout(self._global_info_widget)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
@@ -2711,7 +2733,7 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(gp_browse)
 
         gp_detect = QPushButton("Detect")
-        gp_detect.setFixedWidth(55)
+        gp_detect.setFixedWidth(80)
         gp_detect.setToolTip("Auto-detect game installation")
         gp_detect.clicked.connect(self._global_auto_detect_path)
         info_layout.addWidget(gp_detect)
@@ -2741,12 +2763,16 @@ class MainWindow(QMainWindow):
             self._global_game_path.setToolTip(saved_gp)
 
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("primaryNav")
+        self._tabs.tabBar().setObjectName("primaryTabBar")
+        self._tabs.setTabPosition(QTabWidget.North)
         right_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(right_panel)
 
         from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
         pack_sidebar = QFrame()
-        pack_sidebar.setMinimumWidth(40)
+        pack_sidebar.setObjectName("packBrowser")
+        pack_sidebar.setMinimumWidth(210)
         pack_sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-left: 1px solid {COLORS['border']};")
         ps_layout = QVBoxLayout(pack_sidebar)
         ps_layout.setContentsMargins(6, 6, 6, 6)
@@ -2754,6 +2780,7 @@ class MainWindow(QMainWindow):
 
         ps_hdr_row = QHBoxLayout()
         ps_hdr = QLabel("Pack Browser")
+        ps_hdr.setProperty("heading", True)
         ps_hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 2px 0;")
         ps_hdr_row.addWidget(ps_hdr)
         ps_hdr_row.addStretch()
@@ -2838,6 +2865,7 @@ class MainWindow(QMainWindow):
 
         self._pack_sidebar = pack_sidebar
         self._pack_dock = QDockWidget("Pack Browser", self)
+        self._pack_dock.setMinimumWidth(218)
         self._pack_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._pack_dock.setFeatures(
             QDockWidget.DockWidgetMovable |
@@ -2867,18 +2895,26 @@ class MainWindow(QMainWindow):
         self._buff_rust_items: list = []
 
         self._save_tabs = QTabWidget()
-        self._save_tabs.setTabPosition(QTabWidget.South)
+        self._save_tabs.setObjectName("sectionNav")
+        self._save_tabs.tabBar().setObjectName("sectionTabBar")
+        self._save_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._save_tabs, tr("tab.save_editor"))
 
         self._mods_tabs = QTabWidget()
-        self._mods_tabs.setTabPosition(QTabWidget.South)
+        self._mods_tabs.setObjectName("sectionNav")
+        self._mods_tabs.tabBar().setObjectName("sectionTabBar")
+        self._mods_tabs.setTabPosition(QTabWidget.North)
 
         self._items_tabs = QTabWidget()
-        self._items_tabs.setTabPosition(QTabWidget.South)
+        self._items_tabs.setObjectName("sectionNav")
+        self._items_tabs.tabBar().setObjectName("sectionTabBar")
+        self._items_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._items_tabs, tr("tab.items"))
 
         self._world_tabs = QTabWidget()
-        self._world_tabs.setTabPosition(QTabWidget.South)
+        self._world_tabs.setObjectName("sectionNav")
+        self._world_tabs.tabBar().setObjectName("sectionTabBar")
+        self._world_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._world_tabs, tr("tab.world"))
 
         _real_tabs = self._tabs
@@ -3773,6 +3809,11 @@ class MainWindow(QMainWindow):
     def _apply_ui_settings(self) -> None:
         scale = self._config.get("ui_scale", 100) / 100.0
         compact = self._config.get("compact_mode", False)
+        sheet = apply_crimson_theme(
+            QApplication.instance(), "dark", scale=scale, compact=compact
+        )
+        self.setStyleSheet(sheet)
+        return
 
         if compact:
             font_main = 11
@@ -31228,6 +31269,7 @@ QCheckBox::indicator {{
 
     def _build_status_bar(self) -> None:
         self._status = self.statusBar()
+        self._status.setObjectName("statusRail")
         self._status_file_label = QLabel("No file loaded")
         self._status_items_label = QLabel("Items: 0")
         self._status_parc_label = QLabel("")

@@ -38,6 +38,9 @@ def test_shared_panel_exposes_fixed_preset_and_safe_initial_state() -> None:
     }
     assert buttons["Preview 30m / 1s"].isEnabled()
     assert not buttons["Apply Preset"].isEnabled()
+    assert buttons["Preview 30m / 1s"].property("quietAction") is True
+    assert buttons["Apply Preset"].property("primaryAction") is True
+    assert buttons["Restore Original"].property("quietAction") is True
 
 
 def test_both_applications_use_the_shared_timer_panel() -> None:

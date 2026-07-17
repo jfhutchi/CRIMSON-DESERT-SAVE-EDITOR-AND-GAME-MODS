@@ -101,7 +101,7 @@ from gui import MainWindow
 
 
 _CJK_FONT_STACK = [
-    "Consolas",
+    "Bahnschrift",
     "Segoe UI",
     "Microsoft YaHei",
     "Microsoft JhengHei",
@@ -196,7 +196,8 @@ def main() -> None:
     font = QFont()
     font.setFamilies(_CJK_FONT_STACK)
     font.setPointSize(10)
-    font.setStyleHint(QFont.Monospace)
+    font.setStyleName("SemiCondensed")
+    font.setStyleHint(QFont.SansSerif)
     app.setFont(font)
 
     chosen_language = _compute_startup_language()

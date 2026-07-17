@@ -85,8 +85,12 @@ def test_both_specs_bundle_shared_timer_and_native_archive_runtime() -> None:
         assert "crimson_common.blackstar_timer" in spec
         assert "crimson_common.blackstar_timer_worker" in spec
         assert "crimson_common.blackstar_timer_ui" in spec
+        assert "crimson_common.crimson_theme" in spec
         assert "crimson_rs" in spec
         assert "lz4.block" in spec
+
+    assert "'crimson_theme'" in specs[0].read_text(encoding="utf-8")
+    assert "'gui.crimson_theme'" in specs[1].read_text(encoding="utf-8")
 
 
 def test_source_entry_points_bootstrap_repository_shared_packages() -> None:
