@@ -72,4 +72,4 @@ def test_timer_panel_runs_archive_operations_on_qthread() -> None:
     assert "worker.moveToThread(thread)" in source
     assert "thread.started.connect(worker.run)" in source
     assert "worker.finished.connect(thread.quit)" in source
-    assert "progress.canceled.connect(worker.request_cancel)" in source
+    assert "progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)" in source

@@ -2497,6 +2497,11 @@ class MainWindow(QMainWindow):
         self._blackstar_input_hash = ""
         self._blackstar_preview_token = None
         self._blackstar_dry_run_active = True
+        self._load_thread = None
+        self._load_worker = None
+        self._load_progress = None
+        self._parc_thread = None
+        self._parc_worker = None
         self._parc_status: str = ""
         self._config: dict = self._load_config()
 
@@ -31408,39 +31413,63 @@ QCheckBox::indicator {{
 
     def _load_save(self, path: str) -> None:
         self._blackstar_preview_token = None
-        from PySide6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Loading save file...", None, 0, 5, self)
+        if self._load_thread is not None:
+            self._update_status("A save is already loading")
+            return
+        if self._parc_worker is not None:
+            self._parc_worker.request_cancel()
+
+        from crimson_common.gui_task_worker import GuiTaskWorker
+
+        progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Loading")
         progress.setMinimumDuration(0)
         progress.setWindowModality(Qt.WindowModal)
         progress.setValue(0)
-        QApplication.processEvents()
 
-        def _step(msg, val):
-            progress.setLabelText(msg)
-            progress.setValue(val)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText(msg)
-            QApplication.processEvents()
+        def _task(report):
+            report("Decrypting save file...", 10)
+            save_data = load_save_file(path)
+            report("Scanning items...", 45)
+            items = scan_items(save_data.decompressed_blob)
+            report("Resolving item names...", 65)
+            for item in items:
+                item.name = self._name_db.get_name(item.item_key)
+                item.category = self._name_db.get_category(item.item_key)
+            report("Creating pristine backup...", 80)
+            pristine = self._create_pristine_backup(path)
+            report("Preparing the editor...", 95)
+            return save_data, items, pristine
 
-        try:
-            _step("Decrypting save file...", 1)
-            self._save_data = load_save_file(path)
+        thread = QThread(self)
+        worker = GuiTaskWorker(task=_task)
+        worker.moveToThread(thread)
+        self._load_thread = thread
+        self._load_worker = worker
+        self._load_progress = progress
+        self._set_load_busy(True)
+
+        def _on_progress(message: str, value: int) -> None:
+            progress.setLabelText(message)
+            progress.setValue(value)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
+
+        def _on_completed(result) -> None:
+            save_data, items, pristine = result
+            self._save_data = save_data
+            self._items = items
             self._document_generation_counter += 1
             self._save_data.document_generation = self._document_generation_counter
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
-
-            _step("Creating backup...", 2)
-            pristine = self._create_pristine_backup(path)
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            _step("Scanning items...", 3)
-            self._scan_and_populate()
-
-            _step("Populating UI...", 4)
+            progress.setLabelText("Populating the editor...")
+            progress.setValue(98)
+            self._populate_scanned_items()
 
             slot_dir = os.path.basename(os.path.dirname(path))
             friendly = self._friendly_slot_name(slot_dir)
@@ -31465,27 +31494,56 @@ QCheckBox::indicator {{
                     "Blackstar Preview uses its own compatibility check"
                 )
 
-            self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
-            progress.setValue(5)
-            progress.close()
+            self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
+            progress.setValue(100)
             self._update_status(f"Loaded: {friendly} ({slot_dir}){schema_notice}")
-        except Warning as w:
-            self._update_status(f"Loaded (HMAC warning): {os.path.basename(path)}")
-            progress.close()
-        except Exception as e:
-            progress.close()
-            err_msg = str(e)
+
+        def _on_failed(message: str, details: str) -> None:
             hint = ""
-            if "byte must be in range" in err_msg or "chacha20" in traceback.format_exc().lower():
+            if "byte must be in range" in message or "chacha20" in details.lower():
                 hint = (
                     "\n\nThis file appears to be corrupted or is not a valid save file.\n"
                     "If this is a backup, it may have been created from an already-broken save.\n"
                     "Try loading a different save or restoring from an earlier backup."
                 )
             QMessageBox.critical(
-                self, "Error",
-                f"Failed to load save file:\n\n{e}{hint}\n\n{traceback.format_exc()}"
+                self,
+                "Error",
+                f"Failed to load save file:\n\n{message}{hint}\n\n{details}",
             )
+
+        def _on_cancelled() -> None:
+            self._update_status("Save loading cancelled; no save was changed")
+
+        def _cleanup() -> None:
+            progress.close()
+            self._load_progress = None
+            self._load_worker = None
+            self._load_thread = None
+            self._set_load_busy(False)
+
+        worker.progress.connect(_on_progress, Qt.QueuedConnection)
+        worker.completed.connect(_on_completed, Qt.QueuedConnection)
+        worker.failed.connect(_on_failed, Qt.QueuedConnection)
+        worker.cancelled.connect(_on_cancelled, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(_cleanup)
+        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
+        thread.started.connect(worker.run)
+        progress.show()
+        thread.start()
+
+    def _set_load_busy(self, busy: bool) -> None:
+        for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and bool(self._save_data))
+        if not busy:
+            self._update_schema_write_controls()
 
     def _save_file(self) -> None:
         if not self._save_data or not self._loaded_path:
@@ -31605,6 +31663,9 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
+        self._populate_scanned_items()
+
+    def _populate_scanned_items(self) -> None:
         self._status_parc_label.setText("Loading... (PARC enriching in background)")
         self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
         self._populate_inventory()
@@ -31617,23 +31678,73 @@ QCheckBox::indicator {{
     def _deferred_parc_enrich(self) -> None:
         if not self._save_data or not self._items:
             return
+        if self._parc_thread is not None:
+            return
 
-        try:
+        from crimson_common.gui_task_worker import GuiTaskWorker
+
+        save_data = self._save_data
+        items = self._items
+        generation = save_data.document_generation
+
+        def _task(report):
+            def _on_progress(step: int, total: int) -> None:
+                total = max(1, total)
+                value = 10 + int((min(step, total) / total) * 85)
+                report(f"Enriching item offsets ({step}/{total})...", value)
+
             enriched, parc_status = enrich_items_with_parc(
-                self._save_data.decompressed_blob, self._items
+                save_data.decompressed_blob, items, _on_progress
             )
-            self._parc_status = parc_status
-            if enriched > 0:
-                self._status_parc_label.setText(parc_status)
-                self._status_parc_label.setStyleSheet(f"color: {COLORS['success']}; padding: 0 8px;")
-            else:
-                self._status_parc_label.setText("Legacy mode: pattern-based scanning")
-                self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
-        except Exception:
-            self._parc_status = "Legacy mode: pattern-based scanning"
-            self._status_parc_label.setText(self._parc_status)
-            self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
+            return generation, enriched, parc_status
 
+        thread = QThread(self)
+        worker = GuiTaskWorker(task=_task)
+        worker.moveToThread(thread)
+        self._parc_thread = thread
+        self._parc_worker = worker
+
+        def _on_progress(message: str, _value: int) -> None:
+            self._status_parc_label.setText(message)
+
+        def _on_completed(result) -> None:
+            result_generation, enriched, parc_status = result
+            if (
+                self._save_data is save_data
+                and self._save_data.document_generation == result_generation
+            ):
+                self._finish_parc_enrich(enriched, parc_status)
+
+        def _on_failed(message: str, details: str) -> None:
+            log.error("PARC enrichment failed: %s\n%s", message, details)
+            if self._save_data is save_data:
+                self._finish_parc_enrich(0, "Legacy mode: pattern-based scanning")
+
+        def _cleanup() -> None:
+            stale = self._save_data is not save_data
+            self._parc_thread = None
+            self._parc_worker = None
+            if stale:
+                QTimer.singleShot(0, self._deferred_parc_enrich)
+
+        worker.progress.connect(_on_progress, Qt.QueuedConnection)
+        worker.completed.connect(_on_completed, Qt.QueuedConnection)
+        worker.failed.connect(_on_failed, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(_cleanup)
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _finish_parc_enrich(self, enriched: int, parc_status: str) -> None:
+        self._parc_status = parc_status
+        if enriched > 0:
+            self._status_parc_label.setText(parc_status)
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['success']}; padding: 0 8px;")
+        else:
+            self._status_parc_label.setText("Legacy mode: pattern-based scanning")
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
         self._enrich_vendor_names()
         self._update_inv_subtab_counts()
 

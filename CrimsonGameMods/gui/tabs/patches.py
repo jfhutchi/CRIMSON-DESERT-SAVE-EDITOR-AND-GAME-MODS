@@ -12,7 +12,7 @@ from typing import Callable, Optional, Tuple
 
 from data_db import get_connection
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox,
@@ -43,6 +43,7 @@ class GamePatchesTab(QWidget):
     status_message = Signal(str)
     game_path_changed = Signal(str)
     config_save_requested = Signal()
+    status_scan_ready = Signal(object)
 
     def __init__(self, config: dict, paz_manager: PazPatchManager, experimental_mode: bool, show_guide_fn=None, parent=None):
         super().__init__(parent)
@@ -50,6 +51,7 @@ class GamePatchesTab(QWidget):
         self._paz_manager = paz_manager
         self._experimental_mode = experimental_mode
         self._show_guide_fn = show_guide_fn
+        self.status_scan_ready.connect(self._paz_apply_status_results)
         self._build_ui()
 
     def set_game_path(self, path: str) -> None:
@@ -268,7 +270,7 @@ class GamePatchesTab(QWidget):
                 except Exception as e:
                     log.warning(tr("Status check failed for %s: %s"), patch.name, e)
                     results.append((row, None, False, str(e)))
-            QTimer.singleShot(0, lambda: self._paz_apply_status_results(results))
+            self.status_scan_ready.emit(results)
 
         threading.Thread(target=_do_scan, daemon=True).start()
 
@@ -1013,11 +1015,11 @@ class SkillsTab(QWidget):
             self._skill_game_path.setText(self._game_path)
         path_row.addWidget(self._skill_game_path, 1)
 
-        extract_btn = QPushButton(tr("Extract Skills"))
-        extract_btn.setObjectName("accentBtn")
-        extract_btn.setToolTip(tr("Extract skill.pabgb from game PAZ archives and parse all entries"))
-        extract_btn.clicked.connect(self._skill_extract)
-        path_row.addWidget(extract_btn)
+        self._skill_extract_btn = QPushButton(tr("Extract Skills"))
+        self._skill_extract_btn.setObjectName("accentBtn")
+        self._skill_extract_btn.setToolTip(tr("Extract skill.pabgb from game PAZ archives and parse all entries"))
+        self._skill_extract_btn.clicked.connect(self._skill_extract)
+        path_row.addWidget(self._skill_extract_btn)
         layout.addLayout(path_row)
 
         search_row = QHBoxLayout()
@@ -1127,82 +1129,121 @@ class SkillsTab(QWidget):
         self._skill_current_entry = None
         self._skill_modified = False
         self._skill_edits: dict = {}
+        self._skill_thread = None
+        self._skill_worker = None
 
     def _skill_extract(self) -> None:
         game_path = self._game_path
         if not game_path:
             QMessageBox.warning(self, tr("Skills"), tr("Set the game path first (Browse at top)."))
             return
-        self._skill_game_path.setText(game_path)
-
-        self._skill_status.setText(tr("Extracting skill.pabgb..."))
-        QApplication.processEvents()
-
-        try:
-            import crimson_rs
-            dir_path = "gamedata/binary__/client/bin"
-            raw_data = crimson_rs.extract_file(game_path, '0008', dir_path, 'skill.pabgb')
-            raw_schema = crimson_rs.extract_file(game_path, '0008', dir_path, 'skill.pabgh')
-        except Exception as e:
-            self._skill_status.setText(f"Extract failed: {e}")
-            QMessageBox.critical(self, tr("Extract Failed"), str(e))
+        if self._skill_thread is not None:
+            self._skill_status.setText(tr("Skill extraction is already running..."))
             return
 
-        self._skill_status.setText(tr("Parsing entries..."))
-        QApplication.processEvents()
+        from crimson_common.gui_task_worker import GuiTaskWorker
 
-        try:
+        self._skill_game_path.setText(game_path)
+        self._skill_extract_btn.setEnabled(False)
+        self._skill_status.setText(tr("Extracting skill.pabgb..."))
+
+        def _task(report):
+            report("Extracting skill data from game archives...", 10)
+            import crimson_rs
+
+            dir_path = "gamedata/binary__/client/bin"
+            raw_data = crimson_rs.extract_file(
+                game_path, "0008", dir_path, "skill.pabgb"
+            )
+            raw_schema = crimson_rs.extract_file(
+                game_path, "0008", dir_path, "skill.pabgh"
+            )
+
+            report("Deep-parsing skill entries...", 55)
             from universal_pabgb_parser import parse_pabgb
+
+            parser_result = parse_pabgb(
+                bytes(raw_data), raw_schema, "skill", deep=True
+            )
+            report("Resolving skill display names...", 80)
+
+            display_names = {}
+            loc_path = None
+            for base in (
+                os.path.dirname(os.path.abspath(__file__)),
+                getattr(sys, "_MEIPASS", ""),
+                os.getcwd(),
+            ):
+                candidate = os.path.join(base, "localizationstring_eng_items.tsv")
+                if os.path.isfile(candidate):
+                    loc_path = candidate
+                    break
+            if loc_path:
+                with open(loc_path, "r", encoding="utf-8-sig") as stream:
+                    for line in stream:
+                        for match in re.finditer(
+                            r"Knowledge:Knowledge_(\w+)#([^}\"<]+)", line
+                        ):
+                            suffix = match.group(1)
+                            display_names[f"Skill_{suffix}"] = match.group(2).strip()
+
+                for entry in parser_result.entries:
+                    display = display_names.get(entry.name)
+                    if not display:
+                        base_name = entry.name.replace("Skill_", "")
+                        display = display_names.get(f"Skill_{base_name}")
+                    entry.display_name = display or ""
+
+            report("Preparing skill browser...", 95)
+            return bytes(raw_data), raw_schema, parser_result, display_names
+
+        thread = QThread(self)
+        worker = GuiTaskWorker(task=_task)
+        worker.moveToThread(thread)
+        self._skill_thread = thread
+        self._skill_worker = worker
+
+        def _on_progress(message: str, _value: int) -> None:
+            self._skill_status.setText(message)
+
+        def _on_completed(result) -> None:
+            raw_data, raw_schema, parser_result, display_names = result
             self._skill_data = bytearray(raw_data)
             self._skill_schema_data = raw_schema
-            self._skill_original = bytes(raw_data)
-            self._skill_parser_result = parse_pabgb(
-                bytes(raw_data), raw_schema, 'skill', deep=True)
+            self._skill_original = raw_data
+            self._skill_parser_result = parser_result
+            self._skill_display_names = display_names
             self._skill_modified = False
             self._skill_edits = {}
-
-            count = self._skill_parser_result.entry_count
-
-            self._skill_display_names = {}
-            try:
-                import re as _re
-                loc_path = None
-                for base in [os.path.dirname(os.path.abspath(__file__)),
-                             getattr(sys, '_MEIPASS', ''), os.getcwd()]:
-                    p = os.path.join(base, 'localizationstring_eng_items.tsv')
-                    if os.path.isfile(p):
-                        loc_path = p
-                        break
-                if loc_path:
-                    with open(loc_path, 'r', encoding='utf-8-sig') as lf:
-                        for line in lf:
-                            for m in _re.finditer(r'Knowledge:Knowledge_(\w+)#([^}"<]+)', line):
-                                suffix = m.group(1)
-                                display = m.group(2).strip()
-                                self._skill_display_names[f'Skill_{suffix}'] = display
-
-                    for entry in self._skill_parser_result.entries:
-                        dn = self._skill_display_names.get(entry.name)
-                        if not dn:
-                            base_name = entry.name.replace('Skill_', '')
-                            dn = self._skill_display_names.get(f'Skill_{base_name}')
-                        if dn:
-                            entry.display_name = dn
-                        else:
-                            entry.display_name = ""
-
-                    named = sum(1 for e in self._skill_parser_result.entries if e.display_name)
-                    log.info("Skill display names loaded: %d/%d", named, count)
-            except Exception as le:
-                log.warning(tr("Localization load failed: %s"), le)
-
+            count = parser_result.entry_count
+            named = sum(
+                1 for entry in parser_result.entries if entry.display_name
+            )
+            log.info("Skill display names loaded: %d/%d", named, count)
             self._skill_status.setText(
                 f"Extracted: {len(raw_data):,} bytes, {count} skills. "
-                f"Search by name (e.g. 'Force Palm', 'Slash', 'JiJeongTa').")
-        except Exception as e:
-            log.exception("Unhandled exception")
-            self._skill_status.setText(f"Parse failed: {e}")
-            QMessageBox.critical(self, tr("Parse Failed"), str(e))
+                "Search by name (e.g. 'Force Palm', 'Slash', 'JiJeongTa')."
+            )
+
+        def _on_failed(message: str, details: str) -> None:
+            log.error("Skill extraction failed: %s\n%s", message, details)
+            self._skill_status.setText(f"Extract or parse failed: {message}")
+            QMessageBox.critical(self, tr("Skill Extraction Failed"), message)
+
+        def _cleanup() -> None:
+            self._skill_thread = None
+            self._skill_worker = None
+            self._skill_extract_btn.setEnabled(True)
+
+        worker.progress.connect(_on_progress, Qt.QueuedConnection)
+        worker.completed.connect(_on_completed, Qt.QueuedConnection)
+        worker.failed.connect(_on_failed, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(_cleanup)
+        thread.started.connect(worker.run)
+        thread.start()
 
     def _skill_search_items(self) -> None:
         if not self._skill_parser_result:

@@ -13,7 +13,7 @@ import traceback
 log = logging.getLogger(__name__)
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QBrush, QShortcut,
 )
@@ -230,6 +230,9 @@ class MainWindow(QMainWindow):
         self._undo_stack: List[UndoEntry] = []
         self._loaded_path: str = ""
         self._dirty: bool = False
+        self._load_thread = None
+        self._load_worker = None
+        self._load_progress = None
         self._parc_status: str = ""
         self._tab_loaders: dict = {}
         self._loaded_tabs: set = set()
@@ -3164,37 +3167,60 @@ QCheckBox::indicator {{
             self._load_save(saves[idx]["path"])
 
     def _load_save(self, path: str) -> None:
+        if self._load_thread is not None:
+            self._update_status("A save is already loading")
+            return
+
+        from crimson_common.gui_task_worker import GuiTaskWorker
         from PySide6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Loading save file...", None, 0, 5, self)
+
+        progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Loading")
         progress.setMinimumDuration(0)
         progress.setWindowModality(Qt.WindowModal)
         progress.setValue(0)
-        QApplication.processEvents()
 
-        def _step(msg, val):
-            progress.setLabelText(msg)
-            progress.setValue(val)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText(msg)
-            QApplication.processEvents()
+        def _task(report):
+            report("Decrypting save file...", 10)
+            save_data = load_save_file(path)
+            report("Scanning items...", 45)
+            items = scan_items(save_data.decompressed_blob)
+            report("Resolving item names...", 65)
+            for item in items:
+                item.name = self._name_db.get_name(item.item_key)
+                item.category = self._name_db.get_category(item.item_key)
+            report("Creating pristine backup...", 80)
+            pristine = self._create_pristine_backup(path)
+            report("Preparing the editor...", 95)
+            return save_data, items, pristine
 
-        try:
-            _step("Decrypting save file...", 1)
-            self._save_data = load_save_file(path)
+        thread = QThread(self)
+        worker = GuiTaskWorker(task=_task)
+        worker.moveToThread(thread)
+        self._load_thread = thread
+        self._load_worker = worker
+        self._load_progress = progress
+        self._set_load_busy(True)
+
+        def _on_progress(message: str, value: int) -> None:
+            progress.setLabelText(message)
+            progress.setValue(value)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
+
+        def _on_completed(result) -> None:
+            save_data, items, pristine = result
+            self._save_data = save_data
+            self._items = items
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
-
-            _step("Creating backup...", 2)
-            pristine = self._create_pristine_backup(path)
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            _step("Scanning items...", 3)
-            self._scan_and_populate()
-
-            _step("Populating UI...", 4)
+            progress.setLabelText("Populating the editor...")
+            progress.setValue(98)
+            self._populate_scanned_items()
 
             slot_dir = os.path.basename(os.path.dirname(path))
             friendly = self._friendly_slot_name(slot_dir)
@@ -3205,31 +3231,56 @@ QCheckBox::indicator {{
 
             self._quick_save_btn.setEnabled(True)
             self._quick_save_btn.setToolTip(f"Save to: {path}")
-
-            self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
+            self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
             self._update_status(f"Loaded: {friendly} ({slot_dir})")
-
-            if hasattr(self, '_backup_tab'):
+            if hasattr(self, "_backup_tab"):
                 self._backup_tab.set_loaded_path(path)
+            progress.setValue(100)
 
-            progress.setValue(5)
-        except Warning as w:
-            self._update_status(f"Loaded (HMAC warning): {os.path.basename(path)}")
-            progress.close()
-        except Exception as e:
-            progress.close()
-            err_msg = str(e)
+        def _on_failed(message: str, details: str) -> None:
             hint = ""
-            if "byte must be in range" in err_msg or "chacha20" in traceback.format_exc().lower():
+            if "byte must be in range" in message or "chacha20" in details.lower():
                 hint = (
                     "\n\nThis file appears to be corrupted or is not a valid save file.\n"
                     "If this is a backup, it may have been created from an already-broken save.\n"
                     "Try loading a different save or restoring from an earlier backup."
                 )
             QMessageBox.critical(
-                self, "Error",
-                f"Failed to load save file:\n\n{e}{hint}\n\n{traceback.format_exc()}"
+                self,
+                "Error",
+                f"Failed to load save file:\n\n{message}{hint}\n\n{details}",
             )
+
+        def _on_cancelled() -> None:
+            self._update_status("Save loading cancelled; no save was changed")
+
+        def _cleanup() -> None:
+            progress.close()
+            self._load_progress = None
+            self._load_worker = None
+            self._load_thread = None
+            self._set_load_busy(False)
+
+        worker.progress.connect(_on_progress, Qt.QueuedConnection)
+        worker.completed.connect(_on_completed, Qt.QueuedConnection)
+        worker.failed.connect(_on_failed, Qt.QueuedConnection)
+        worker.cancelled.connect(_on_cancelled, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(_cleanup)
+        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
+        thread.started.connect(worker.run)
+        progress.show()
+        thread.start()
+
+    def _set_load_busy(self, busy: bool) -> None:
+        for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and bool(self._save_data))
 
     def _save_file(self) -> None:
         if not self._save_data or not self._loaded_path:
@@ -3346,6 +3397,9 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
+        self._populate_scanned_items()
+
+    def _populate_scanned_items(self) -> None:
         self._fix_duplicate_item_nos()
 
         self._loaded_tabs.clear()

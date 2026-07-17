@@ -18,6 +18,7 @@ from .blackstar_timer import (
 )
 from .blackstar_timer_worker import BlackstarTimerWorker
 from .blackstar_timer_ui import BlackstarTimerPanel
+from .gui_task_worker import GuiTaskWorker
 
 __all__ = [
     "BLACKSTAR_114_PROFILE",
@@ -28,6 +29,7 @@ __all__ = [
     "BlackstarTimerPanel",
     "DetectionReport",
     "GameRunningError",
+    "GuiTaskWorker",
     "PreviewReport",
     "PreviewToken",
     "StalePreviewError",

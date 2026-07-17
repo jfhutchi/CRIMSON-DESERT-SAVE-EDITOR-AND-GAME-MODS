@@ -66,6 +66,7 @@ a = Analysis(
         'crimson_common.blackstar_timer_worker',
         'crimson_common.blackstar_timer_ui',
         'crimson_common.crimson_theme',
+        'crimson_common.gui_task_worker',
         'crimson_theme',
         'crimson_rs',
         'crimson_rs.enums',

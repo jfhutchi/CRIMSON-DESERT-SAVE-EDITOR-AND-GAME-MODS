@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -166,7 +166,7 @@ class BlackstarTimerPanel(QGroupBox):
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._cleanup)
-        progress.canceled.connect(worker.request_cancel)
+        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
         progress.show()
         thread.start()
 
