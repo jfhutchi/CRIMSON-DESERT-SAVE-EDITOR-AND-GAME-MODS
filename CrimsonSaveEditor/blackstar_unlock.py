@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import re
 import struct
 import tempfile
@@ -13,6 +14,7 @@ from typing import Callable
 
 from blackstar_compat import require_blackstar_compatibility
 from blackstar_template import BlackstarDynamicValues, materialize_blackstar_template
+from app_logging import phase
 from parc_inserter3 import (
     FixupMetrics, ParsedInsertContext, _fixup_external, _fixup_trailing_sizes,
     build_insert_context,
@@ -22,6 +24,7 @@ from save_compat import SaveSchemaIdentity
 BLACKSTAR_CHARACTER_KEY = 1000799
 BLACKSTAR_ITEM_KEY = 1002269
 _TARGET_PATTERN = re.compile(r"\s*target=0x[0-9A-Fa-f]+")
+log = logging.getLogger(__name__)
 
 
 class BlackstarValidationError(ValueError):
@@ -250,7 +253,6 @@ def unlock_blackstar(
     progress: Callable[[BlackstarProgress], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> BlackstarResult:
-    del operation_id
     original = bytes(blob)
     started = time.perf_counter()
     context = build_insert_context(original)
@@ -283,12 +285,19 @@ def unlock_blackstar(
     _clan, mounts = _clan_parts(context)
     position = found[0][1].start_offset if classification == "legacy" else mounts.list_elements[-1].end_offset
     record = materialize_blackstar_template(context, position, values)
-    if classification == "legacy":
-        candidate, fixups = _replace_record(context, found[0][1], record)
-        action = "replace"
-    else:
-        candidate, fixups = _insert_record(context, record)
-        action = "insert"
+    with phase(
+        log,
+        operation_id,
+        "blackstar_mount_insertion",
+        classification=classification,
+        record_bytes=len(record),
+    ):
+        if classification == "legacy":
+            candidate, fixups = _replace_record(context, found[0][1], record)
+            action = "replace"
+        else:
+            candidate, fixups = _insert_record(context, record)
+            action = "insert"
     _emit(progress, "candidate", 4, f"Built Blackstar {action} candidate")
     candidate_context = build_insert_context(candidate)
     after_classification, after_found = _classify(candidate_context)
@@ -296,8 +305,14 @@ def unlock_blackstar(
         raise BlackstarValidationError("Candidate Blackstar record did not validate")
     if canonical_root_snapshot(candidate_context, "QuestSaveData") != quest_before:
         raise BlackstarValidationError("Quest semantics changed")
-    if canonical_root_snapshot(candidate_context, "KnowledgeSaveData") != knowledge_before:
-        raise BlackstarValidationError("Knowledge semantics changed")
+    with phase(
+        log,
+        operation_id,
+        "blackstar_knowledge_insertion",
+        requested_changes=0,
+    ):
+        if canonical_root_snapshot(candidate_context, "KnowledgeSaveData") != knowledge_before:
+            raise BlackstarValidationError("Knowledge semantics changed")
     _emit(progress, "validation", 5, "Validated unchanged quests and knowledge")
     input_hash = hashlib.sha256(original).hexdigest()
     candidate_hash = hashlib.sha256(candidate).hexdigest()
