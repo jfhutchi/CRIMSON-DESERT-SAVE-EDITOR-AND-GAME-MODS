@@ -93,6 +93,141 @@ QWidget {{
 QWidget:disabled {{ color: {c['ash']}; }}
 QLabel {{ background: transparent; }}
 
+QWidget#crimsonApplicationShell {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 {c['ink']}, stop:0.54 {c['obsidian']}, stop:1 {c['surface_warm']});
+}}
+QFrame#commandHeader {{
+    min-height: 62px;
+    max-height: 62px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['ink']}, stop:0.62 {c['obsidian']}, stop:1 {c['surface_warm']});
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+}}
+QWidget#destinationNavigation,
+QWidget#shellUtilities,
+QFrame#shellBody {{
+    background: transparent;
+    border: 0px;
+}}
+QToolButton#destinationButton {{
+    min-width: 66px;
+    min-height: 60px;
+    padding: 0px 2px;
+    color: {c['ash']};
+    background: transparent;
+    border: 0px;
+    border-bottom: 2px solid transparent;
+    font-size: 8pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+QToolButton#destinationButton:hover {{
+    color: {c['text_bright']};
+    background: transparent;
+    border: 0px;
+    border-bottom: 2px solid {c['divider']};
+}}
+QToolButton#destinationButton:checked {{
+    color: {c['text_bright']};
+    background: transparent;
+    border: 0px;
+    border-bottom: 2px solid {c['accent_red']};
+}}
+QToolButton#shellUtilityButton {{
+    min-width: 40px;
+    min-height: 26px;
+    padding: 0px 7px;
+    color: {c['ash']};
+    background: transparent;
+    border: 0px;
+    font-size: 7.5pt;
+    font-weight: 700;
+}}
+QToolButton#shellUtilityButton:hover,
+QToolButton#shellUtilityButton:focus {{
+    color: {c['text_bright']};
+    background-color: {c['surface']};
+    border: 0px;
+}}
+QFrame#contextNavigation {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['ink']}, stop:1 {c['obsidian']});
+    border: 0px;
+    border-right: 1px solid {c['divider']};
+}}
+QLabel#contextEyebrow,
+QLabel#routeEyebrow {{
+    color: {c['accent_red']};
+    font-size: 7.5pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+QLabel#contextTitle {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 13pt;
+    padding-top: 3px;
+}}
+QWidget#routeNavigation {{
+    background: transparent;
+    border: 0px;
+}}
+QPushButton#routeButton {{
+    min-height: 34px;
+    padding: 1px 8px 1px 12px;
+    color: {c['ash']};
+    background: transparent;
+    border: 0px;
+    border-left: 2px solid transparent;
+    text-align: left;
+    font-size: 9.5pt;
+    font-weight: 500;
+}}
+QPushButton#routeButton:hover {{
+    color: {c['parchment']};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['surface']}, stop:1 transparent);
+    border: 0px;
+    border-left: 2px solid {c['divider']};
+}}
+QPushButton#routeButton:checked {{
+    color: {c['text_bright']};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['selection']}, stop:1 transparent);
+    border: 0px;
+    border-left: 2px solid {c['accent_red']};
+    font-weight: 700;
+}}
+QLabel#contextFootnote {{
+    color: {c['divider']};
+    font-size: 7pt;
+    letter-spacing: 1px;
+}}
+QFrame#editorialWorkspace {{
+    background: qradialgradient(cx:0.78, cy:0.02, radius:0.95,
+        stop:0 {c['surface_warm']}, stop:0.34 {c['obsidian']}, stop:1 {c['ink']});
+    border: 0px;
+}}
+QFrame#routeHeader {{
+    min-height: 54px;
+    max-height: 54px;
+    background: transparent;
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+}}
+QLabel#routeTitle {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 15pt;
+}}
+QLabel#routeDescription {{
+    max-width: 420px;
+    color: {c['ash']};
+    font-size: 8.5pt;
+}}
+
 QMenuBar {{
     min-height: 24px;
     background-color: {c['ink']};

@@ -295,6 +295,12 @@ from crimson_theme import (
     install_crimson_shell,
     legacy_colors,
 )
+from crimson_common.crimson_shell import (
+    ShellCommand,
+    ShellDestination,
+    ShellRoute,
+    install_crimson_application_shell,
+)
 
 COLORS.clear()
 COLORS.update(legacy_colors(CRIMSON_DARK_TOKENS))
@@ -2544,7 +2550,7 @@ class MainWindow(QMainWindow):
             self._update_status(
                 f"Ready. Item DB: {len(self._name_db.items)} items"
                 + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
-                + "  |  Select a save from the sidebar or File > Open"
+                + "  |  Select a save with SAVES or Menu > File > Open"
             )
 
 
@@ -2699,7 +2705,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
+        self._center_status = QLabel("Ready — Select a save with SAVES or Menu > File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
             "background: transparent; "
@@ -2961,6 +2967,99 @@ class MainWindow(QMainWindow):
 
         if self._config.get("ui_scale", 100) != 100 or self._config.get("compact_mode", False):
             self._apply_ui_settings()
+
+        self._shell = install_crimson_application_shell(
+            self,
+            product="SAVE EDITOR",
+            router_tabs=self._real_tabs,
+            destinations=self._shell_destinations(),
+            context_widget=self._global_info_widget,
+            commands=(
+                ShellCommand("SAVES", self._toggle_save_sidebar, "Open the save browser"),
+                ShellCommand("PACKS", self._toggle_pack_sidebar, "Open the item pack browser"),
+            ),
+            docks=(self._save_dock, self._pack_dock),
+            preserve_widgets=(self._center_status,),
+        )
+
+    def _shell_destinations(self) -> tuple[ShellDestination, ...]:
+        outer = self._real_tabs
+
+        def section_route(
+            label: str,
+            section: QTabWidget,
+            index: int,
+            description: str = "",
+        ) -> ShellRoute:
+            return ShellRoute(
+                label,
+                outer.indexOf(section),
+                section,
+                index,
+                description,
+            )
+
+        inventory = section_route(
+            "Save Overview",
+            self._save_tabs,
+            0,
+            "Loaded character, inventory, and save state.",
+        )
+        backup = ShellRoute(
+            "Backup & Restore",
+            self._backup_tab_index,
+            description="Local snapshots and recovery.",
+        )
+        return (
+            ShellDestination(
+                "SAVE",
+                (inventory, backup),
+                "Current save",
+            ),
+            ShellDestination(
+                "MOUNTS",
+                (
+                    section_route(
+                        "Blackstar",
+                        self._save_tabs,
+                        5,
+                        "Blackstar ownership, companions, and mount records.",
+                    ),
+                ),
+                "Mount registry",
+            ),
+            ShellDestination(
+                "INVENTORY",
+                (
+                    section_route("Inventory", self._save_tabs, 0),
+                    section_route("Item Swap", self._save_tabs, 1),
+                    section_route("Repurchase", self._save_tabs, 2),
+                    section_route("Equipment", self._save_tabs, 3),
+                    section_route("Sockets", self._save_tabs, 4),
+                    section_route("Dye", self._save_tabs, 6),
+                    section_route("Item Database", self._items_tabs, 0),
+                    section_route("Item Packs", self._items_tabs, 1),
+                ),
+                "Character loadout",
+            ),
+            ShellDestination(
+                "WORLD",
+                tuple(
+                    section_route(self._world_tabs.tabText(index), self._world_tabs, index)
+                    for index in range(self._world_tabs.count())
+                ),
+                "World state",
+            ),
+            ShellDestination(
+                "TOOLS",
+                (
+                    backup,
+                    section_route("Item Database", self._items_tabs, 0),
+                    section_route("Item Packs", self._items_tabs, 1),
+                ),
+                "Archive utilities",
+            ),
+        )
 
     def _toggle_save_sidebar(self) -> None:
         if self._save_dock.isVisible():

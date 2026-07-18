@@ -70,6 +70,15 @@ def test_stylesheet_encodes_game_shell_focus_and_accessibility_roles() -> None:
     stylesheet = build_stylesheet(CRIMSON_DARK_TOKENS)
     for required in (
         "QMainWindow#crimsonWindow",
+        "QWidget#crimsonApplicationShell",
+        "QFrame#commandHeader",
+        "QWidget#destinationNavigation",
+        "QToolButton#destinationButton",
+        "QFrame#contextNavigation",
+        "QPushButton#routeButton",
+        "QFrame#editorialWorkspace",
+        "QFrame#routeHeader",
+        "QToolButton#shellUtilityButton",
         "QTabWidget#primaryNav",
         "QTabWidget#sectionNav",
         "QWidget#contextStrip",
@@ -119,7 +128,24 @@ def test_shared_shell_installer_is_used_by_both_main_windows() -> None:
         "CrimsonGameMods/gui/main_window.py",
     ):
         source = (ROOT / relative).read_text(encoding="utf-8")
-        assert "install_crimson_shell(" in source
+        assert "install_crimson_application_shell(" in source
+        assert "self._shell_destinations()" in source
+
+
+def test_structural_shell_is_editorial_instead_of_boxed_tab_chrome() -> None:
+    stylesheet = build_stylesheet(CRIMSON_DARK_TOKENS)
+    assert "QFrame#commandHeader {" in stylesheet
+    assert "min-height: 62px" in stylesheet
+    assert "QToolButton#destinationButton:checked" in stylesheet
+    assert "border-bottom: 2px solid" in stylesheet
+    assert "QFrame#contextNavigation {" in stylesheet
+    assert "border-right: 1px solid" in stylesheet
+    assert "QPushButton#routeButton {" in stylesheet
+    assert "border: 0px" in stylesheet
+    assert "QPushButton#routeButton:checked" in stylesheet
+    assert "border-left: 2px solid" in stylesheet
+    assert "QFrame#routeHeader {" in stylesheet
+    assert "font-family: Georgia" in stylesheet
 
 
 def test_save_editor_mount_workspace_keeps_the_blackstar_surface_visible() -> None:

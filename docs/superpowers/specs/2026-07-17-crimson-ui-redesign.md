@@ -64,16 +64,23 @@ download or extra font license is required on supported Windows systems.
 
 ## Application Shell
 
-Each window keeps the native menu bar, then presents a horizontal primary
-navigation band and a compact secondary navigation band. Existing `QTabWidget`
-instances remain the routing mechanism, receive stable object names, and keep
-their current indices and callbacks. The game path strip becomes a quiet
-graphite-edged command strip. The main workspace remains dense and table-first.
+Each window uses one full-width command header with a restrained brand block,
+five destination-level navigation choices, and a quiet utility cluster. A
+contextual left rail lists only the routes relevant to the selected destination.
+The remaining width is one uninterrupted editorial work surface with a compact
+route title and the existing feature page below it.
 
-Save Browser and Pack Browser remain dockable. Game Mods continues to open them
-on demand; Save Editor continues to expose both as persistent workflow tools.
-The status bar becomes a bottom command rail with concise state, progress, and
-keyboard hints. No navigation is hidden behind a new hamburger menu.
+Existing `QTabWidget` instances remain the routing mechanism and keep their
+current indices, callbacks, and View-menu actions, but their tab bars are hidden.
+Changes made through shortcuts or the legacy View menu synchronize back to the
+new destination and route selection. This preserves functionality without
+making nested native tab strips the visible information architecture.
+
+The native menu and game-path strip are collapsed by default and remain
+available through `MENU` and `PATH` utilities in the header. Save Browser and
+Pack Browser remain dockable, but open on demand through `SAVES` and `PACKS`
+rather than permanently boxing in the workspace. The existing status bar forms
+the bottom command rail.
 
 ## Component Roles
 
@@ -94,16 +101,20 @@ Stable roles include:
 - `dangerAction`, `primaryAction`, and `quietAction` dynamic properties for
   semantic button emphasis where an existing action already has that meaning.
 - `brandBlock`, `brandMark`, and `shellIdentity` for the branded primary rail;
+- `crimsonApplicationShell`, `commandHeader`, `destinationNavigation`,
+  `contextNavigation`, `routeNavigation`, `routeHeader`, and
+  `editorialWorkspace` for the structural shell;
 - `blackstarTimerPanel`, `blackstarMetricRow`, and `changeRecord` for the shared
   reference surface.
 
 ## Interaction And Accessibility
 
 All interactive controls have at least a 28-pixel compact height, visible
-keyboard focus, and sufficient parchment/obsidian contrast. Selected tabs use
-text, border, and background changes rather than color alone. Existing keyboard
-shortcuts, F-key navigation, tab order, context menus, detachable tabs, UI scale,
-zoom, and compact mode remain operational.
+keyboard focus, and sufficient parchment/obsidian contrast. Destination and
+route selection use text, a crimson rule, and subtle tonal depth rather than
+boxed tab states. Existing keyboard shortcuts, F-key navigation, tab order,
+context menus, detachable legacy tools, UI scale, zoom, and compact mode remain
+operational.
 
 The minimum supported layout is 1366x768 at 100 percent scale. Both windows must
 also render at 1920x1080 and with Qt high-DPI scaling. Horizontal overflow stays

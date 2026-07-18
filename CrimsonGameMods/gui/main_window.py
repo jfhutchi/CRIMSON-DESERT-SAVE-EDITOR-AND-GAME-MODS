@@ -57,6 +57,12 @@ from gui.theme import (
     _TAB_SELECTED_BORDER, DARK_STYLESHEET, LIGHT_STYLESHEET, apply_theme,
     install_crimson_shell,
 )
+from crimson_common.crimson_shell import (
+    ShellCommand,
+    ShellDestination,
+    ShellRoute,
+    install_crimson_application_shell,
+)
 from gui.utils import _num_item
 
 
@@ -326,7 +332,7 @@ class MainWindow(QMainWindow):
             self._update_status(
                 f"Ready. Item DB: {len(self._name_db.items)} items"
                 + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
-                + "  |  Select a save from the sidebar or File > Open"
+                + "  |  Select a save with SAVES or Menu > File > Open"
             )
 
 
@@ -480,7 +486,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
+        self._center_status = QLabel("Ready — Select a save with SAVES or Menu > File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
             "background: transparent; "
@@ -981,6 +987,103 @@ class MainWindow(QMainWindow):
 
         if self._config.get("ui_scale", 100) != 100 or self._config.get("compact_mode", False):
             self._apply_ui_settings()
+
+        self._shell = install_crimson_application_shell(
+            self,
+            product="GAME MODS",
+            router_tabs=self._real_tabs,
+            destinations=self._shell_destinations(),
+            context_widget=self._global_info_widget,
+            commands=(
+                ShellCommand("SAVES", self._toggle_save_sidebar, "Open the save browser"),
+                ShellCommand("PACKS", self._toggle_pack_sidebar, "Open the item pack browser"),
+            ),
+            docks=(self._save_dock, self._pack_dock),
+            preserve_widgets=(self._center_status,),
+        )
+
+    def _shell_destinations(self) -> tuple[ShellDestination, ...]:
+        outer = self._real_tabs
+
+        def find_route(
+            label: str,
+            section: QTabWidget,
+            tab_name: str,
+            description: str = "",
+        ) -> ShellRoute | None:
+            for index in range(section.count()):
+                if section.tabText(index) == tab_name:
+                    return ShellRoute(
+                        label,
+                        outer.indexOf(section),
+                        section,
+                        index,
+                        description,
+                    )
+            return None
+
+        def routes(*candidates: ShellRoute | None) -> tuple[ShellRoute, ...]:
+            return tuple(route for route in candidates if route is not None)
+
+        game_patches = find_route(
+            "Game Patches",
+            self._mods_tabs,
+            "Game Patches",
+            "Preview, apply, and restore verified archive patches.",
+        )
+        item_buffs = find_route("Item Buffs", self._mods_tabs, tr("tab.itembuffs"))
+        merc_pets = find_route("Mercenaries & Pets", self._mods_tabs, "MercPets")
+        database = find_route("Item Database", self._items_tabs, tr("tab.database"))
+        field_edit = find_route("Field & Regions", self._mods_tabs, tr("FieldEdit"))
+        game_browser = find_route("Game Browser", self._mods_tabs, tr("Game Browser"))
+        return (
+            ShellDestination(
+                "SAVE",
+                routes(item_buffs, merc_pets, database),
+                "Save-aware tools",
+            ),
+            ShellDestination(
+                "MOUNTS",
+                routes(
+                    game_patches,
+                    find_route("Dragon Wheel", self._mods_tabs, "Dragon Wheel"),
+                    merc_pets,
+                    field_edit,
+                ),
+                "Mount systems",
+            ),
+            ShellDestination(
+                "INVENTORY",
+                routes(
+                    item_buffs,
+                    find_route("Stores", self._mods_tabs, tr("tab.stores")),
+                    find_route("Storage", self._mods_tabs, "BagSpace"),
+                    find_route("Drop Sets", self._mods_tabs, "DropSets"),
+                    database,
+                ),
+                "Items & economy",
+            ),
+            ShellDestination(
+                "WORLD",
+                routes(
+                    field_edit,
+                    find_route("Spawn Editor", self._mods_tabs, "SpawnEdit"),
+                    find_route("Skill Tree", self._mods_tabs, "SkillTree"),
+                    game_browser,
+                ),
+                "World systems",
+            ),
+            ShellDestination(
+                "MODS",
+                routes(
+                    game_patches,
+                    find_route("Stacker Tool", self._mods_tabs, "Stacker Tool"),
+                    find_route("Load Manager", self._mods_tabs, "Load Manager"),
+                    game_browser,
+                ),
+                "Archive workshop",
+            ),
+        )
 
     def _toggle_save_sidebar(self) -> None:
         if self._save_dock.isVisible():

@@ -88,7 +88,7 @@ import json
 import tempfile
 from pathlib import Path
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QToolButton, QWidget
 {import_line}
 temporary = tempfile.TemporaryDirectory(prefix="codex-ui-inventory-")
 synthetic_game = Path(temporary.name)
@@ -120,9 +120,61 @@ def layout_report():
             by_tabs[name] = {{
                 "selectable": selectable,
                 "fits": last_right <= bar.width(),
+                "hidden": bar.isHidden(),
             }}
+        destination_nav = window._shell.findChild(QWidget, "destinationNavigation")
+        utilities = window._shell.findChild(QWidget, "shellUtilities")
+        destination_buttons = window._shell.destination_buttons
+        utility_buttons = utilities.findChildren(QToolButton, "shellUtilityButton")
+        by_tabs["_shell"] = {{
+            "selectable": True,
+            "fits": (
+                window.width() == width
+                and destination_nav.width() > 0
+                and utilities.width() > 0
+                and all(
+                    button.isVisible()
+                    and button.geometry().left() >= 0
+                    and button.geometry().right() < destination_nav.width()
+                    for button in destination_buttons
+                )
+                and all(
+                    button.isVisible()
+                    and button.geometry().left() >= 0
+                    and button.geometry().right() < utilities.width()
+                    for button in utility_buttons
+                )
+            ),
+            "hidden": False,
+        }}
         reports[f"{{width}}x{{height}}"] = by_tabs
     return reports
+
+def missing_shell_routes():
+    section_names = {{
+        id(getattr(window, name)): name
+        for name in ("_save_tabs", "_mods_tabs", "_items_tabs", "_world_tabs")
+    }}
+    actual = set()
+    for destination in window._shell._destinations:
+        for route in destination.routes:
+            if route.section_tabs is None:
+                actual.add(f"{{route.primary_index}}:direct")
+            else:
+                section_name = section_names[id(route.section_tabs)]
+                actual.add(
+                    f"{{route.primary_index}}:{{section_name}}:{{route.section_index}}"
+                )
+    required = set()
+    for primary_index in range(window._real_tabs.count()):
+        primary_widget = window._real_tabs.widget(primary_index)
+        section_name = section_names.get(id(primary_widget))
+        if section_name is None:
+            required.add(f"{{primary_index}}:direct")
+            continue
+        for section_index in range(primary_widget.count()):
+            required.add(f"{{primary_index}}:{{section_name}}:{{section_index}}")
+    return sorted(required - actual)
 
 result = {{
     "top": [window._tabs.tabText(i) for i in range(window._tabs.count())],
@@ -136,6 +188,9 @@ result = {{
     "synthetic_game": str(synthetic_game),
     "dock_widths": {{name: getattr(window, name).width() for name in ("_save_dock", "_pack_dock")}},
     "save_nav_widths": {{button.text(): button.width() for button in window._save_dock.findChildren(QPushButton) if button.text() in {{"Home", "Backup"}}}},
+    "shell_destinations": [button.text() for button in window._shell.destination_buttons],
+    "menu_hidden": window.menuBar().isHidden(),
+    "missing_shell_routes": missing_shell_routes(),
     "layouts": layout_report(),
 }}
 print("UI_INVENTORY=" + json.dumps(result, ensure_ascii=True))
@@ -169,10 +224,27 @@ def test_save_editor_runtime_navigation_and_critical_actions_are_reachable() -> 
     assert min(inventory["dock_widths"].values()) >= 210
     assert min(inventory["save_nav_widths"].values()) >= 70
     assert all(
-        tab["selectable"] and tab["fits"]
+        tab["selectable"]
         for size in inventory["layouts"].values()
         for tab in size.values()
     )
+    assert all(
+        inventory["layouts"][size][name]["hidden"]
+        for size in inventory["layouts"]
+        for name in ("_tabs", "_save_tabs", "_items_tabs", "_world_tabs")
+    )
+    assert inventory["menu_hidden"]
+    assert inventory["missing_shell_routes"] == []
+    assert all(
+        size["_shell"]["fits"] for size in inventory["layouts"].values()
+    )
+    assert inventory["shell_destinations"] == [
+        "SAVE",
+        "MOUNTS",
+        "INVENTORY",
+        "WORLD",
+        "TOOLS",
+    ]
     assert inventory["top"] == ["Save Editor", "Items", "World", "Backup/Restore"]
     assert inventory["save"] == [
         "Inventory",
@@ -211,10 +283,27 @@ def test_game_mods_runtime_navigation_and_critical_actions_are_reachable() -> No
     inventory = _runtime_inventory("mods")
     assert inventory["game_path"] == inventory["synthetic_game"]
     assert all(
-        tab["selectable"] and tab["fits"]
+        tab["selectable"]
         for size in inventory["layouts"].values()
         for tab in size.values()
     )
+    assert all(
+        inventory["layouts"][size][name]["hidden"]
+        for size in inventory["layouts"]
+        for name in ("_tabs", "_mods_tabs", "_items_tabs")
+    )
+    assert inventory["menu_hidden"]
+    assert inventory["missing_shell_routes"] == []
+    assert all(
+        size["_shell"]["fits"] for size in inventory["layouts"].values()
+    )
+    assert inventory["shell_destinations"] == [
+        "SAVE",
+        "MOUNTS",
+        "INVENTORY",
+        "WORLD",
+        "MODS",
+    ]
     assert inventory["top"] == ["Game Mods", "Items"]
     assert inventory["mods"] == [
         "Game Patches",
