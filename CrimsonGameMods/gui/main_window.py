@@ -1010,6 +1010,11 @@ class MainWindow(QMainWindow):
             section: QTabWidget,
             tab_name: str,
             description: str = "",
+            *,
+            icon_name: str = "",
+            game_art_id: int | None = None,
+            badge: str = "",
+            immersive: bool = False,
         ) -> ShellRoute | None:
             for index in range(section.count()):
                 if section.tabText(index) == tab_name:
@@ -1019,6 +1024,10 @@ class MainWindow(QMainWindow):
                         section,
                         index,
                         description,
+                        icon_name,
+                        game_art_id,
+                        badge,
+                        immersive,
                     )
             return None
 
@@ -1030,6 +1039,10 @@ class MainWindow(QMainWindow):
             self._mods_tabs,
             "Game Patches",
             "Preview, apply, and restore verified archive patches.",
+            icon_name="mounts",
+            game_art_id=1000799,
+            badge="DRAGON",
+            immersive=True,
         )
         item_buffs = find_route("Item Buffs", self._mods_tabs, tr("tab.itembuffs"))
         merc_pets = find_route("Mercenaries & Pets", self._mods_tabs, "MercPets")
@@ -2680,13 +2693,35 @@ QCheckBox::indicator {{
         self._set_game_path(path)
 
     def _global_auto_detect_path(self) -> None:
-        detected = PazPatchManager.find_game_path()
-        if detected:
-            self._set_game_path(detected)
-        else:
-            QMessageBox.warning(self, "Not Found",
-                "Could not auto-detect Crimson Desert.\n"
-                "Use Browse to set the path manually.")
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching for the Crimson Desert installation...")
+
+        def _completed(detected: str | None) -> None:
+            if detected:
+                self._set_game_path(detected)
+                self._update_status(f"Game found: {detected}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Not Found",
+                    "Could not auto-detect Crimson Desert.\n"
+                    "Use Browse to set the path manually.",
+                )
+
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known Steam and library locations...", 20),
+                PazPatchManager.find_game_path(),
+            )[-1],
+            completed=_completed,
+            failed=lambda message, details: (
+                log.error("Game path detection failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Detection Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
 
 
     def _on_tab_navigate_requested(self, selector: str) -> None:
@@ -3230,7 +3265,24 @@ QCheckBox::indicator {{
             QMessageBox.critical(self, "Error", f"Failed to load raw stream:\n{e}")
 
     def _auto_find_save(self) -> None:
-        saves = find_save_files()
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching known save locations...")
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known save locations...", 15),
+                find_save_files(),
+            )[-1],
+            completed=self._show_auto_find_results,
+            failed=lambda message, details: (
+                log.error("Save search failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Auto-Find Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
+
+    def _show_auto_find_results(self, saves: list[dict]) -> None:
         if not saves:
             QMessageBox.information(
                 self, "Auto-Find",

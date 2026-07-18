@@ -50,6 +50,10 @@ def test_shared_panel_matches_the_approved_blackstar_editorial_layout() -> None:
     assert panel.objectName() == "blackstarTimerPanel"
     assert panel.findChild(QLabel, "blackstarTimerEyebrow").text() == "GAME ARCHIVE SETTING"
     assert panel.findChild(QLabel, "blackstarTimerTitle").text() == "Blackstar"
+    hero_art = panel.findChild(QLabel, "blackstarHeroArt")
+    assert hero_art is not None
+    assert not hero_art.pixmap().isNull()
+    assert panel.findChild(QLabel, "blackstarCompatibility").text() == "VERIFIED FOR 1.14"
     assert panel.findChild(QLabel, "blackstarTimerSectionTitle").text() == "Extended Flight"
     assert panel.findChild(QLabel, "blackstarDurationBefore").text() == "10 min"
     assert panel.findChild(QLabel, "blackstarDurationAfter").text() == "30 min"

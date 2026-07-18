@@ -98,8 +98,8 @@ QWidget#crimsonApplicationShell {{
         stop:0 {c['ink']}, stop:0.54 {c['obsidian']}, stop:1 {c['surface_warm']});
 }}
 QFrame#commandHeader {{
-    min-height: 62px;
-    max-height: 62px;
+    min-height: 76px;
+    max-height: 76px;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 {c['ink']}, stop:0.62 {c['obsidian']}, stop:1 {c['surface_warm']});
     border: 0px;
@@ -112,9 +112,9 @@ QFrame#shellBody {{
     border: 0px;
 }}
 QToolButton#destinationButton {{
-    min-width: 66px;
-    min-height: 60px;
-    padding: 0px 2px;
+    min-width: 70px;
+    min-height: 74px;
+    padding: 7px 2px 4px 2px;
     color: {c['ash']};
     background: transparent;
     border: 0px;
@@ -136,9 +136,11 @@ QToolButton#destinationButton:checked {{
     border-bottom: 2px solid {c['accent_red']};
 }}
 QToolButton#shellUtilityButton {{
-    min-width: 40px;
-    min-height: 26px;
-    padding: 0px 7px;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0px;
     color: {c['ash']};
     background: transparent;
     border: 0px;
@@ -174,9 +176,9 @@ QWidget#routeNavigation {{
     background: transparent;
     border: 0px;
 }}
-QPushButton#routeButton {{
-    min-height: 34px;
-    padding: 1px 8px 1px 12px;
+QAbstractButton#routeButton {{
+    min-height: 46px;
+    padding: 0px;
     color: {c['ash']};
     background: transparent;
     border: 0px;
@@ -185,20 +187,46 @@ QPushButton#routeButton {{
     font-size: 9.5pt;
     font-weight: 500;
 }}
-QPushButton#routeButton:hover {{
+QAbstractButton#routeButton:hover {{
     color: {c['parchment']};
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 {c['surface']}, stop:1 transparent);
     border: 0px;
     border-left: 2px solid {c['divider']};
 }}
-QPushButton#routeButton:checked {{
+QAbstractButton#routeButton:checked {{
     color: {c['text_bright']};
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 {c['selection']}, stop:1 transparent);
     border: 0px;
     border-left: 2px solid {c['accent_red']};
     font-weight: 700;
+}}
+QFrame#routeArtHalo {{
+    background: qradialgradient(cx:0.5, cy:0.45, radius:0.72,
+        stop:0 {c['surface']}, stop:0.72 {c['ink']}, stop:1 transparent);
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+}}
+QLabel#routeArt {{ background: transparent; border: 0px; }}
+QLabel#routeButtonTitle {{
+    color: {c['ash']};
+    font-family: Georgia;
+    font-size: 10pt;
+}}
+QLabel#routeButtonBadge {{
+    color: {c['divider']};
+    font-size: 7pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+QAbstractButton#routeButton:hover QLabel#routeButtonTitle,
+QAbstractButton#routeButton:checked QLabel#routeButtonTitle {{
+    color: {c['text_bright']};
+}}
+QAbstractButton#routeButton:hover QLabel#routeButtonBadge,
+QAbstractButton#routeButton:checked QLabel#routeButtonBadge {{
+    color: {c['ash']};
 }}
 QLabel#contextFootnote {{
     color: {c['divider']};
@@ -226,6 +254,25 @@ QLabel#routeDescription {{
     max-width: 420px;
     color: {c['ash']};
     font-size: 8.5pt;
+}}
+QFrame#shellFooter {{
+    min-height: 39px;
+    max-height: 39px;
+    background-color: {c['ink']};
+    border: 0px;
+    border-top: 1px solid {c['divider']};
+}}
+QLabel#shellShortcuts {{
+    color: {c['ash']};
+    font-family: "Cascadia Mono";
+    font-size: 7.5pt;
+    letter-spacing: 1px;
+}}
+QLabel#shellSafety {{
+    color: {c['moss']};
+    font-size: 7.5pt;
+    font-weight: 700;
+    letter-spacing: 1px;
 }}
 
 QMenuBar {{
@@ -364,10 +411,12 @@ QLabel[displayTitle="true"] {{
 }}
 
 QPushButton, QToolButton {{
-    min-height: 28px;
-    background: transparent;
+    min-height: 30px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['surface']}, stop:0.72 {c['obsidian']}, stop:1 transparent);
     color: {c['ash']};
-    border: 1px solid {c['divider']};
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
     border-radius: 0px;
     padding: 3px 12px;
     font-size: 9pt;
@@ -375,8 +424,10 @@ QPushButton, QToolButton {{
 }}
 QPushButton:hover, QToolButton:hover {{
     color: {c['text_bright']};
-    border-color: {c['ash']};
-    background-color: {c['surface']};
+    border: 0px;
+    border-bottom: 1px solid {c['accent_red']};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['selection']}, stop:0.82 {c['surface']}, stop:1 transparent);
 }}
 QPushButton:pressed, QToolButton:pressed {{
     color: {c['text_bright']};
@@ -384,12 +435,14 @@ QPushButton:pressed, QToolButton:pressed {{
 }}
 QPushButton:focus, QToolButton:focus {{
     outline: none;
-    border: 1px solid {c['accent_red']};
+    border: 0px;
+    border-bottom: 1px solid {c['accent_red']};
 }}
 QPushButton:disabled, QToolButton:disabled {{
     color: {c['divider']};
     background: transparent;
-    border-color: {c['divider']};
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
 }}
 QPushButton#accentBtn,
 QPushButton[primaryAction="true"] {{
@@ -541,7 +594,16 @@ QFrame#blackstarTimerPanel {{
     border-bottom: 1px solid {c['divider']};
 }}
 QFrame#blackstarTimerBody,
-QFrame#blackstarTimerMain {{ background: transparent; border: 0px; }}
+QFrame#blackstarTimerMain,
+QFrame#blackstarHero {{ background: transparent; border: 0px; }}
+QFrame#blackstarHero {{ border-bottom: 1px solid {c['divider']}; }}
+QFrame#blackstarHeroArtHalo {{
+    background: qradialgradient(cx:0.5, cy:0.42, radius:0.72,
+        stop:0 {c['surface']}, stop:0.68 {c['ink']}, stop:1 transparent);
+    border: 0px;
+    border-bottom: 1px solid {c['accent_red']};
+}}
+QLabel#blackstarHeroArt {{ background: transparent; border: 0px; }}
 QFrame#blackstarMetricRow {{
     background: transparent;
     border: 0px;
@@ -566,6 +628,17 @@ QLabel#blackstarTimerTitle {{
     color: {c['text_bright']};
     font-family: Georgia;
     font-size: 28pt;
+}}
+QLabel#blackstarCompatibilityEyebrow {{
+    color: {c['ash']};
+    font-size: 7pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+QLabel#blackstarCompatibility {{
+    color: {c['moss']};
+    font-size: 9pt;
+    font-weight: 700;
 }}
 QLabel#blackstarTimerSectionTitle,
 QLabel#changeRecordTitle {{

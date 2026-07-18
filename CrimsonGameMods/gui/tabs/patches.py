@@ -333,14 +333,32 @@ class GamePatchesTab(QWidget):
             self._apply_game_path(path)
 
     def _paz_auto_detect_path(self) -> None:
-        detected = PazPatchManager.find_game_path()
-        if detected:
-            self._apply_game_path(detected)
-            self._paz_status_label.setText(f"Game found at: {detected}")
-        else:
-            self._paz_status_label.setText(
-                tr("Could not auto-detect game installation. Use Browse to set the path manually.")
-            )
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._paz_status_label.setText(tr("Searching for the Crimson Desert installation..."))
+
+        def _completed(detected: str | None) -> None:
+            if detected:
+                self._apply_game_path(detected)
+                self._paz_status_label.setText(f"Game found at: {detected}")
+            else:
+                self._paz_status_label.setText(
+                    tr("Could not auto-detect game installation. Use Browse to set the path manually.")
+                )
+
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report(tr("Searching known Steam and library locations..."), 20),
+                PazPatchManager.find_game_path(),
+            )[-1],
+            completed=_completed,
+            failed=lambda message, details: (
+                log.error("Game path detection failed: %s\n%s", message, details),
+                self._paz_status_label.setText(f"Detection failed: {message}"),
+            ),
+            progress=lambda message, _value: self._paz_status_label.setText(message),
+        )
 
     def _paz_get_selected_patch(self) -> Optional[PazPatch]:
         rows = self._paz_patch_table.selectionModel().selectedRows()

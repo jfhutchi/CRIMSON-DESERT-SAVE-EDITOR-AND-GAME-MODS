@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QButtonGroup,
     QFrame,
     QHBoxLayout,
@@ -13,11 +15,16 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionButton,
+    QStylePainter,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from .crimson_icons import game_art_icon, inferred_symbol, symbol_icon
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,10 @@ class ShellRoute:
     section_tabs: QTabWidget | None = None
     section_index: int = 0
     description: str = ""
+    icon_name: str = ""
+    game_art_id: int | None = None
+    badge: str = ""
+    immersive: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,7 @@ class ShellDestination:
     label: str
     routes: tuple[ShellRoute, ...]
     caption: str = ""
+    icon_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +59,62 @@ class ShellCommand:
     label: str
     callback: Callable[[], None]
     tooltip: str = ""
+    icon_name: str = ""
+
+
+class CrimsonRouteButton(QPushButton):
+    """A registry row that can combine real game art with quiet metadata."""
+
+    def __init__(self, route: ShellRoute, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("routeButton")
+        self.setText(route.label)
+        self.badge = route.badge
+        self.uses_game_art = route.game_art_id is not None
+        icon = (
+            game_art_icon(route.game_art_id, route.icon_name or "mounts")
+            if route.game_art_id is not None
+            else symbol_icon(route.icon_name or inferred_symbol(route.label))
+        )
+        self.setIcon(icon)
+        self.setIconSize(QSize(34, 34) if self.uses_game_art else QSize(20, 20))
+        self.setMinimumHeight(54 if self.uses_game_art else 46)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 4, 10, 4)
+        layout.setSpacing(10)
+        halo = QFrame(self)
+        halo.setObjectName("routeArtHalo")
+        halo.setFixedSize(38, 38)
+        halo_layout = QHBoxLayout(halo)
+        halo_layout.setContentsMargins(2, 2, 2, 2)
+        art = QLabel(halo)
+        art.setObjectName("routeArt")
+        art.setAlignment(Qt.AlignCenter)
+        art.setPixmap(icon.pixmap(self.iconSize()))
+        art.setAttribute(Qt.WA_TransparentForMouseEvents)
+        halo_layout.addWidget(art)
+        halo.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(halo)
+
+        title = QLabel(route.label, self)
+        title.setObjectName("routeButtonTitle")
+        title.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(title, 1)
+        if route.badge:
+            badge = QLabel(route.badge.upper(), self)
+            badge.setObjectName("routeButtonBadge")
+            badge.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+            layout.addWidget(badge)
+
+    def paintEvent(self, _event) -> None:
+        painter = QStylePainter(self)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.text = ""
+        option.icon = QIcon()
+        painter.drawControl(QStyle.CE_PushButton, option)
 
 
 class CrimsonApplicationShell(QWidget):
@@ -78,7 +146,7 @@ class CrimsonApplicationShell(QWidget):
         self._active_route = -1
         self._routing = False
         self.destination_buttons: list[QToolButton] = []
-        self.route_buttons: list[QPushButton] = []
+        self.route_buttons: list[CrimsonRouteButton] = []
 
         self._hide_legacy_navigation()
         self._build_layout(product, commands)
@@ -111,7 +179,7 @@ class CrimsonApplicationShell(QWidget):
         header = QFrame(self)
         header.setObjectName("commandHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(28, 0, 20, 0)
+        header_layout.setContentsMargins(34, 0, 24, 0)
         header_layout.setSpacing(18)
 
         brand = QWidget(header)
@@ -144,6 +212,11 @@ class CrimsonApplicationShell(QWidget):
             button = QToolButton(nav)
             button.setObjectName("destinationButton")
             button.setText(destination.label.upper())
+            button.setIcon(
+                symbol_icon(destination.icon_name or inferred_symbol(destination.label))
+            )
+            button.setIconSize(QSize(18, 18))
+            button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
             button.setCheckable(True)
             button.setAutoRaise(True)
             button.setCursor(Qt.PointingHandCursor)
@@ -166,15 +239,24 @@ class CrimsonApplicationShell(QWidget):
         utility_layout.setSpacing(3)
         if self._menu_bar is not None:
             utility_layout.addWidget(
-                self._utility_button("MENU", self.toggle_menu, "Show the full application menu")
+                self._utility_button(
+                    "MENU", self.toggle_menu, "Show the full application menu", "menu"
+                )
             )
         if self._context_widget is not None:
             utility_layout.addWidget(
-                self._utility_button("PATH", self.toggle_context, "Show the game path controls")
+                self._utility_button(
+                    "PATH", self.toggle_context, "Show the game path controls", "path"
+                )
             )
         for command in commands:
             utility_layout.addWidget(
-                self._utility_button(command.label, command.callback, command.tooltip)
+                self._utility_button(
+                    command.label,
+                    command.callback,
+                    command.tooltip,
+                    command.icon_name or inferred_symbol(command.label),
+                )
             )
         product_label = QLabel(product.upper(), utility)
         product_label.setObjectName("shellProduct")
@@ -196,14 +278,14 @@ class CrimsonApplicationShell(QWidget):
 
         context_nav = QFrame(body)
         context_nav.setObjectName("contextNavigation")
-        context_nav.setMinimumWidth(210)
-        context_nav.setMaximumWidth(252)
+        context_nav.setMinimumWidth(238)
+        context_nav.setMaximumWidth(270)
         context_layout = QVBoxLayout(context_nav)
         context_layout.setContentsMargins(28, 30, 20, 24)
         context_layout.setSpacing(0)
-        context_eyebrow = QLabel("WORKSPACE", context_nav)
-        context_eyebrow.setObjectName("contextEyebrow")
-        context_layout.addWidget(context_eyebrow)
+        self.context_eyebrow = QLabel("WORKSPACE", context_nav)
+        self.context_eyebrow.setObjectName("contextEyebrow")
+        context_layout.addWidget(self.context_eyebrow)
         self.context_title = QLabel("", context_nav)
         self.context_title.setObjectName("contextTitle")
         context_layout.addWidget(self.context_title)
@@ -225,30 +307,30 @@ class CrimsonApplicationShell(QWidget):
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(0)
 
-        route_header = QFrame(workspace)
-        route_header.setObjectName("routeHeader")
-        route_header_layout = QHBoxLayout(route_header)
+        self.route_header = QFrame(workspace)
+        self.route_header.setObjectName("routeHeader")
+        route_header_layout = QHBoxLayout(self.route_header)
         route_header_layout.setContentsMargins(28, 14, 30, 12)
         route_header_layout.setSpacing(12)
         title_stack = QVBoxLayout()
         title_stack.setContentsMargins(0, 0, 0, 0)
         title_stack.setSpacing(1)
-        self.route_eyebrow = QLabel("", route_header)
+        self.route_eyebrow = QLabel("", self.route_header)
         self.route_eyebrow.setObjectName("routeEyebrow")
-        self.route_title = QLabel("", route_header)
+        self.route_title = QLabel("", self.route_header)
         self.route_title.setObjectName("routeTitle")
         title_stack.addWidget(self.route_eyebrow)
         title_stack.addWidget(self.route_title)
         route_header_layout.addLayout(title_stack)
         route_header_layout.addStretch(1)
-        self.route_description = QLabel("", route_header)
+        self.route_description = QLabel("", self.route_header)
         self.route_description.setObjectName("routeDescription")
         self.route_description.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.route_description.setWordWrap(True)
         self.route_description.setMinimumWidth(320)
         self.route_description.setMaximumWidth(420)
         route_header_layout.addWidget(self.route_description, 0)
-        workspace_layout.addWidget(route_header)
+        workspace_layout.addWidget(self.route_header)
 
         self._router_tabs.setParent(workspace)
         self._router_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -256,15 +338,33 @@ class CrimsonApplicationShell(QWidget):
         body_layout.addWidget(workspace, 1)
         root.addWidget(body, 1)
 
+        footer = QFrame(self)
+        footer.setObjectName("shellFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(34, 0, 30, 0)
+        footer_layout.setSpacing(18)
+        shortcuts = QLabel("CTRL+O  OPEN     CTRL+S  SAVE     ESC  CLOSE", footer)
+        shortcuts.setObjectName("shellShortcuts")
+        footer_layout.addWidget(shortcuts)
+        footer_layout.addStretch(1)
+        safety = QLabel("SOURCE-SAFE  /  BACKUP BEFORE WRITE", footer)
+        safety.setObjectName("shellSafety")
+        footer_layout.addWidget(safety)
+        root.addWidget(footer)
+
     def _utility_button(
         self,
         label: str,
         callback: Callable[[], None],
         tooltip: str,
+        icon_name: str = "menu",
     ) -> QToolButton:
         button = QToolButton(self)
         button.setObjectName("shellUtilityButton")
         button.setText(label.upper())
+        button.setIcon(symbol_icon(icon_name))
+        button.setIconSize(QSize(19, 19))
+        button.setToolButtonStyle(Qt.ToolButtonIconOnly)
         button.setAutoRaise(True)
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(tooltip)
@@ -282,9 +382,8 @@ class CrimsonApplicationShell(QWidget):
             destination = self._destinations[index]
             self.destination_buttons[index].setChecked(True)
             self.context_title.setText(destination.label.upper())
-            self.route_eyebrow.setText(
-                destination.caption.upper() or "CRIMSON DESERT TOOLS"
-            )
+            self.context_eyebrow.setText(destination.caption.upper() or "WORKSPACE")
+            self.route_eyebrow.setText(destination.caption.upper() or "CRIMSON DESERT TOOLS")
             self._rebuild_route_navigation(destination)
             self.activate_route(0)
         finally:
@@ -307,8 +406,7 @@ class CrimsonApplicationShell(QWidget):
         self._route_group = QButtonGroup(self)
         self._route_group.setExclusive(True)
         for index, route in enumerate(destination.routes):
-            button = QPushButton(route.label, self._route_container)
-            button.setObjectName("routeButton")
+            button = CrimsonRouteButton(route, self._route_container)
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
             button.setAccessibleName(f"Open {route.label}")
@@ -336,6 +434,7 @@ class CrimsonApplicationShell(QWidget):
             self.route_title.setText(route.label)
             self.route_description.setText(route.description)
             self.route_description.setVisible(bool(route.description))
+            self.route_header.setVisible(not route.immersive)
         finally:
             if owns_routing_guard:
                 self._routing = False

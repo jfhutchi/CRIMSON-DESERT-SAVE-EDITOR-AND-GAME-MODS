@@ -22,6 +22,7 @@ from .blackstar_timer import (
     TransactionReport,
 )
 from .blackstar_timer_worker import BlackstarTimerWorker
+from .crimson_icons import game_art_icon
 
 log = logging.getLogger(__name__)
 
@@ -50,24 +51,62 @@ class BlackstarTimerPanel(QFrame):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setContentsMargins(28, 22, 28, 24)
         layout.setSpacing(6)
+
+        hero = QFrame()
+        hero.setObjectName("blackstarHero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(0, 0, 0, 14)
+        hero_layout.setSpacing(14)
+
+        art_halo = QFrame(hero)
+        art_halo.setObjectName("blackstarHeroArtHalo")
+        art_halo.setFixedSize(64, 64)
+        art_layout = QHBoxLayout(art_halo)
+        art_layout.setContentsMargins(3, 3, 3, 3)
+        art = QLabel(art_halo)
+        art.setObjectName("blackstarHeroArt")
+        art.setAlignment(Qt.AlignCenter)
+        art.setPixmap(game_art_icon(1000799).pixmap(56, 56))
+        art_layout.addWidget(art)
+        hero_layout.addWidget(art_halo)
+
+        title_stack = QVBoxLayout()
+        title_stack.setContentsMargins(0, 2, 0, 0)
+        title_stack.setSpacing(0)
 
         eyebrow = QLabel("GAME ARCHIVE SETTING")
         eyebrow.setObjectName("blackstarTimerEyebrow")
         eyebrow.setProperty("eyebrow", True)
-        layout.addWidget(eyebrow)
+        title_stack.addWidget(eyebrow)
 
         title = QLabel("Blackstar")
         title.setObjectName("blackstarTimerTitle")
         title.setProperty("displayTitle", True)
-        layout.addWidget(title)
+        title_stack.addWidget(title)
+        hero_layout.addLayout(title_stack)
+        hero_layout.addStretch(1)
+
+        compatibility_stack = QVBoxLayout()
+        compatibility_stack.setContentsMargins(0, 8, 0, 0)
+        compatibility_stack.setSpacing(1)
+        compatibility_eyebrow = QLabel("COMPATIBILITY")
+        compatibility_eyebrow.setObjectName("blackstarCompatibilityEyebrow")
+        compatibility_eyebrow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        compatibility = QLabel("VERIFIED FOR 1.14")
+        compatibility.setObjectName("blackstarCompatibility")
+        compatibility.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        compatibility_stack.addWidget(compatibility_eyebrow)
+        compatibility_stack.addWidget(compatibility)
+        hero_layout.addLayout(compatibility_stack)
+        layout.addWidget(hero)
 
         body = QFrame()
         body.setObjectName("blackstarTimerBody")
         body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(0, 12, 0, 0)
-        body_layout.setSpacing(24)
+        body_layout.setContentsMargins(0, 18, 0, 0)
+        body_layout.setSpacing(32)
 
         main = QFrame()
         main.setObjectName("blackstarTimerMain")

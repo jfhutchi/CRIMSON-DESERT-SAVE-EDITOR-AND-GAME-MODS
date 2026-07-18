@@ -75,7 +75,7 @@ def test_stylesheet_encodes_game_shell_focus_and_accessibility_roles() -> None:
         "QWidget#destinationNavigation",
         "QToolButton#destinationButton",
         "QFrame#contextNavigation",
-        "QPushButton#routeButton",
+        "QAbstractButton#routeButton",
         "QFrame#editorialWorkspace",
         "QFrame#routeHeader",
         "QToolButton#shellUtilityButton",
@@ -94,7 +94,7 @@ def test_stylesheet_encodes_game_shell_focus_and_accessibility_roles() -> None:
         "QPushButton:focus",
         "QLineEdit:focus",
         "QComboBox:focus",
-        "min-height: 28px",
+        "min-height: 30px",
         "Georgia",
         "border-radius: 0px",
     ):
@@ -110,7 +110,7 @@ def test_stylesheet_matches_the_approved_flat_crimson_desert_direction() -> None
 
     assert f"border-bottom: 2px solid {accent}" in stylesheet
     assert f"border-top: 1px solid {divider}" in stylesheet
-    assert "QPushButton, QToolButton {\n    min-height: 28px;\n    background: transparent;" in stylesheet
+    assert "QPushButton, QToolButton {\n    min-height: 30px;\n    background: qlineargradient" in stylesheet
     assert "QGroupBox {\n    color:" in stylesheet
     assert "QGroupBox {\n    color:" + f" {accent};" in stylesheet
     assert "QGroupBox {\n    color:" + f" {accent};\n    border: 0px;" in stylesheet
@@ -135,17 +135,32 @@ def test_shared_shell_installer_is_used_by_both_main_windows() -> None:
 def test_structural_shell_is_editorial_instead_of_boxed_tab_chrome() -> None:
     stylesheet = build_stylesheet(CRIMSON_DARK_TOKENS)
     assert "QFrame#commandHeader {" in stylesheet
-    assert "min-height: 62px" in stylesheet
+    assert "min-height: 76px" in stylesheet
     assert "QToolButton#destinationButton:checked" in stylesheet
     assert "border-bottom: 2px solid" in stylesheet
     assert "QFrame#contextNavigation {" in stylesheet
     assert "border-right: 1px solid" in stylesheet
-    assert "QPushButton#routeButton {" in stylesheet
+    assert "QAbstractButton#routeButton {" in stylesheet
     assert "border: 0px" in stylesheet
-    assert "QPushButton#routeButton:checked" in stylesheet
+    assert "QAbstractButton#routeButton:checked" in stylesheet
     assert "border-left: 2px solid" in stylesheet
     assert "QFrame#routeHeader {" in stylesheet
     assert "font-family: Georgia" in stylesheet
+    assert "QFrame#routeArtHalo" in stylesheet
+    assert "QFrame#shellFooter" in stylesheet
+    assert "QPushButton, QToolButton {\n    min-height: 30px;\n    background:" in stylesheet
+    assert "QPushButton, QToolButton {\n    min-height: 30px;\n    background:" + f" transparent;\n    color:" not in stylesheet
+
+
+def test_frozen_builds_bundle_the_blackstar_game_portrait() -> None:
+    for relative in (
+        "CrimsonSaveEditor/CrimsonSaveEditor.spec",
+        "CrimsonGameMods/CrimsonGameMods.spec",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "1000799.webp" in source
+        assert "crimson_assets" in source
+        assert "crimson_common.crimson_icons" in source
 
 
 def test_save_editor_mount_workspace_keeps_the_blackstar_surface_visible() -> None:

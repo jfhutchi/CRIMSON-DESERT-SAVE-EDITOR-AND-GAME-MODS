@@ -13,6 +13,7 @@ if str(GAME_MODS) not in sys.path:
 
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QLabel,
     QMainWindow,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
 
 from crimson_common.crimson_shell import (
     CrimsonApplicationShell,
+    CrimsonRouteButton,
+    ShellCommand,
     ShellDestination,
     ShellRoute,
     install_crimson_application_shell,
@@ -71,6 +74,7 @@ def test_shell_replaces_visible_tab_chrome_with_destination_and_context_navigati
     assert shell.findChild(QWidget, "commandHeader") is not None
     assert shell.findChild(QWidget, "contextNavigation") is not None
     assert shell.findChild(QWidget, "editorialWorkspace") is not None
+    assert all(not button.icon().isNull() for button in shell.destination_buttons)
     assert [button.text() for button in shell.destination_buttons] == [
         "SAVE",
         "MOUNTS",
@@ -98,13 +102,49 @@ def test_shell_replaces_visible_tab_chrome_with_destination_and_context_navigati
     assert second.currentIndex() == 0
     assert [
         button.text()
-        for button in shell.findChildren(QPushButton, "routeButton")
+        for button in shell.findChildren(QAbstractButton, "routeButton")
     ] == ["Gamma"]
 
     router.setCurrentIndex(0)
     first.setCurrentIndex(1)
     assert shell.context_title.text() == "MOUNTS"
     assert shell.route_title.text() == "Beta"
+
+
+def test_shell_uses_game_art_in_the_registry_and_supports_immersive_routes() -> None:
+    _application()
+    router, first, _second = _router()
+    route = ShellRoute(
+        "Blackstar",
+        0,
+        first,
+        0,
+        "Blackstar ownership and archive settings.",
+        icon_name="mounts",
+        game_art_id=1000799,
+        badge="DRAGON",
+        immersive=True,
+    )
+    shell = CrimsonApplicationShell(
+        product="SAVE EDITOR",
+        router_tabs=router,
+        destinations=(ShellDestination("MOUNTS", (route,), "Mount registry"),),
+        commands=(ShellCommand("PATH", lambda: None, "Choose game path", "path"),),
+    )
+
+    shell.show()
+    _application().processEvents()
+
+    button = shell.findChild(QAbstractButton, "routeButton")
+    assert isinstance(button, CrimsonRouteButton)
+    assert button.badge == "DRAGON"
+    assert button.uses_game_art
+    assert not button.icon().isNull()
+    assert shell.findChild(QWidget, "routeHeader").isHidden()
+    assert shell.context_eyebrow.text() == "MOUNT REGISTRY"
+    utility = shell.findChild(QAbstractButton, "shellUtilityButton")
+    assert utility is not None
+    assert not utility.icon().isNull()
 
 
 def test_shell_keeps_legacy_menu_and_path_controls_reachable_but_collapsed() -> None:
