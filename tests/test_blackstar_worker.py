@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 import blackstar_worker
 from blackstar_unlock import BlackstarProgress
@@ -12,7 +12,7 @@ from blackstar_worker import BlackstarWorker
 
 @pytest.fixture(scope="module", autouse=True)
 def qt_application():
-    return QCoreApplication.instance() or QCoreApplication([])
+    return QApplication.instance() or QApplication([])
 
 
 def _worker(*, dry_run: bool = True) -> BlackstarWorker:
@@ -90,6 +90,58 @@ def test_worker_cancelled_before_start_emits_only_cancelled(monkeypatch) -> None
     worker.request_cancel()
     worker.run()
     assert terminals == ["cancelled"]
+
+
+def test_worker_cancelled_after_analysis_never_starts_transaction(monkeypatch) -> None:
+    worker = _worker(dry_run=False)
+
+    def fake_unlock(**_kwargs):
+        worker.request_cancel()
+        return SimpleNamespace(output_blob=b"changed-candidate")
+
+    monkeypatch.setattr(blackstar_worker, "unlock_blackstar", fake_unlock)
+    monkeypatch.setattr(
+        blackstar_worker,
+        "transactional_write_blackstar",
+        lambda **_kwargs: pytest.fail("cancelled analysis must not write"),
+        raising=False,
+    )
+    terminals = []
+    worker.completed.connect(lambda _result: terminals.append("completed"))
+    worker.failed.connect(lambda *_args: terminals.append("failed"))
+    worker.cancelled.connect(lambda: terminals.append("cancelled"))
+
+    worker.run()
+
+    assert terminals == ["cancelled"]
+
+
+def test_worker_disables_cancellation_once_transaction_starts(monkeypatch) -> None:
+    worker = _worker(dry_run=False)
+    monkeypatch.setattr(
+        blackstar_worker,
+        "unlock_blackstar",
+        lambda **_kwargs: SimpleNamespace(output_blob=b"changed-candidate"),
+    )
+
+    def fake_write(**_kwargs):
+        worker.request_cancel()
+        return "written"
+
+    monkeypatch.setattr(
+        blackstar_worker, "transactional_write_blackstar", fake_write, raising=False
+    )
+    cancellation_states = []
+    terminals = []
+    worker.cancellation_changed.connect(cancellation_states.append)
+    worker.completed.connect(lambda _result: terminals.append("completed"))
+    worker.failed.connect(lambda *_args: terminals.append("failed"))
+    worker.cancelled.connect(lambda: terminals.append("cancelled"))
+
+    worker.run()
+
+    assert cancellation_states == [False]
+    assert terminals == ["completed"]
 
 
 def test_worker_exception_emits_only_failed(monkeypatch) -> None:

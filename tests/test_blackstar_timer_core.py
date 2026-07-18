@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import crimson_rs
@@ -9,6 +10,7 @@ import pytest
 from blackstar_timer_archive import make_timer_archive
 import crimson_common.blackstar_timer as timer_module
 from crimson_common.blackstar_timer import (
+    ArchiveFileHash,
     BackupConflictError,
     BlackstarTimerService,
     GameRunningError,
@@ -127,6 +129,22 @@ def test_preview_token_is_bound_to_all_source_files(tmp_path: Path) -> None:
         assert "changed after preview" in str(exc)
     else:
         raise AssertionError("Changed source archive was accepted")
+
+
+def test_preview_token_rejects_archive_path_outside_game_directory(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    unsafe = replace(
+        preview.token,
+        archive_hashes=(ArchiveFileHash("../outside.bin", "0" * 64),),
+    )
+
+    with pytest.raises(StalePreviewError, match="Unsafe backup path"):
+        service.validate_preview_token(unsafe)
 
 
 def test_preview_refuses_unknown_schema_without_token(tmp_path: Path) -> None:
@@ -290,6 +308,53 @@ def test_restore_recovers_verified_vanilla_archive(tmp_path: Path) -> None:
     assert restored.status is TimerStatus.VANILLA
     assert restored.backup_dir == applied.backup_dir
     assert service.detect(archive.game_dir).status is TimerStatus.VANILLA
+
+
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["after_restore_file_1", "after_restore_file_2", "after_restore_file_3"],
+)
+def test_restore_rolls_back_to_applied_state_after_each_write_boundary(
+    tmp_path: Path,
+    failure_phase: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    def fail(phase: str) -> None:
+        if phase == failure_phase:
+            raise RuntimeError(f"injected failure: {phase}")
+
+    service = BlackstarTimerService(profile, fault_injector=fail)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    service.apply(preview.token)
+    applied = _snapshot(archive.game_dir)
+
+    with pytest.raises(TimerTransactionError, match="rolled back to the applied state"):
+        service.restore(archive.game_dir)
+
+    assert _snapshot(archive.game_dir) == applied
+    assert service.detect(archive.game_dir).status is TimerStatus.APPLIED
+
+
+def test_restore_rejects_unsafe_manifest_path_without_writing(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    applied = service.apply(preview.token)
+    assert applied.backup_dir is not None
+    manifest_path = applied.backup_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_hashes"]["../outside.bin"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _snapshot(archive.game_dir)
+
+    with pytest.raises(BackupConflictError, match="archive paths"):
+        service.restore(archive.game_dir)
+
+    assert _snapshot(archive.game_dir) == before
 
 
 def test_restore_refuses_unrelated_post_apply_change_without_writing(

@@ -372,7 +372,10 @@ class BlackstarTimerService:
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
         for expected in token.archive_hashes:
-            path = game / Path(expected.relative_path)
+            try:
+                path = self._contained_path(game, expected.relative_path)
+            except BackupConflictError as exc:
+                raise StalePreviewError(str(exc)) from exc
             if not path.is_file() or self._hash_file(path) != expected.sha256:
                 raise StalePreviewError(
                     f"Source archive changed after preview: {expected.relative_path}"
@@ -534,28 +537,73 @@ class BlackstarTimerService:
             raise BackupConflictError("Backup belongs to a different game directory")
         source_hashes = self._manifest_hashes(manifest, "source_hashes")
         post_hashes = self._manifest_hashes(manifest, "post_apply_hashes")
+        expected_paths = self._expected_archive_paths(game)
+        if set(source_hashes) != expected_paths or set(post_hashes) != expected_paths:
+            raise BackupConflictError(
+                "Backup manifest archive paths do not match the enrolled timer files"
+            )
         for relative, expected in source_hashes.items():
-            backup_file = backup_dir / Path(relative)
+            backup_file = self._contained_path(backup_dir, relative)
             if not backup_file.is_file() or self._hash_file(backup_file) != expected:
                 raise BackupConflictError(f"Backup file is missing or altered: {relative}")
         self._emit_progress(progress, "backup_verification", 30)
         for relative, expected in post_hashes.items():
-            current_file = game / Path(relative)
+            current_file = self._contained_path(game, relative)
             if not current_file.is_file() or self._hash_file(current_file) != expected:
                 raise BackupConflictError(
                     f"Game archive changed after this preset was applied: {relative}"
                 )
-        self._restore_backup_files(game, backup_dir, source_hashes)
-        self._emit_progress(progress, "archive_restore", 70)
-        detection = self.detect(game)
-        if detection.status is not TimerStatus.VANILLA:
-            raise TimerTransactionError(
-                f"Restore completed but vanilla verification failed: {detection.reason}"
-            )
-        self._emit_progress(progress, "restore_verification", 95)
-        manifest["restored"] = True
-        manifest["restored_at"] = datetime.now(timezone.utc).isoformat()
-        self._write_manifest(manifest_path, manifest)
+
+        rollback_dir = Path(
+            tempfile.mkdtemp(prefix=".restore-rollback-", dir=backup_dir.parent)
+        )
+        try:
+            self._restore_backup_files(rollback_dir, game, post_hashes)
+            try:
+                self._restore_backup_files(
+                    game,
+                    backup_dir,
+                    source_hashes,
+                    after_replace=lambda index, _relative: self._inject_fault(
+                        f"after_restore_file_{index}"
+                    ),
+                )
+                self._emit_progress(progress, "archive_restore", 70)
+                detection = self.detect(game)
+                if detection.status is not TimerStatus.VANILLA:
+                    raise TimerTransactionError(
+                        "Vanilla verification failed: " + detection.reason
+                    )
+                self._emit_progress(progress, "restore_verification", 95)
+                manifest["restored"] = True
+                manifest["restored_at"] = datetime.now(timezone.utc).isoformat()
+                self._write_manifest(manifest_path, manifest)
+            except Exception as exc:
+                try:
+                    self._restore_backup_files(game, rollback_dir, post_hashes)
+                    rollback_detection = self.detect(game)
+                    if rollback_detection.status is not TimerStatus.APPLIED:
+                        raise TimerTransactionError(
+                            "Applied-state verification failed: "
+                            + rollback_detection.reason
+                        )
+                except Exception as rollback_exc:
+                    raise TimerTransactionError(
+                        f"Restore failed: {exc}; rollback also failed: {rollback_exc}"
+                    ) from exc
+                raise TimerTransactionError(
+                    "Restore failed and all three archives were rolled back to the "
+                    f"applied state: {exc}"
+                ) from exc
+        finally:
+            try:
+                shutil.rmtree(rollback_dir)
+            except OSError as exc:
+                log.warning(
+                    "Could not remove temporary restore rollback directory %s: %s",
+                    rollback_dir,
+                    exc,
+                )
         return TransactionReport(
             status=TimerStatus.VANILLA,
             action="restore",
@@ -738,17 +786,49 @@ class BlackstarTimerService:
         game: Path,
         backup_dir: Path,
         source_hashes: dict[str, str],
+        after_replace: Callable[[int, str], None] | None = None,
     ) -> None:
-        for relative, expected in source_hashes.items():
-            source = backup_dir / Path(relative)
-            destination = game / Path(relative)
+        for index, (relative, expected) in enumerate(source_hashes.items(), start=1):
+            source = self._contained_path(backup_dir, relative)
+            destination = self._contained_path(game, relative)
             if not source.is_file() or self._hash_file(source) != expected:
                 raise OSError(f"Backup cannot be verified: {relative}")
             temp_path = self._copy_to_temp(source, destination)
             os.replace(temp_path, destination)
+            if after_replace is not None:
+                after_replace(index, relative)
         for relative, expected in source_hashes.items():
-            if self._hash_file(game / Path(relative)) != expected:
+            if self._hash_file(self._contained_path(game, relative)) != expected:
                 raise OSError(f"Restored file hash mismatch: {relative}")
+
+    def _expected_archive_paths(self, game: Path) -> set[str]:
+        try:
+            entry = self._find_entry(game)
+            paths = self._source_paths(game, entry)
+            return {path.relative_to(game).as_posix() for path in paths}
+        except Exception as exc:
+            raise BackupConflictError(
+                f"Could not resolve the enrolled timer archive paths: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _contained_path(root: Path, relative: str) -> Path:
+        if "\\" in relative:
+            raise BackupConflictError(f"Unsafe backup path: {relative}")
+        parts = relative.split("/")
+        if (
+            not parts
+            or any(part in {"", ".", ".."} or ":" in part for part in parts)
+            or relative.startswith("/")
+        ):
+            raise BackupConflictError(f"Unsafe backup path: {relative}")
+        root = root.resolve()
+        candidate = (root / Path(*parts)).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise BackupConflictError(f"Unsafe backup path: {relative}") from exc
+        return candidate
 
     @staticmethod
     def _copy_to_temp(source: Path, destination: Path) -> Path:

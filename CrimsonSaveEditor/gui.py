@@ -9687,12 +9687,13 @@ QCheckBox::indicator {{
         worker.completed.connect(self._finish_blackstar_unlock)
         worker.failed.connect(self._fail_blackstar_unlock)
         worker.cancelled.connect(self._cancel_blackstar_unlock)
+        worker.cancellation_changed.connect(self._on_blackstar_cancellation_changed)
         worker.completed.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._cleanup_blackstar_unlock)
-        progress.canceled.connect(lambda: worker.request_cancel())
+        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
         log.info(
             "operation=%s blackstar_worker_start dry_run=%s generation=%s "
             "input_sha256=%s path=%s",
@@ -9741,6 +9742,13 @@ QCheckBox::indicator {{
         self._blackstar_progress.setValue(event.completed)
         self._blackstar_progress.setLabelText(event.message)
         self._update_status(f"Blackstar: {event.message}")
+
+    def _on_blackstar_cancellation_changed(self, enabled: bool) -> None:
+        if self._blackstar_progress is not None and not enabled:
+            self._blackstar_progress.setCancelButton(None)
+            self._blackstar_progress.setLabelText(
+                "Backing up, writing, and verifying the save; cancellation is disabled..."
+            )
 
     def _finish_blackstar_unlock(self, worker_result) -> None:
         worker = self._blackstar_worker

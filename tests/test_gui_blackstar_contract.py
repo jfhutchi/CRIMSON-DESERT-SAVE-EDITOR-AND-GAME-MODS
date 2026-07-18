@@ -30,6 +30,8 @@ def test_blackstar_dry_run_defaults_on_and_uses_qthread() -> None:
     assert 'QCheckBox("Dry run (no changes)")' in build_source
     assert "self._blackstar_dry_run.setChecked(True)" in build_source
     assert "QThread" in start_source
+    assert "progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)" in start_source
+    assert "worker.cancellation_changed.connect" in start_source
     assert "insert_quest_completed" not in start_source
 
 

@@ -4,14 +4,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from crimson_common.blackstar_timer_worker import BlackstarTimerWorker
 
 
 @pytest.fixture(scope="module", autouse=True)
 def qt_application():
-    return QCoreApplication.instance() or QCoreApplication([])
+    return QApplication.instance() or QApplication([])
 
 
 class FakeTimerService:
