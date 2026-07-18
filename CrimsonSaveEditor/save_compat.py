@@ -84,19 +84,28 @@ def extract_required_list_encodings(result: dict) -> dict[str, str]:
 
 
 def compute_schema_identity(blob: bytes, raw_header: bytes) -> SaveSchemaIdentity:
-    parc = parc_serializer.parse_parc_blob(blob)
-    result = save_parser.build_result_from_raw(blob, {"input_kind": "raw_blob"})
-    by_name = {type_def.name: type_def for type_def in parc.types}
+    schema = save_parser.parse_schema(blob)
+    type_names = [type_def.name for type_def in schema["types"]]
+    toc = save_parser.parse_toc(blob, schema["schema_end"], type_names)
+    result = save_parser.build_result_from_layout(
+        blob,
+        {"input_kind": "raw_blob"},
+        schema,
+        toc,
+        object_class_names={"MercenaryClanSaveData", "KnowledgeSaveData"},
+    )
+    by_name = {type_def.name: type_def for type_def in schema["types"]}
     signatures = {
         name: _type_signature(by_name[name]) if name in by_name else "MISSING"
         for name in REQUIRED_TYPES
     }
     version = struct.unpack_from("<H", raw_header, 4)[0] if len(raw_header) >= 6 else 0
+    schema_bytes = blob[0x0E:schema["schema_end"]]
     return SaveSchemaIdentity(
         container_version=version,
-        schema_sha256=hashlib.sha256(parc.schema_bytes).hexdigest(),
-        root_entry_count=parc.num_root_entries,
-        type_count=len(parc.types),
+        schema_sha256=hashlib.sha256(schema_bytes).hexdigest(),
+        root_entry_count=struct.unpack_from("<I", schema_bytes)[0],
+        type_count=len(schema["types"]),
         required_type_signatures=signatures,
         observed_encodings=extract_required_list_encodings(result),
     )

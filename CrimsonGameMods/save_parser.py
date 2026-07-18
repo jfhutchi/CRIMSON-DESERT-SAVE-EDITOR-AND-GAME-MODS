@@ -1380,9 +1380,34 @@ def build_result_from_raw(
     raw = bytes(raw)
     schema = parse_schema(raw)
     type_names = [t.name for t in schema["types"]]
-    type_map = classify_type_indices(schema["types"])
     toc = parse_toc(raw, schema["schema_end"], type_names)
-    objects = decode_object_blocks(raw, toc["entries"], schema["types"])
+    return build_result_from_layout(
+        raw,
+        load_meta,
+        schema,
+        toc,
+        include_legacy=include_legacy,
+    )
+
+
+def build_result_from_layout(
+    raw: bytes | bytearray,
+    load_meta: dict[str, Any],
+    schema: dict[str, Any],
+    toc: dict[str, Any],
+    *,
+    object_class_names: set[str] | None = None,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    raw = bytes(raw)
+    object_entries = toc["entries"]
+    if object_class_names is not None:
+        object_entries = [
+            entry
+            for entry in toc["entries"]
+            if entry.class_name in object_class_names
+        ]
+    objects = decode_object_blocks(raw, object_entries, schema["types"])
 
     result = {
         "input": load_meta,
@@ -1408,6 +1433,7 @@ def build_result_from_raw(
         "objects": objects,
     }
     if include_legacy:
+        type_map = classify_type_indices(schema["types"])
         character = parse_character_stats(raw, toc["entries"], type_map)
         items = scan_items(raw, toc["entries"], type_map)
         bags = scan_bag_expansion(raw, toc["entries"], type_map)
