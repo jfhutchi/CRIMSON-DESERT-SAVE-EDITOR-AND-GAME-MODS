@@ -292,6 +292,7 @@ from crimson_theme import (
     CRIMSON_DARK_TOKENS,
     apply_crimson_theme,
     build_stylesheet,
+    install_crimson_shell,
     legacy_colors,
 )
 
@@ -2667,8 +2668,8 @@ class MainWindow(QMainWindow):
 
         settings_btn = QPushButton("Settings")
         settings_btn.setStyleSheet(
-            f"font-size: 12px; font-weight: bold; color: #4FC3F7; "
-            f"border: 1px solid #4FC3F7; border-radius: 4px; padding: 4px 8px;"
+            f"font-size: 10px; font-weight: bold; color: {COLORS['text_dim']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: 0; padding: 4px 8px;"
         )
         settings_btn.clicked.connect(self._open_settings)
         sb_layout.addWidget(settings_btn)
@@ -2687,10 +2688,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._save_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._save_dock.setWidget(sidebar)
         self._save_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_sb_collapsed': not v})
@@ -2705,13 +2702,13 @@ class MainWindow(QMainWindow):
         self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
-            f"background-color: {COLORS['panel']}; "
-            f"color: {COLORS['accent']}; "
-            f"font-size: 13px; font-weight: bold; "
-            f"padding: 8px; "
+            "background: transparent; "
+            f"color: {COLORS['text_dim']}; "
+            "font-size: 10px; font-weight: normal; "
+            "padding: 4px; "
             f"border-bottom: 1px solid {COLORS['border']};"
         )
-        self._center_status.setFixedHeight(36)
+        self._center_status.setFixedHeight(28)
         right_layout.addWidget(self._center_status)
 
         self._global_info_widget = QWidget()
@@ -2725,9 +2722,9 @@ class MainWindow(QMainWindow):
 
         self._global_game_path = QLabel("Not set — click Browse")
         self._global_game_path.setStyleSheet(
-            f"color: {COLORS['accent']}; padding: 2px 6px; "
-            f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
-            f"background-color: {COLORS['input_bg']};"
+            f"color: {COLORS['text_dim']}; padding: 2px 6px; "
+            f"border: 0; border-bottom: 1px solid {COLORS['border']}; "
+            "background: transparent;"
         )
         self._global_game_path.setToolTip("Game installation path used by Game Data, ItemBuffs, and Stores")
         info_layout.addWidget(self._global_game_path, 1)
@@ -2748,9 +2745,9 @@ class MainWindow(QMainWindow):
         self._global_hide_btn.setCheckable(True)
         self._global_hide_btn.setToolTip("Hide/Show game path bar")
         self._global_hide_btn.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['accent']}; color: white; "
-            f"font-weight: bold; border-radius: 12px; font-size: 12px; }}"
-            f"QPushButton:checked {{ background: #4CAF50; }}")
+            f"QPushButton {{ background: transparent; color: {COLORS['text_dim']}; "
+            f"font-weight: bold; border: 1px solid {COLORS['border']}; "
+            "border-radius: 0; font-size: 11px; }}")
         self._global_hide_btn.clicked.connect(self._toggle_global_info)
         info_layout.addWidget(self._global_hide_btn)
 
@@ -2771,6 +2768,7 @@ class MainWindow(QMainWindow):
         self._tabs.setObjectName("primaryNav")
         self._tabs.tabBar().setObjectName("primaryTabBar")
         self._tabs.setTabPosition(QTabWidget.North)
+        install_crimson_shell(self._tabs, product="SAVE EDITOR")
         right_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(right_panel)
 
@@ -2877,10 +2875,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._pack_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._pack_dock.setWidget(pack_sidebar)
         self._pack_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_ps_collapsed': not v})
@@ -7548,10 +7542,17 @@ QCheckBox::indicator {{
     }
 
     def _build_mercenary_tab(self) -> None:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+        from PySide6.QtWidgets import QScrollArea
+
+        tab = QScrollArea()
+        tab.setObjectName("mercenaryScroll")
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
+        tab.setWidget(content)
 
         info = QLabel(
             "Mercenary/Pets — View, rename, and unlock mounts/companions.\n"
@@ -7559,9 +7560,9 @@ QCheckBox::indicator {{
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['text']}; padding: 6px; "
-            f"border: 1px solid {COLORS['accent']}; border-radius: 4px; "
-            f"background-color: rgba(79,195,247,0.08);"
+            f"color: {COLORS['text_dim']}; padding: 5px 10px; "
+            f"border: 0; border-left: 2px solid {COLORS['accent']}; "
+            "background: transparent;"
         )
         layout.addWidget(info)
 
@@ -7671,7 +7672,10 @@ QCheckBox::indicator {{
         self._blackstar_timer_panel.set_game_path(
             self._config.get("game_install_path", "")
         )
-        layout.addWidget(self._blackstar_timer_panel)
+        # Lead the mount workspace with the focused Blackstar surface from the
+        # approved mockup; the legacy roster and experimental tools remain
+        # available below in the scrollable page.
+        layout.insertWidget(1, self._blackstar_timer_panel)
 
         mount_grp = QGroupBox("Unlock Mounts (Experimental)")
         mount_grid = QGridLayout(mount_grp)
@@ -15696,9 +15700,9 @@ QCheckBox::indicator {{
         )
         warning.setWordWrap(True)
         warning.setStyleSheet(
-            f"color: {COLORS['error']}; font-weight: bold; padding: 8px; "
-            f"border: 1px solid {COLORS['error']}; border-radius: 4px; "
-            f"background-color: rgba(255,80,80,0.10);"
+            f"color: {COLORS['text_dim']}; padding: 5px 10px; "
+            f"border: 0; border-left: 2px solid {COLORS['error']}; "
+            "background: transparent;"
         )
         help_row = QHBoxLayout()
         help_row.addWidget(warning, 1)
@@ -35013,26 +35017,22 @@ QCheckBox::indicator {{
         if scope == "save":
             text = "This tab modifies your SAVE FILE"
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         elif scope == "game":
             text = "This tab modifies GAME FILES (requires admin + restart)"
-            color = "#FFB74D"
-            bg = "rgba(255,183,77,0.08)"
+            color = COLORS["error"]
         elif scope == "readonly":
             text = "This tab is READ-ONLY (browse only)"
             color = "#B0A088"
-            bg = "rgba(176,160,136,0.05)"
         else:
             text = scope
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding: 3px 8px; "
-            f"border: 1px solid {color}; border-radius: 3px; "
-            f"background-color: {bg}; font-weight: bold;"
+            f"color: {color}; font-size: 10px; padding: 2px 8px; "
+            f"border: 0; border-left: 2px solid {color}; "
+            "background: transparent; font-weight: bold;"
         )
-        lbl.setFixedHeight(22)
+        lbl.setFixedHeight(20)
         return lbl
 
     def _show_guide(self, key: str) -> None:

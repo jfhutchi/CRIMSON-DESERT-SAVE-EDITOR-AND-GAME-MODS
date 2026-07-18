@@ -86,9 +86,9 @@ class GamePatchesTab(QWidget):
         )
         warning.setWordWrap(True)
         warning.setStyleSheet(
-            f"color: {COLORS['error']}; font-weight: bold; padding: 8px; "
-            f"border: 1px solid {COLORS['error']}; border-radius: 4px; "
-            f"background-color: rgba(255,80,80,0.10);"
+            f"color: {COLORS['text_dim']}; padding: 5px 10px; "
+            f"border: 0; border-left: 2px solid {COLORS['error']}; "
+            "background: transparent;"
         )
         help_row = QHBoxLayout()
         help_row.addWidget(warning, 1)

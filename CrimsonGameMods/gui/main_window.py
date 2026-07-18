@@ -55,6 +55,7 @@ from localization import tr, set_language, get_language, get_available_languages
 from gui.theme import (
     COLORS, CATEGORY_COLORS, _TAB_SELECTED_BG, _TAB_SELECTED_COLOR,
     _TAB_SELECTED_BORDER, DARK_STYLESHEET, LIGHT_STYLESHEET, apply_theme,
+    install_crimson_shell,
 )
 from gui.utils import _num_item
 
@@ -449,8 +450,8 @@ class MainWindow(QMainWindow):
 
         settings_btn = QPushButton("Settings")
         settings_btn.setStyleSheet(
-            f"font-size: 12px; font-weight: bold; color: #4FC3F7; "
-            f"border: 1px solid #4FC3F7; border-radius: 4px; padding: 4px 8px;"
+            f"font-size: 10px; font-weight: bold; color: {COLORS['text_dim']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: 0; padding: 4px 8px;"
         )
         settings_btn.clicked.connect(self._open_settings)
         sb_layout.addWidget(settings_btn)
@@ -468,10 +469,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._save_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._save_dock.setWidget(sidebar)
         self._save_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_sb_collapsed': not v})
@@ -486,13 +483,13 @@ class MainWindow(QMainWindow):
         self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
-            f"background-color: {COLORS['panel']}; "
-            f"color: {COLORS['accent']}; "
-            f"font-size: 13px; font-weight: bold; "
-            f"padding: 8px; "
+            "background: transparent; "
+            f"color: {COLORS['text_dim']}; "
+            "font-size: 10px; font-weight: normal; "
+            "padding: 4px; "
             f"border-bottom: 1px solid {COLORS['border']};"
         )
-        self._center_status.setMaximumHeight(36)
+        self._center_status.setMaximumHeight(28)
         self._center_status.setVisible(False)  # hidden in gamemods variant
         right_layout.addWidget(self._center_status)
 
@@ -507,9 +504,9 @@ class MainWindow(QMainWindow):
 
         self._global_game_path = QLabel("Not set — click Browse")
         self._global_game_path.setStyleSheet(
-            f"color: {COLORS['accent']}; padding: 2px 6px; "
-            f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
-            f"background-color: {COLORS['input_bg']};"
+            f"color: {COLORS['text_dim']}; padding: 2px 6px; "
+            f"border: 0; border-bottom: 1px solid {COLORS['border']}; "
+            "background: transparent;"
         )
         self._global_game_path.setToolTip("Game installation path used by Game Data, ItemBuffs, and Stores")
         info_layout.addWidget(self._global_game_path, 1)
@@ -530,9 +527,9 @@ class MainWindow(QMainWindow):
         self._global_hide_btn.setCheckable(True)
         self._global_hide_btn.setToolTip("Hide game path bar (▲ collapse / ▼ expand)")
         self._global_hide_btn.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['accent']}; color: white; "
-            f"font-weight: bold; border-radius: 12px; font-size: 14px; }}"
-            f"QPushButton:checked {{ background: {COLORS['accent']}; }}")
+            f"QPushButton {{ background: transparent; color: {COLORS['text_dim']}; "
+            f"font-weight: bold; border: 1px solid {COLORS['border']}; "
+            "border-radius: 0; font-size: 11px; }}")
         self._global_hide_btn.clicked.connect(self._toggle_global_info)
         info_layout.addWidget(self._global_hide_btn)
 
@@ -644,10 +641,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._pack_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._pack_dock.setWidget(pack_sidebar)
         self._pack_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_ps_collapsed': not v})
@@ -696,7 +689,11 @@ class MainWindow(QMainWindow):
         )
         _corner_layout.addWidget(self._btn_toggle_save_browser)
 
-        self._tabs.setCornerWidget(_corner, Qt.TopRightCorner)
+        install_crimson_shell(
+            self._tabs,
+            product="GAME MODS",
+            action_widget=_corner,
+        )
 
 
         self._mods_tabs = QTabWidget()
@@ -4205,26 +4202,22 @@ QCheckBox::indicator {{
         if scope == "save":
             text = "This tab modifies your SAVE FILE"
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         elif scope == "game":
             text = "This tab modifies GAME FILES (requires admin + restart)"
-            color = "#FFB74D"
-            bg = "rgba(255,183,77,0.08)"
+            color = COLORS["error"]
         elif scope == "readonly":
             text = "This tab is READ-ONLY (browse only)"
             color = "#B0A088"
-            bg = "rgba(176,160,136,0.05)"
         else:
             text = scope
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding: 3px 8px; "
-            f"border: 1px solid {color}; border-radius: 3px; "
-            f"background-color: {bg}; font-weight: bold;"
+            f"color: {color}; font-size: 10px; padding: 2px 8px; "
+            f"border: 0; border-left: 2px solid {color}; "
+            "background: transparent; font-weight: bold;"
         )
-        lbl.setFixedHeight(22)
+        lbl.setFixedHeight(20)
         return lbl
 
     def _show_guide(self, key: str) -> None:

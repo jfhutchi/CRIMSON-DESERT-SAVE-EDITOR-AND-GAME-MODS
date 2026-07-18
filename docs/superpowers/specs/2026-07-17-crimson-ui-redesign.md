@@ -32,23 +32,28 @@ models, signals, and mutation callbacks do not move.
 
 ## Visual Direction
 
-The interface uses a restrained Crimson Desert vocabulary instead of generic
-dashboard cards or the current DOS-like monospace treatment:
+The interface uses the approved Blackstar mockup's restrained Crimson Desert
+vocabulary instead of generic dashboard cards, gold-outlined Qt forms, or the
+old DOS-like treatment:
 
-- Ink `#0A0907` and obsidian `#12100D` form the application depth.
-- Charcoal `#201A14` and ember `#2C2118` separate work areas without cards.
-- Bronze `#9C743B` and bright bronze `#C6A15F` draw one-pixel rules, focus, and
-  selected navigation.
-- Parchment `#E7DCC5` is primary text; ash `#A89B87` is secondary text.
-- Crimson `#87352D` is reserved for destructive or dangerous actions, never used
-  as a decorative wash.
-- Moss `#758B5C`, amber `#C28A3C`, and iron red `#A94A3E` communicate success,
-  warning, and error.
+- Ink `#050706` and obsidian `#080B09` form the green-black application depth.
+- Surface `#0D120F` and warm surface `#17150F` create subtle editorial depth.
+- Graphite `#29302B` draws quiet one-pixel dividers rather than control boxes.
+- Bone `#E6E1D7` and bright bone `#F2EDE3` carry primary text; ash `#7F857D`
+  carries descriptions and inactive navigation.
+- Crimson `#B63A32` is the focused accent for selection underlines, section
+  eyebrows, primary actions, and left-edge status markers.
+- Moss `#78917B`, amber `#A88455`, and iron red `#C05247` communicate success,
+  warning, and error without becoming decorative fills.
 
-Panels are squared and translucent-looking through layered near-black colors,
-not rounded floating cards. Separators are narrow bronze rules. Texture comes
-from subtle linear gradients in headers and selected tabs rather than images,
-which keeps builds deterministic and high-DPI safe.
+Panels are squared and largely borderless. Generic group boxes use a single
+graphite top rule; buttons are transparent until selected; primary and
+secondary navigation use crimson underlines instead of boxed tabs. A restrained
+warm gradient is reserved for the Blackstar work surface and contextual strips.
+
+The Blackstar timer is the reference surface: a red eyebrow and large serif
+title lead into two before/after metric rows, a left-rule verification status,
+and a right-hand Change Record. This exact surface is shared by both executables.
 
 ## Typography
 
@@ -62,8 +67,8 @@ download or extra font license is required on supported Windows systems.
 Each window keeps the native menu bar, then presents a horizontal primary
 navigation band and a compact secondary navigation band. Existing `QTabWidget`
 instances remain the routing mechanism, receive stable object names, and keep
-their current indices and callbacks. The game path strip becomes a contextual
-bronze-edged command strip. The main workspace remains dense and table-first.
+their current indices and callbacks. The game path strip becomes a quiet
+graphite-edged command strip. The main workspace remains dense and table-first.
 
 Save Browser and Pack Browser remain dockable. Game Mods continues to open them
 on demand; Save Editor continues to expose both as persistent workflow tools.
@@ -88,6 +93,9 @@ Stable roles include:
 - `saveBrowser` and `packBrowser` for dock workflows;
 - `dangerAction`, `primaryAction`, and `quietAction` dynamic properties for
   semantic button emphasis where an existing action already has that meaning.
+- `brandBlock`, `brandMark`, and `shellIdentity` for the branded primary rail;
+- `blackstarTimerPanel`, `blackstarMetricRow`, and `changeRecord` for the shared
+  reference surface.
 
 ## Interaction And Accessibility
 

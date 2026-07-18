@@ -7,6 +7,7 @@ from crimson_common.crimson_theme import (
     MONO_FONT,
     apply_crimson_theme,
     build_stylesheet,
+    install_crimson_shell,
     legacy_colors,
     scaled_stylesheet,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "MONO_FONT",
     "apply_crimson_theme",
     "build_stylesheet",
+    "install_crimson_shell",
     "legacy_colors",
     "scaled_stylesheet",
 ]

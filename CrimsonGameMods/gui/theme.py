@@ -5,6 +5,7 @@ from gui.crimson_theme import (
     CRIMSON_LIGHT_TOKENS,
     apply_crimson_theme,
     build_stylesheet,
+    install_crimson_shell,
     legacy_colors,
 )
 

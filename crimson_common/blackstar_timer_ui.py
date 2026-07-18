@@ -6,7 +6,7 @@ from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -26,7 +26,7 @@ from .blackstar_timer_worker import BlackstarTimerWorker
 log = logging.getLogger(__name__)
 
 
-class BlackstarTimerPanel(QGroupBox):
+class BlackstarTimerPanel(QFrame):
     status_message = Signal(str)
 
     def __init__(
@@ -36,7 +36,10 @@ class BlackstarTimerPanel(QGroupBox):
         service_factory: Callable[[], BlackstarTimerService] = BlackstarTimerService,
         parent=None,
     ) -> None:
-        super().__init__(title, parent)
+        super().__init__(parent)
+        self.setObjectName("blackstarTimerPanel")
+        self.setAccessibleName(title)
+        self.setMinimumHeight(280)
         self._service_factory = service_factory
         self._game_dir = Path()
         self._preview_token = None
@@ -47,22 +50,115 @@ class BlackstarTimerPanel(QGroupBox):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(6)
+
+        eyebrow = QLabel("GAME ARCHIVE SETTING")
+        eyebrow.setObjectName("blackstarTimerEyebrow")
+        eyebrow.setProperty("eyebrow", True)
+        layout.addWidget(eyebrow)
+
+        title = QLabel("Blackstar")
+        title.setObjectName("blackstarTimerTitle")
+        title.setProperty("displayTitle", True)
+        layout.addWidget(title)
+
+        body = QFrame()
+        body.setObjectName("blackstarTimerBody")
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 12, 0, 0)
+        body_layout.setSpacing(24)
+
+        main = QFrame()
+        main.setObjectName("blackstarTimerMain")
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(6)
+
+        section_title = QLabel("Extended Flight")
+        section_title.setObjectName("blackstarTimerSectionTitle")
+        main_layout.addWidget(section_title)
+
         info = QLabel(
-            "Fixed verified preset: mounted time 30 minutes; summon cooldown 1 second. "
-            "This modifies installed game archives, affects every save, and does not "
+            "The tested preset affects every save by changing Blackstar's game archive "
+            "settings. Preview verifies the "
+            "archive and prepares a reversible three-file backup before Apply becomes "
+            "available: mounted time 30 minutes; summon cooldown 1 second. It does not "
             "change the loaded save or any quest-completion flags."
         )
         info.setObjectName("blackstarTimerWarning")
+        info.setProperty("muted", True)
         info.setWordWrap(True)
-        layout.addWidget(info)
+        main_layout.addWidget(info)
+
+        duration_row, self._duration_before, self._duration_after = self._metric_row(
+            "Mounted duration",
+            "Time before Blackstar returns",
+            "10 min",
+            "30 min",
+            "blackstarDuration",
+        )
+        main_layout.addWidget(duration_row)
+
+        cooldown_row, self._cooldown_before, self._cooldown_after = self._metric_row(
+            "Summon cooldown",
+            "Delay after mounted time expires",
+            "60 min",
+            "1 sec",
+            "blackstarCooldown",
+        )
+        main_layout.addWidget(cooldown_row)
+
+        status_block = QFrame()
+        status_block.setObjectName("blackstarStatusBlock")
+        status_layout = QVBoxLayout(status_block)
+        status_layout.setContentsMargins(12, 4, 6, 4)
+        status_layout.setSpacing(2)
+        self._status = QLabel("Preview required - nothing written")
+        self._status.setObjectName("blackstarTimerStatus")
+        self._status.setProperty("recordValue", True)
+        self._status.setWordWrap(True)
+        status_layout.addWidget(self._status)
+        self._status_detail = QLabel(
+            "Select the Crimson Desert install folder, then run Preview."
+        )
+        self._status_detail.setObjectName("blackstarTimerStatusDetail")
+        self._status_detail.setProperty("muted", True)
+        self._status_detail.setWordWrap(True)
+        status_layout.addWidget(self._status_detail)
+        main_layout.addWidget(status_block)
+        main_layout.addStretch()
+
+        record = QFrame()
+        record.setObjectName("changeRecord")
+        record.setMinimumWidth(300)
+        record_layout = QVBoxLayout(record)
+        record_layout.setContentsMargins(22, 0, 0, 0)
+        record_layout.setSpacing(0)
+        record_title = QLabel("Change Record")
+        record_title.setObjectName("changeRecordTitle")
+        record_layout.addWidget(record_title)
+        record_layout.addSpacing(10)
+        record_layout.addWidget(self._record_row("Target", "Game archives"))
+        fields_row, self._fields_value = self._record_value_row(
+            "Fields changed", "2", "blackstarFieldsChanged"
+        )
+        record_layout.addWidget(fields_row)
+        save_row, self._save_changes_value = self._record_value_row(
+            "Save changes", "None", "blackstarSaveChanges"
+        )
+        record_layout.addWidget(save_row)
+        quest_row, self._quest_changes_value = self._record_value_row(
+            "Quest changes", "None", "blackstarQuestChanges"
+        )
+        record_layout.addWidget(quest_row)
+        backup_row, self._backup_value = self._record_value_row(
+            "Backup", "On apply", "blackstarBackup"
+        )
+        record_layout.addWidget(backup_row)
+        record_layout.addSpacing(14)
 
         buttons = QHBoxLayout()
-        self._preview_button = QPushButton("Preview 30m / 1s")
-        self._preview_button.setObjectName("blackstarTimerPreview")
-        self._preview_button.setProperty("quietAction", True)
-        self._preview_button.clicked.connect(lambda: self._start("preview"))
-        buttons.addWidget(self._preview_button)
-
         self._apply_button = QPushButton("Apply Preset")
         self._apply_button.setObjectName("blackstarTimerApply")
         self._apply_button.setProperty("primaryAction", True)
@@ -70,19 +166,100 @@ class BlackstarTimerPanel(QGroupBox):
         self._apply_button.clicked.connect(lambda: self._start("apply"))
         buttons.addWidget(self._apply_button)
 
+        self._preview_button = QPushButton("Preview 30m / 1s")
+        self._preview_button.setObjectName("blackstarTimerPreview")
+        self._preview_button.setProperty("quietAction", True)
+        self._preview_button.clicked.connect(lambda: self._start("preview"))
+        buttons.addWidget(self._preview_button)
+
         self._restore_button = QPushButton("Restore Original")
         self._restore_button.setObjectName("blackstarTimerRestore")
         self._restore_button.setProperty("quietAction", True)
         self._restore_button.setEnabled(False)
         self._restore_button.clicked.connect(lambda: self._start("restore"))
         buttons.addWidget(self._restore_button)
-        buttons.addStretch()
-        layout.addLayout(buttons)
+        record_layout.addLayout(buttons)
+        record_layout.addStretch()
 
-        self._status = QLabel("Select the Crimson Desert install folder, then Preview.")
-        self._status.setObjectName("blackstarTimerStatus")
-        self._status.setWordWrap(True)
-        layout.addWidget(self._status)
+        body_layout.addWidget(main, 1)
+        body_layout.addWidget(record, 0)
+        layout.addWidget(body, 1)
+
+    @staticmethod
+    def _metric_row(
+        label: str,
+        detail: str,
+        before: str,
+        after: str,
+        prefix: str,
+    ) -> tuple[QFrame, QLabel, QLabel]:
+        row = QFrame()
+        row.setObjectName("blackstarMetricRow")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 8, 0, 8)
+        row_layout.setSpacing(12)
+        labels = QVBoxLayout()
+        labels.setContentsMargins(0, 0, 0, 0)
+        labels.setSpacing(0)
+        name = QLabel(label)
+        name.setProperty("recordValue", True)
+        note = QLabel(detail)
+        note.setProperty("muted", True)
+        labels.addWidget(name)
+        labels.addWidget(note)
+        row_layout.addLayout(labels)
+        row_layout.addStretch()
+        before_label = QLabel(before)
+        before_label.setObjectName(prefix + "Before")
+        before_label.setProperty("metricBefore", True)
+        before_font = before_label.font()
+        before_font.setStrikeOut(True)
+        before_label.setFont(before_font)
+        row_layout.addWidget(before_label)
+        arrow = QLabel(">")
+        arrow.setProperty("eyebrow", True)
+        row_layout.addWidget(arrow)
+        after_label = QLabel(after)
+        after_label.setObjectName(prefix + "After")
+        after_label.setProperty("metricAfter", True)
+        row_layout.addWidget(after_label)
+        return row, before_label, after_label
+
+    @staticmethod
+    def _record_row(label: str, value: str) -> QFrame:
+        row, _value = BlackstarTimerPanel._record_value_row(label, value, "")
+        return row
+
+    @staticmethod
+    def _record_value_row(
+        label: str,
+        value: str,
+        object_name: str,
+    ) -> tuple[QFrame, QLabel]:
+        row = QFrame()
+        row.setObjectName("changeRecordRow")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 7, 0, 7)
+        key = QLabel(label)
+        key.setProperty("muted", True)
+        value_label = QLabel(value)
+        if object_name:
+            value_label.setObjectName(object_name)
+        value_label.setProperty("recordValue", True)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row_layout.addWidget(key)
+        row_layout.addStretch()
+        row_layout.addWidget(value_label)
+        return row, value_label
+
+    @staticmethod
+    def _time_label(seconds: int | None) -> str:
+        if seconds is None:
+            return "-"
+        if seconds < 60:
+            return f"{seconds} sec"
+        minutes = seconds // 60
+        return f"{minutes} min"
 
     def set_game_path(self, game_dir: str | Path) -> None:
         normalized = Path(game_dir).expanduser() if str(game_dir).strip() else Path()
@@ -181,6 +358,7 @@ class BlackstarTimerPanel(QGroupBox):
             self._progress.setValue(value)
             self._progress.setLabelText(f"{label}...")
         self._status.setText(label)
+        self._status_detail.setText("Archive verification is running in the background.")
         self.status_message.emit(f"Blackstar Timer: {label}")
 
     def _on_cancellation_changed(self, enabled: bool) -> None:
@@ -194,11 +372,26 @@ class BlackstarTimerPanel(QGroupBox):
         if isinstance(result, PreviewReport):
             self._preview_token = result.token
             self._apply_button.setEnabled(result.token is not None)
-            self._status.setText(result.reason)
+            self._duration_before.setText(self._time_label(result.duration_before))
+            self._duration_after.setText(self._time_label(result.duration_after))
+            self._cooldown_before.setText(self._time_label(result.cooldown_before))
+            self._cooldown_after.setText(self._time_label(result.cooldown_after))
+            self._status.setText("Preview verified - nothing written")
+            self._status_detail.setText(result.reason)
+            self._backup_value.setText("Ready on apply")
+            self._preview_button.setText("Preview Again")
         elif isinstance(result, TransactionReport):
             self._preview_token = None
             self._apply_button.setEnabled(False)
-            self._status.setText(result.reason)
+            self._status.setText(
+                "Preset applied and verified"
+                if result.action == "apply"
+                else "Original values restored and verified"
+            )
+            self._status_detail.setText(result.reason)
+            self._backup_value.setText(
+                "Created" if result.action == "apply" else "Restored"
+            )
         self._restore_button.setEnabled(self._has_owned_backup())
         self.status_message.emit(self._status.text())
         if self._progress is not None:
@@ -237,7 +430,8 @@ class BlackstarTimerPanel(QGroupBox):
         log.error("Blackstar timer worker failed: %s\n%s", message, details)
         self._preview_token = None
         self._apply_button.setEnabled(False)
-        self._status.setText(message)
+        self._status.setText("Operation failed - nothing written")
+        self._status_detail.setText(message)
         if self._progress is not None:
             self._progress.close()
         QMessageBox.critical(
@@ -247,7 +441,8 @@ class BlackstarTimerPanel(QGroupBox):
         )
 
     def _on_cancelled(self) -> None:
-        self._status.setText("Cancelled before any game archive write.")
+        self._status.setText("Cancelled - nothing written")
+        self._status_detail.setText("Cancelled before any game archive write.")
         if self._progress is not None:
             self._progress.close()
         self.status_message.emit(self._status.text())

@@ -10,6 +10,7 @@ from crimson_common.crimson_theme import (
     DISPLAY_FONT,
     MONO_FONT,
     build_stylesheet,
+    install_crimson_shell,
     legacy_colors,
 )
 
@@ -31,6 +32,11 @@ def test_crimson_token_vocabulary_and_typography_are_complete() -> None:
         "moss",
         "amber",
         "iron_red",
+        "surface",
+        "surface_warm",
+        "divider",
+        "accent_red",
+        "text_bright",
     }
     assert required <= set(CRIMSON_DARK_TOKENS)
     assert required <= set(CRIMSON_LIGHT_TOKENS)
@@ -38,6 +44,8 @@ def test_crimson_token_vocabulary_and_typography_are_complete() -> None:
     assert BODY_FONT.startswith("Bahnschrift,")
     assert BODY_FONT_STYLE == "SemiCondensed"
     assert "Consolas" in MONO_FONT
+    assert CRIMSON_DARK_TOKENS["accent_red"] == "#B63A32"
+    assert CRIMSON_DARK_TOKENS["divider"] == "#29302B"
 
     colors = legacy_colors(CRIMSON_DARK_TOKENS)
     assert {
@@ -66,6 +74,12 @@ def test_stylesheet_encodes_game_shell_focus_and_accessibility_roles() -> None:
         "QTabWidget#sectionNav",
         "QWidget#contextStrip",
         "QStatusBar#statusRail",
+        "QWidget#brandBlock",
+        "QLabel#brandMark",
+        "QWidget#shellIdentity",
+        "QFrame#blackstarTimerPanel",
+        "QFrame#blackstarMetricRow",
+        "QFrame#changeRecord",
         'QPushButton[primaryAction="true"]',
         'QPushButton[dangerAction="true"]',
         "QPushButton:focus",
@@ -73,12 +87,46 @@ def test_stylesheet_encodes_game_shell_focus_and_accessibility_roles() -> None:
         "QComboBox:focus",
         "min-height: 28px",
         "Georgia",
-        "Bahnschrift,",
         "border-radius: 0px",
     ):
         assert required in stylesheet
     assert "purple" not in stylesheet.lower()
     assert "Inter" not in stylesheet
+
+
+def test_stylesheet_matches_the_approved_flat_crimson_desert_direction() -> None:
+    stylesheet = build_stylesheet(CRIMSON_DARK_TOKENS)
+    accent = CRIMSON_DARK_TOKENS["accent_red"]
+    divider = CRIMSON_DARK_TOKENS["divider"]
+
+    assert f"border-bottom: 2px solid {accent}" in stylesheet
+    assert f"border-top: 1px solid {divider}" in stylesheet
+    assert "QPushButton, QToolButton {\n    min-height: 28px;\n    background: transparent;" in stylesheet
+    assert "QGroupBox {\n    color:" in stylesheet
+    assert "QGroupBox {\n    color:" + f" {accent};" in stylesheet
+    assert "QGroupBox {\n    color:" + f" {accent};\n    border: 0px;" in stylesheet
+    assert "QTabBar#primaryTabBar::tab {\n    min-height: 40px;" in stylesheet
+    assert "QTabBar#primaryTabBar::tab:selected {\n    color:" in stylesheet
+    assert 'QPushButton[primaryAction="true"]:disabled' in stylesheet
+    assert "border-top: 3px solid" not in stylesheet
+    assert "border: 1px solid #9C743B" not in stylesheet
+
+
+def test_shared_shell_installer_is_used_by_both_main_windows() -> None:
+    assert callable(install_crimson_shell)
+    for relative in (
+        "CrimsonSaveEditor/gui.py",
+        "CrimsonGameMods/gui/main_window.py",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "install_crimson_shell(" in source
+
+
+def test_save_editor_mount_workspace_keeps_the_blackstar_surface_visible() -> None:
+    source = (ROOT / "CrimsonSaveEditor" / "gui.py").read_text(encoding="utf-8")
+    assert 'tab.setObjectName("mercenaryScroll")' in source
+    assert "tab.setWidgetResizable(True)" in source
+    assert "layout.insertWidget(1, self._blackstar_timer_panel)" in source
 
 
 def test_both_application_theme_entrypoints_share_one_vocabulary() -> None:

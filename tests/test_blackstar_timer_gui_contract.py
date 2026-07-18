@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
 
 from crimson_common.blackstar_timer_ui import BlackstarTimerPanel
 
@@ -41,6 +41,24 @@ def test_shared_panel_exposes_fixed_preset_and_safe_initial_state() -> None:
     assert buttons["Preview 30m / 1s"].property("quietAction") is True
     assert buttons["Apply Preset"].property("primaryAction") is True
     assert buttons["Restore Original"].property("quietAction") is True
+
+
+def test_shared_panel_matches_the_approved_blackstar_editorial_layout() -> None:
+    panel = BlackstarTimerPanel(title="Blackstar Timer")
+
+    assert isinstance(panel, QFrame)
+    assert panel.objectName() == "blackstarTimerPanel"
+    assert panel.findChild(QLabel, "blackstarTimerEyebrow").text() == "GAME ARCHIVE SETTING"
+    assert panel.findChild(QLabel, "blackstarTimerTitle").text() == "Blackstar"
+    assert panel.findChild(QLabel, "blackstarTimerSectionTitle").text() == "Extended Flight"
+    assert panel.findChild(QLabel, "blackstarDurationBefore").text() == "10 min"
+    assert panel.findChild(QLabel, "blackstarDurationAfter").text() == "30 min"
+    assert panel.findChild(QLabel, "blackstarCooldownBefore").text() == "60 min"
+    assert panel.findChild(QLabel, "blackstarCooldownAfter").text() == "1 sec"
+    assert panel.findChild(QFrame, "changeRecord") is not None
+    assert panel.findChild(QLabel, "blackstarSaveChanges").text() == "None"
+    assert panel.findChild(QLabel, "blackstarQuestChanges").text() == "None"
+    assert panel.findChild(QLabel, "blackstarFieldsChanged").text() == "2"
 
 
 def test_both_applications_use_the_shared_timer_panel() -> None:

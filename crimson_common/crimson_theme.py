@@ -9,60 +9,72 @@ BODY_FONT = 'Bahnschrift, "Segoe UI", sans-serif'
 BODY_FONT_STYLE = "SemiCondensed"
 MONO_FONT = '"Cascadia Mono", Consolas, monospace'
 
+# The legacy token names remain for compatibility with hundreds of existing
+# widgets. The additional semantic tokens describe the approved flat mockup.
 CRIMSON_DARK_TOKENS = {
-    "ink": "#0A0907",
-    "obsidian": "#12100D",
-    "charcoal": "#201A14",
-    "ember": "#2C2118",
-    "bronze": "#9C743B",
-    "bronze_bright": "#C6A15F",
-    "parchment": "#E7DCC5",
-    "ash": "#A89B87",
-    "crimson": "#87352D",
-    "moss": "#758B5C",
-    "amber": "#C28A3C",
-    "iron_red": "#A94A3E",
-    "selection": "#44301D",
-    "scope_save": "#789B96",
-    "scope_game": "#C28A3C",
+    "ink": "#050706",
+    "obsidian": "#080B09",
+    "charcoal": "#0E1310",
+    "ember": "#17150F",
+    "bronze": "#29302B",
+    "bronze_bright": "#B63A32",
+    "parchment": "#E6E1D7",
+    "ash": "#7F857D",
+    "crimson": "#9F302B",
+    "moss": "#78917B",
+    "amber": "#A88455",
+    "iron_red": "#C05247",
+    "selection": "#18201B",
+    "scope_save": "#87A6A0",
+    "scope_game": "#A88455",
+    "surface": "#0D120F",
+    "surface_warm": "#17150F",
+    "divider": "#29302B",
+    "accent_red": "#B63A32",
+    "text_bright": "#F2EDE3",
 }
 
 CRIMSON_LIGHT_TOKENS = {
-    "ink": "#EEE5D5",
-    "obsidian": "#F6F0E5",
-    "charcoal": "#E3D7C4",
-    "ember": "#D3C1A6",
-    "bronze": "#7B5425",
-    "bronze_bright": "#9A6D32",
-    "parchment": "#271E15",
-    "ash": "#66594A",
-    "crimson": "#7E2D28",
-    "moss": "#4E6C3D",
-    "amber": "#955F19",
-    "iron_red": "#8D302B",
-    "selection": "#D5BA8E",
-    "scope_save": "#356D6A",
-    "scope_game": "#955F19",
+    "ink": "#E4DFD5",
+    "obsidian": "#F2EEE6",
+    "charcoal": "#E8E3DA",
+    "ember": "#DDD6CA",
+    "bronze": "#B9B2A7",
+    "bronze_bright": "#9E302A",
+    "parchment": "#1A1D1A",
+    "ash": "#62675F",
+    "crimson": "#8D2925",
+    "moss": "#55705A",
+    "amber": "#80633D",
+    "iron_red": "#A43F36",
+    "selection": "#D8DDD6",
+    "scope_save": "#3C6E68",
+    "scope_game": "#80633D",
+    "surface": "#ECE8DF",
+    "surface_warm": "#DDD6CA",
+    "divider": "#B9B2A7",
+    "accent_red": "#9E302A",
+    "text_bright": "#111411",
 }
 
 
 def legacy_colors(tokens: Mapping[str, str]) -> dict[str, str]:
-    """Map the shared vocabulary to keys used throughout both legacy UIs."""
+    """Map semantic tokens to keys still used by the established editors."""
     return {
         "bg": tokens["obsidian"],
-        "panel": tokens["charcoal"],
-        "header": tokens["ember"],
-        "accent": tokens["bronze_bright"],
+        "panel": tokens["surface"],
+        "header": tokens["surface_warm"],
+        "accent": tokens["accent_red"],
         "text": tokens["parchment"],
         "text_dim": tokens["ash"],
         "selected": tokens["selection"],
-        "border": tokens["bronze"],
+        "border": tokens["divider"],
         "input_bg": tokens["ink"],
         "success": tokens["moss"],
         "warning": tokens["amber"],
         "error": tokens["iron_red"],
         "scope_save": tokens["scope_save"],
-        "scope_game": tokens["scope_game"],
+        "scope_game": tokens["accent_red"],
     }
 
 
@@ -76,170 +88,193 @@ QMainWindow#crimsonWindow, QDialog {{
 QWidget {{
     background-color: {c['obsidian']};
     color: {c['parchment']};
-    font-family: {BODY_FONT};
     font-size: 10pt;
 }}
 QWidget:disabled {{ color: {c['ash']}; }}
+QLabel {{ background: transparent; }}
 
 QMenuBar {{
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {c['ember']}, stop:1 {c['charcoal']});
-    color: {c['parchment']};
-    border-top: 1px solid {c['bronze']};
-    border-bottom: 1px solid {c['bronze']};
-    padding: 3px 10px;
-    font-family: {DISPLAY_FONT};
-    font-size: 10pt;
+    min-height: 24px;
+    background-color: {c['ink']};
+    color: {c['ash']};
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+    padding: 0px 14px;
+    font-size: 9pt;
 }}
 QMenuBar::item {{
     background: transparent;
-    padding: 5px 12px;
-    border-radius: 0px;
+    padding: 4px 12px;
 }}
 QMenuBar::item:selected, QMenuBar::item:pressed {{
-    background-color: {c['selection']};
-    color: {c['bronze_bright']};
+    color: {c['text_bright']};
+    background-color: {c['surface']};
 }}
 QMenu {{
-    background-color: {c['charcoal']};
+    background-color: {c['surface']};
     color: {c['parchment']};
-    border: 1px solid {c['bronze']};
-    padding: 4px;
+    border: 1px solid {c['divider']};
+    padding: 5px;
 }}
-QMenu::item {{ padding: 6px 26px 6px 12px; }}
+QMenu::item {{ padding: 7px 28px 7px 12px; }}
 QMenu::item:selected {{
     background-color: {c['selection']};
-    color: {c['bronze_bright']};
+    color: {c['text_bright']};
+    border-left: 2px solid {c['accent_red']};
 }}
 QMenu::separator {{
     height: 1px;
-    background-color: {c['bronze']};
-    margin: 4px 8px;
+    background-color: {c['divider']};
+    margin: 5px 8px;
 }}
 
+QTabWidget#primaryNav {{ background-color: {c['ink']}; }}
 QTabWidget#primaryNav::pane {{
-    border: 1px solid {c['bronze']};
-    border-top: 2px solid {c['bronze_bright']};
+    border: 0px;
+    border-top: 1px solid {c['divider']};
     background-color: {c['obsidian']};
 }}
-QTabBar#primaryTabBar {{
-    background-color: {c['ink']};
-}}
+QTabWidget#primaryNav::tab-bar {{ alignment: center; }}
+QTabBar#primaryTabBar {{ background-color: {c['ink']}; }}
 QTabBar#primaryTabBar::tab {{
-    min-height: 32px;
-    min-width: 112px;
-    padding: 6px 24px;
-    margin: 0px;
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {c['ember']}, stop:1 {c['charcoal']});
+    min-height: 40px;
+    min-width: 78px;
+    padding: 2px 16px;
+    margin: 0px 3px;
+    background: transparent;
     color: {c['ash']};
-    border: 1px solid {c['bronze']};
-    border-bottom: 0px;
-    border-radius: 0px;
-    font-family: {DISPLAY_FONT};
-    font-size: 11pt;
-    font-weight: 600;
+    border: 0px;
+    border-bottom: 2px solid transparent;
+    font-size: 8.5pt;
+    font-weight: 700;
 }}
 QTabBar#primaryTabBar::tab:selected {{
-    background-color: {c['selection']};
-    color: {c['parchment']};
-    border-top: 3px solid {c['bronze_bright']};
+    color: {c['text_bright']};
+    border-bottom: 2px solid {c['accent_red']};
 }}
-QTabBar#primaryTabBar::tab:hover:!selected {{
-    color: {c['bronze_bright']};
-    background-color: {c['ember']};
-}}
+QTabBar#primaryTabBar::tab:hover:!selected {{ color: {c['parchment']}; }}
 
 QTabWidget#sectionNav::pane {{
     border: 0px;
-    border-top: 1px solid {c['bronze']};
+    border-top: 1px solid {c['divider']};
     background-color: {c['obsidian']};
 }}
-QTabBar#sectionTabBar {{ background-color: {c['ink']}; }}
+QTabWidget#sectionNav::tab-bar {{ alignment: left; }}
+QTabBar#sectionTabBar {{ background-color: {c['obsidian']}; }}
 QTabBar#sectionTabBar::tab {{
-    min-height: 28px;
-    padding: 4px 14px;
+    min-height: 30px;
+    padding: 2px 13px;
     margin: 0px;
-    background-color: {c['charcoal']};
+    background: transparent;
     color: {c['ash']};
     border: 0px;
-    border-right: 1px solid {c['bronze']};
-    border-bottom: 1px solid {c['bronze']};
-    border-radius: 0px;
+    border-bottom: 2px solid transparent;
+    font-size: 9pt;
     font-weight: 600;
 }}
 QTabBar#sectionTabBar::tab:selected {{
-    background-color: {c['selection']};
-    color: {c['parchment']};
-    border-bottom: 3px solid {c['bronze_bright']};
+    color: {c['text_bright']};
+    border-bottom: 2px solid {c['accent_red']};
 }}
-QTabBar#sectionTabBar::tab:hover:!selected {{
-    color: {c['bronze_bright']};
-    background-color: {c['ember']};
+QTabBar#sectionTabBar::tab:hover:!selected {{ color: {c['parchment']}; }}
+
+QWidget#brandBlock {{
+    min-width: 210px;
+    background-color: {c['ink']};
 }}
+QLabel#brandMark {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 9pt;
+    font-weight: 700;
+}}
+QWidget#shellIdentity {{
+    min-width: 190px;
+    background-color: {c['ink']};
+}}
+QLabel#shellProduct {{
+    color: {c['text_bright']};
+    font-size: 8pt;
+    font-weight: 700;
+}}
+QLabel#shellDetail {{ color: {c['ash']}; font-size: 8pt; }}
 
 QWidget#contextStrip {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {c['ink']}, stop:0.55 {c['charcoal']}, stop:1 {c['ink']});
-    border-top: 1px solid {c['bronze']};
-    border-bottom: 1px solid {c['bronze']};
+        stop:0 {c['obsidian']}, stop:0.55 {c['surface_warm']}, stop:1 {c['obsidian']});
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
 }}
 QFrame#saveBrowser, QFrame#packBrowser {{
-    background-color: {c['charcoal']};
+    background-color: {c['surface']};
     border: 0px;
 }}
 
-QLabel {{ background: transparent; }}
 QLabel[heading="true"] {{
-    color: {c['bronze_bright']};
-    font-family: {DISPLAY_FONT};
+    color: {c['text_bright']};
+    font-family: Georgia;
     font-size: 12pt;
     font-weight: 600;
 }}
 QLabel[muted="true"] {{ color: {c['ash']}; }}
+QLabel[eyebrow="true"] {{
+    color: {c['accent_red']};
+    font-size: 8pt;
+    font-weight: 700;
+}}
+QLabel[displayTitle="true"] {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 28pt;
+}}
 
 QPushButton, QToolButton {{
     min-height: 28px;
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {c['ember']}, stop:1 {c['charcoal']});
-    color: {c['parchment']};
-    border: 1px solid {c['bronze']};
+    background: transparent;
+    color: {c['ash']};
+    border: 1px solid {c['divider']};
     border-radius: 0px;
     padding: 3px 12px;
-    font-weight: 600;
+    font-size: 9pt;
+    font-weight: 700;
 }}
 QPushButton:hover, QToolButton:hover {{
-    color: {c['bronze_bright']};
-    border-color: {c['bronze_bright']};
-    background-color: {c['selection']};
+    color: {c['text_bright']};
+    border-color: {c['ash']};
+    background-color: {c['surface']};
 }}
 QPushButton:pressed, QToolButton:pressed {{
-    color: {c['ink']};
-    background-color: {c['bronze_bright']};
+    color: {c['text_bright']};
+    background-color: {c['selection']};
 }}
 QPushButton:focus, QToolButton:focus {{
     outline: none;
-    border: 2px solid {c['bronze_bright']};
+    border: 1px solid {c['accent_red']};
 }}
 QPushButton:disabled, QToolButton:disabled {{
-    color: {c['ash']};
-    background-color: {c['ink']};
-    border-color: {c['charcoal']};
+    color: {c['divider']};
+    background: transparent;
+    border-color: {c['divider']};
 }}
 QPushButton#accentBtn,
 QPushButton[primaryAction="true"] {{
-    background-color: {c['bronze']};
-    color: {c['ink']};
-    border: 1px solid {c['bronze_bright']};
+    background-color: {c['accent_red']};
+    color: {c['text_bright']};
+    border: 1px solid {c['accent_red']};
 }}
 QPushButton#accentBtn:hover,
 QPushButton[primaryAction="true"]:hover {{
-    background-color: {c['bronze_bright']};
-    color: {c['ink']};
+    background-color: {c['iron_red']};
+    border-color: {c['iron_red']};
+}}
+QPushButton[primaryAction="true"]:disabled {{
+    color: {c['ash']};
+    background-color: {c['surface']};
+    border-color: {c['divider']};
 }}
 QPushButton[dangerAction="true"] {{
     background-color: {c['crimson']};
-    color: {c['parchment']};
+    color: {c['text_bright']};
     border: 1px solid {c['iron_red']};
 }}
 QPushButton[quietAction="true"] {{
@@ -251,43 +286,44 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit, QTimeEdit {{
     min-height: 28px;
     background-color: {c['ink']};
     color: {c['parchment']};
-    border: 1px solid {c['bronze']};
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
     border-radius: 0px;
     padding: 2px 7px;
     selection-background-color: {c['selection']};
-    selection-color: {c['parchment']};
+    selection-color: {c['text_bright']};
 }}
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
-    border: 2px solid {c['bronze_bright']};
+    border-bottom: 1px solid {c['accent_red']};
 }}
 QComboBox::drop-down {{
     width: 22px;
     border: 0px;
-    border-left: 1px solid {c['bronze']};
-    background-color: {c['charcoal']};
+    background-color: {c['surface']};
 }}
 QComboBox QAbstractItemView {{
-    background-color: {c['charcoal']};
+    background-color: {c['surface']};
     color: {c['parchment']};
-    border: 1px solid {c['bronze']};
+    border: 1px solid {c['divider']};
     selection-background-color: {c['selection']};
 }}
 
 QGroupBox {{
-    color: {c['bronze_bright']};
-    border: 1px solid {c['bronze']};
+    color: {c['accent_red']};
+    border: 0px;
+    border-top: 1px solid {c['divider']};
     border-radius: 0px;
-    margin-top: 14px;
-    padding: 14px 8px 8px 8px;
-    font-family: {DISPLAY_FONT};
-    font-weight: 600;
+    margin-top: 18px;
+    padding: 18px 8px 8px 8px;
+    font-size: 9pt;
+    font-weight: 700;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 8px;
-    padding: 0px 7px;
-    color: {c['bronze_bright']};
+    left: 0px;
+    padding: 0px 10px 0px 0px;
+    color: {c['accent_red']};
     background-color: {c['obsidian']};
 }}
 
@@ -296,41 +332,45 @@ QTextEdit, QPlainTextEdit {{
     background-color: {c['ink']};
     alternate-background-color: {c['obsidian']};
     color: {c['parchment']};
-    border: 1px solid {c['bronze']};
+    border: 0px;
+    border-top: 1px solid {c['divider']};
     border-radius: 0px;
-    gridline-color: {c['charcoal']};
+    gridline-color: {c['divider']};
     selection-background-color: {c['selection']};
-    selection-color: {c['parchment']};
+    selection-color: {c['text_bright']};
 }}
 QTableWidget, QTableView, QTreeWidget, QTreeView {{
-    font-family: {BODY_FONT};
     font-size: 9.5pt;
 }}
-QTableWidget::item, QTableView::item {{ padding: 3px 6px; }}
+QTableWidget::item, QTableView::item {{ padding: 4px 7px; }}
 QTreeWidget::item, QTreeView::item, QListWidget::item, QListView::item {{
-    min-height: 24px;
-    padding: 2px 5px;
+    min-height: 25px;
+    padding: 2px 6px;
+    border-left: 2px solid transparent;
+}}
+QTreeWidget::item:selected, QTreeView::item:selected,
+QListWidget::item:selected, QListView::item:selected {{
+    border-left: 2px solid {c['accent_red']};
 }}
 QTreeWidget::item:hover, QTreeView::item:hover,
 QListWidget::item:hover, QListView::item:hover {{
-    background-color: {c['charcoal']};
-    color: {c['bronze_bright']};
+    background-color: {c['surface']};
+    color: {c['text_bright']};
 }}
 QHeaderView::section {{
-    min-height: 26px;
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {c['ember']}, stop:1 {c['charcoal']});
-    color: {c['bronze_bright']};
+    min-height: 27px;
+    background-color: {c['surface']};
+    color: {c['ash']};
     border: 0px;
-    border-right: 1px solid {c['bronze']};
-    border-bottom: 1px solid {c['bronze']};
+    border-bottom: 1px solid {c['divider']};
     padding: 3px 7px;
-    font-family: {DISPLAY_FONT};
-    font-weight: 600;
+    font-size: 8.5pt;
+    font-weight: 700;
 }}
 QTableCornerButton::section {{
-    background-color: {c['ember']};
-    border: 1px solid {c['bronze']};
+    background-color: {c['surface']};
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
 }}
 
 QCheckBox, QRadioButton {{
@@ -339,80 +379,113 @@ QCheckBox, QRadioButton {{
     color: {c['parchment']};
 }}
 QCheckBox::indicator, QRadioButton::indicator {{
-    width: 15px;
-    height: 15px;
+    width: 14px;
+    height: 14px;
     background-color: {c['ink']};
-    border: 1px solid {c['bronze']};
+    border: 1px solid {c['divider']};
 }}
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-    background-color: {c['bronze_bright']};
-    border: 2px solid {c['parchment']};
+    background-color: {c['accent_red']};
+    border: 1px solid {c['accent_red']};
 }}
 
 QStatusBar#statusRail {{
-    min-height: 28px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {c['ink']}, stop:0.5 {c['charcoal']}, stop:1 {c['ink']});
+    min-height: 26px;
+    background-color: {c['ink']};
     color: {c['ash']};
-    border-top: 1px solid {c['bronze_bright']};
-    font-size: 9pt;
+    border: 0px;
+    border-top: 1px solid {c['divider']};
+    font-size: 8.5pt;
 }}
 QStatusBar#statusRail::item {{ border: 0px; }}
 
+QFrame#blackstarTimerPanel {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {c['obsidian']}, stop:0.58 {c['surface_warm']}, stop:1 {c['obsidian']});
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+}}
+QFrame#blackstarTimerBody,
+QFrame#blackstarTimerMain {{ background: transparent; border: 0px; }}
+QFrame#blackstarMetricRow {{
+    background: transparent;
+    border: 0px;
+    border-top: 1px solid {c['divider']};
+}}
+QFrame#changeRecord {{
+    background: transparent;
+    border: 0px;
+    border-left: 1px solid {c['divider']};
+}}
+QFrame#changeRecordRow {{
+    background: transparent;
+    border: 0px;
+    border-bottom: 1px solid {c['divider']};
+}}
+QFrame#blackstarStatusBlock {{
+    background: transparent;
+    border: 0px;
+    border-left: 2px solid {c['accent_red']};
+}}
+QLabel#blackstarTimerTitle {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 28pt;
+}}
+QLabel#blackstarTimerSectionTitle,
+QLabel#changeRecordTitle {{
+    color: {c['text_bright']};
+    font-family: Georgia;
+    font-size: 12pt;
+}}
+QLabel[metricBefore="true"] {{ color: {c['ash']}; font-size: 13pt; }}
+QLabel[metricAfter="true"] {{ color: {c['text_bright']}; font-size: 14pt; }}
+QLabel[recordValue="true"] {{
+    color: {c['text_bright']};
+    font-size: 9pt;
+    font-weight: 700;
+}}
+
 QProgressBar {{
-    min-height: 16px;
+    min-height: 14px;
     background-color: {c['ink']};
     color: {c['parchment']};
-    border: 1px solid {c['bronze']};
+    border: 1px solid {c['divider']};
     border-radius: 0px;
     text-align: center;
 }}
-QProgressBar::chunk {{ background-color: {c['bronze_bright']}; }}
+QProgressBar::chunk {{ background-color: {c['accent_red']}; }}
 
-QSplitter::handle, QMainWindow::separator {{ background-color: {c['bronze']}; }}
-QSplitter::handle:horizontal {{ width: 3px; }}
-QSplitter::handle:vertical {{ height: 3px; }}
-QSplitter::handle:hover, QMainWindow::separator:hover {{
-    background-color: {c['bronze_bright']};
-}}
-QDockWidget {{
-    color: {c['parchment']};
-    border: 1px solid {c['bronze']};
-}}
+QSplitter::handle, QMainWindow::separator {{ background-color: {c['divider']}; }}
+QSplitter::handle:horizontal {{ width: 2px; }}
+QSplitter::handle:vertical {{ height: 2px; }}
+QSplitter::handle:hover, QMainWindow::separator:hover {{ background-color: {c['accent_red']}; }}
+QDockWidget {{ color: {c['parchment']}; border: 0px; }}
 QDockWidget::title {{
     min-height: 26px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {c['ember']}, stop:1 {c['charcoal']});
-    color: {c['bronze_bright']};
-    border-bottom: 1px solid {c['bronze_bright']};
+    background-color: {c['surface']};
+    color: {c['text_bright']};
+    border-bottom: 1px solid {c['divider']};
     padding: 4px 8px;
-    font-family: {DISPLAY_FONT};
+    font-family: Georgia;
     font-weight: 600;
 }}
 
-QScrollBar:vertical {{
-    width: 12px;
-    margin: 0px;
-    background-color: {c['ink']};
-}}
-QScrollBar:horizontal {{
-    height: 12px;
-    margin: 0px;
-    background-color: {c['ink']};
-}}
+QScrollBar:vertical {{ width: 10px; margin: 0px; background-color: {c['ink']}; }}
+QScrollBar:horizontal {{ height: 10px; margin: 0px; background-color: {c['ink']}; }}
 QScrollBar::handle {{
     min-height: 28px;
     min-width: 28px;
-    background-color: {c['bronze']};
+    background-color: {c['divider']};
     border-radius: 0px;
 }}
-QScrollBar::handle:hover {{ background-color: {c['bronze_bright']}; }}
+QScrollBar::handle:hover {{ background-color: {c['ash']}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0px; height: 0px; }}
 
 QToolTip {{
-    background-color: {c['charcoal']};
-    color: {c['parchment']};
-    border: 1px solid {c['bronze_bright']};
+    background-color: {c['surface']};
+    color: {c['text_bright']};
+    border: 1px solid {c['divider']};
     padding: 5px;
 }}
 """
@@ -454,3 +527,46 @@ def apply_crimson_theme(
         app.setFont(font)
         app.setStyleSheet(stylesheet)
     return stylesheet
+
+
+def install_crimson_shell(tab_widget, *, product: str, action_widget=None):
+    """Install the branded corners used by both primary navigation bars."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+
+    brand = QWidget(tab_widget)
+    brand.setObjectName("brandBlock")
+    brand_layout = QHBoxLayout(brand)
+    brand_layout.setContentsMargins(18, 4, 18, 4)
+    brand_layout.setSpacing(0)
+    brand_mark = QLabel(
+        '<span style="color:#B63A32">CRIMSON</span> DESERT /<br>TOOLS',
+        brand,
+    )
+    brand_mark.setObjectName("brandMark")
+    brand_mark.setTextFormat(Qt.RichText)
+    brand_mark.setAccessibleName("Crimson Desert Tools")
+    brand_layout.addWidget(brand_mark)
+    tab_widget.setCornerWidget(brand, Qt.TopLeftCorner)
+
+    identity = QWidget(tab_widget)
+    identity.setObjectName("shellIdentity")
+    identity_layout = QHBoxLayout(identity)
+    identity_layout.setContentsMargins(12, 3, 12, 3)
+    identity_layout.setSpacing(10)
+    labels = QVBoxLayout()
+    labels.setContentsMargins(0, 0, 0, 0)
+    labels.setSpacing(0)
+    product_label = QLabel(product.upper(), identity)
+    product_label.setObjectName("shellProduct")
+    product_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    detail_label = QLabel("CRIMSON DESERT TOOLS", identity)
+    detail_label.setObjectName("shellDetail")
+    detail_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    labels.addWidget(product_label)
+    labels.addWidget(detail_label)
+    identity_layout.addLayout(labels)
+    if action_widget is not None:
+        identity_layout.addWidget(action_widget)
+    tab_widget.setCornerWidget(identity, Qt.TopRightCorner)
+    return brand, identity
