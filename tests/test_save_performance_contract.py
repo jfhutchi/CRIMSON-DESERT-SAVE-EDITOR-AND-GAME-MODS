@@ -5,6 +5,7 @@ import json
 import struct
 from dataclasses import asdict
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -13,6 +14,7 @@ import save_parser
 from save_compat import (
     REQUIRED_TYPES,
     SaveSchemaIdentity,
+    _type_signature,
     compute_schema_identity,
     extract_required_list_encodings,
 )
@@ -55,22 +57,50 @@ def _legacy_schema_identity(blob: bytes, raw_header: bytes) -> SaveSchemaIdentit
 SAVE_FIXTURES = tuple(sorted(FIXTURES.glob("**/save.save")))
 
 
-def test_schema_identity_decodes_only_required_root_objects(
+def test_type_signature_accepts_both_parser_type_definitions() -> None:
+    type_def_hint = get_type_hints(_type_signature)["type_def"]
+
+    assert set(get_args(type_def_hint)) == {
+        parc_serializer.TypeDef,
+        save_parser.TypeDef,
+    }
+
+
+def test_schema_identity_parses_once_and_decodes_only_required_root_objects(
     copied_save: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     save = load_save_file(str(copied_save))
+    call_counts = {"parse_schema": 0, "parse_toc": 0, "decode_object_blocks": 0}
     decoded_entry_classes: list[tuple[str, ...]] = []
+    original_parse_schema = save_parser.parse_schema
+    original_parse_toc = save_parser.parse_toc
     original_decode = save_parser.decode_object_blocks
 
+    def count_parse_schema(raw):
+        call_counts["parse_schema"] += 1
+        return original_parse_schema(raw)
+
+    def count_parse_toc(raw, schema_end, type_names):
+        call_counts["parse_toc"] += 1
+        return original_parse_toc(raw, schema_end, type_names)
+
     def record_decoded_entries(raw, toc_entries, types):
+        call_counts["decode_object_blocks"] += 1
         decoded_entry_classes.append(tuple(entry.class_name for entry in toc_entries))
         return original_decode(raw, toc_entries, types)
 
+    monkeypatch.setattr(save_parser, "parse_schema", count_parse_schema)
+    monkeypatch.setattr(save_parser, "parse_toc", count_parse_toc)
     monkeypatch.setattr(save_parser, "decode_object_blocks", record_decoded_entries)
 
     compute_schema_identity(bytes(save.decompressed_blob), save.raw_header)
 
+    assert call_counts == {
+        "parse_schema": 1,
+        "parse_toc": 1,
+        "decode_object_blocks": 1,
+    }
     assert decoded_entry_classes
     assert set().union(*map(set, decoded_entry_classes)) == IDENTITY_OBJECT_CLASSES
     assert all(
@@ -78,6 +108,27 @@ def test_schema_identity_decodes_only_required_root_objects(
         for decoded_batch in decoded_entry_classes
         for class_name in decoded_batch
     )
+
+
+def test_selective_layout_result_retains_full_toc(copied_save: Path) -> None:
+    save = load_save_file(str(copied_save))
+    raw = bytes(save.decompressed_blob)
+    schema = save_parser.parse_schema(raw)
+    type_names = [type_def.name for type_def in schema["types"]]
+    toc = save_parser.parse_toc(raw, schema["schema_end"], type_names)
+
+    result = save_parser.build_result_from_layout(
+        raw,
+        {"input_kind": "raw_blob"},
+        schema,
+        toc,
+        object_class_names=IDENTITY_OBJECT_CLASSES,
+    )
+
+    assert result["toc"]["entries"] == toc["entries"]
+    assert result["toc"]["entry_count"] == toc["toc_count"]
+    assert len(result["toc"]["entries"]) > len(result["objects"])
+    assert {obj.class_name for obj in result["objects"]} == IDENTITY_OBJECT_CLASSES
 
 
 @pytest.mark.parametrize(

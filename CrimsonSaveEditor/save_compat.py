@@ -43,7 +43,9 @@ class UnknownSaveSchemaError(ValueError):
     pass
 
 
-def _type_signature(type_def: parc_serializer.TypeDef) -> str:
+def _type_signature(
+    type_def: parc_serializer.TypeDef | save_parser.TypeDef,
+) -> str:
     payload = [
         [field.name, field.type_name, field.meta_kind, field.meta_size, field.meta_aux]
         for field in type_def.fields
