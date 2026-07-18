@@ -6,9 +6,11 @@ CrimsonGameMods/dist/
 CrimsonGameMods/testing/
 CrimsonSaveEditor/build/
 CrimsonSaveEditor/dist/
+CrimsonSaveEditor/icons_local/
 CrimsonSaveEditor/*.spec.bak
 CrimsonSaveEditor/__pycache__/
 CrimsonGameMods/__pycache__/
+CrimsonGameMods/icons_local/
 .venv/
 .pytest_cache/
 .venv_linux/

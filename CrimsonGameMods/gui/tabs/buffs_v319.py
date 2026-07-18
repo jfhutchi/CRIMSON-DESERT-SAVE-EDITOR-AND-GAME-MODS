@@ -158,6 +158,7 @@ class ItemBuffsTab(QWidget):
         self._buff_icons_enabled = True
         self._buff_modified = False
         self._buff_item_limits = {}
+        self._buff_population_job = None
         self._experimental_mode: bool = bool(self._config.get("experimental_mode", False))
         self._favorite_items: List[dict] = self._config.setdefault("favorite_items", [])
         self._copy_buffer: dict = {}
@@ -317,7 +318,15 @@ class ItemBuffsTab(QWidget):
         return True
 
 
-    def load(self, save_data: SaveData, items: List[SaveItem]) -> None:
+    def load(
+        self,
+        save_data: SaveData,
+        items: List[SaveItem],
+        *,
+        completed: Optional[Callable[[], None]] = None,
+        failed: Optional[Callable[[str, str], None]] = None,
+        progress: Optional[Callable[[str, int], None]] = None,
+    ) -> None:
         self._save_data = save_data
         self._items = items if items is not None else []
 
@@ -326,11 +335,25 @@ class ItemBuffsTab(QWidget):
         if (items and buf_data is not None and buf_items
                 and hasattr(self, "_buff_items_table")):
             try:
-                self._buff_show_my_inventory(silent=True)
-            except Exception:
-                pass
+                self._buff_show_my_inventory(
+                    silent=True,
+                    completed=completed,
+                    failed=failed,
+                    progress=progress,
+                )
+                return
+            except Exception as exc:
+                if failed is not None:
+                    failed(str(exc), traceback.format_exc())
+                    return
+                raise
+        if completed is not None:
+            completed()
 
     def unload(self) -> None:
+        if self._buff_population_job is not None and self._buff_population_job.is_running:
+            self._buff_population_job.cancel()
+        self._buff_population_job = None
         self._save_data = None
         self._items = []
 
@@ -3483,16 +3506,32 @@ class ItemBuffsTab(QWidget):
             QMessageBox.critical(self, "Extraction Failed", str(e))
 
 
-    def _buff_show_my_inventory(self, silent: bool = False) -> None:
+    def _buff_show_my_inventory(
+        self,
+        silent: bool = False,
+        *,
+        completed: Optional[Callable[[], None]] = None,
+        failed: Optional[Callable[[str, str], None]] = None,
+        progress: Optional[Callable[[str, int], None]] = None,
+    ) -> None:
+        from crimson_common.gui_population import IncrementalGuiJob
+
+        def _complete_empty() -> None:
+            if completed is not None:
+                completed()
+
         if self._buff_data is None:
             if silent:
+                _complete_empty()
                 return
             self._buff_extract_iteminfo(use_structural=False)
             if self._buff_data is None:
+                _complete_empty()
                 return
 
         if not self._items:
             if silent:
+                _complete_empty()
                 return
             if not self._buff_icons_enabled:
                 try:
@@ -3501,6 +3540,7 @@ class ItemBuffsTab(QWidget):
                     pass
             self.status_message.emit("Pick a save slot in the Save Browser, then click 'My Inventory' again.")
             self.open_save_browser_requested.emit()
+            _complete_empty()
             return
 
         save_keys = set(it.item_key for it in self._items if it.item_key > 0)
@@ -3514,16 +3554,18 @@ class ItemBuffsTab(QWidget):
         if not results:
             if silent:
                 self.status_message.emit("No inventory items matched iteminfo database.")
+                _complete_empty()
                 return
             QMessageBox.information(self, "No Matches",
                                     "No inventory items found in iteminfo database.")
+            _complete_empty()
             return
 
         table = self._buff_items_table
         table.setSortingEnabled(False)
         table.setRowCount(len(results))
 
-        for row, item in enumerate(results):
+        def _write_row(row: int, item) -> None:
             icon_cell = QTableWidgetItem()
             if self._buff_icons_enabled:
                 px = self._icon_cache.get_pixmap(item.item_key)
@@ -3554,11 +3596,47 @@ class ItemBuffsTab(QWidget):
             table.setItem(row, 2, QTableWidgetItem(type_str))
             table.setItem(row, 3, QTableWidgetItem(str(limits.get('stackLimit', '?'))))
 
-        table.setSortingEnabled(True)
-        self._buff_status_label.setText(
-            f"Showing {len(results)} items from your inventory that exist in iteminfo "
-            f"(out of {len(save_keys)} save items, {len(iteminfo_keys)} iteminfo records)"
+        def _done() -> None:
+            table.setSortingEnabled(True)
+            self._buff_population_job = None
+            self._buff_status_label.setText(
+                f"Showing {len(results)} items from your inventory that exist in iteminfo "
+                f"(out of {len(save_keys)} save items, {len(iteminfo_keys)} iteminfo records)"
+            )
+            if completed is not None:
+                completed()
+
+        def _failed(message: str, details: str) -> None:
+            table.setSortingEnabled(True)
+            self._buff_population_job = None
+            log.error("ItemBuff inventory population failed: %s\n%s", message, details)
+            if failed is not None:
+                failed(message, details)
+            else:
+                self._buff_status_label.setText(f"Inventory display failed: {message}")
+
+        previous = self._buff_population_job
+        if previous is not None and previous.is_running:
+            previous.cancel()
+        job = IncrementalGuiJob(
+            self,
+            items=results,
+            consume=_write_row,
+            batch_size=64,
+            time_budget_ms=8,
         )
+        self._buff_population_job = job
+        job.progress.connect(
+            lambda done, total: progress(
+                f"Populating Item Buff inventory ({done:,}/{total:,})...",
+                97 + int((done / max(1, total)) * 2),
+            )
+            if progress is not None
+            else None
+        )
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.start()
 
 
     def _buff_search_items(self) -> None:

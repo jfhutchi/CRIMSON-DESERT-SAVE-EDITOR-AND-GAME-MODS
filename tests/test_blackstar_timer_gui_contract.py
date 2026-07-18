@@ -84,6 +84,17 @@ def test_game_mods_exposes_game_patches_as_a_visible_tab() -> None:
         encoding="utf-8"
     )
     assert 'self._mods_tabs.addTab(self._patches_tab, "Game Patches")' in source
+    assert "self._patches_tab.set_shell_mode(True)" in source
+    assert '"Blackstar",\n            self._mods_tabs,\n            "Game Patches"' in source
+
+
+def test_game_patches_shell_mode_removes_duplicate_path_and_warning_chrome() -> None:
+    source = (
+        ROOT / "CrimsonGameMods" / "gui" / "tabs" / "patches.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def set_shell_mode" in source
+    assert "_shell_redundant_widgets" in source
 
 
 def test_timer_panel_runs_archive_operations_on_qthread() -> None:

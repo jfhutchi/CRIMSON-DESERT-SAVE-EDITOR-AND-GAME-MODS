@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Callable, Iterable, Sequence
 
 from PySide6.QtCore import QSize, Qt
@@ -25,6 +26,62 @@ from PySide6.QtWidgets import (
 )
 
 from .crimson_icons import game_art_icon, inferred_symbol, symbol_icon
+
+
+_BRIGHT_BUTTON_BACKGROUND = re.compile(
+    r"background(?:-color)?\s*:\s*(?:#[0-9a-f]{3,8}|rgba?\s*\()",
+    re.IGNORECASE,
+)
+_PRIMARY_ACTION_TEXT = (
+    "apply to game",
+    "apply preset",
+    "save edit",
+    "save changes",
+    "write save",
+)
+_DANGER_ACTION_TEXT = ("delete", "remove", "wipe", "destroy")
+_LEGACY_ACTION_LABELS = {
+    "transmog (armor / weapon visual swap)": "Transmog",
+    "create custom item": "Create Item",
+    "add custom item to save": "Add to Save",
+    "import mod folder": "Import",
+    "export as field json v3": "Export Field JSON",
+}
+
+
+def normalize_legacy_button_styles(root: QWidget) -> None:
+    """Fold legacy rainbow button palettes into the shared action hierarchy."""
+    for button in root.findChildren(QAbstractButton):
+        if button.objectName() in {
+            "destinationButton",
+            "routeButton",
+            "shellUtilityButton",
+        }:
+            continue
+        style = button.styleSheet()
+        legacy_accent = button.objectName() == "accentBtn"
+        if not legacy_accent and not _BRIGHT_BUTTON_BACKGROUND.search(style):
+            continue
+
+        label = button.text().strip().casefold()
+        for legacy_label, concise_label in _LEGACY_ACTION_LABELS.items():
+            if legacy_label in label:
+                button.setText(concise_label)
+                label = concise_label.casefold()
+                break
+        button.setStyleSheet("")
+        if legacy_accent:
+            button.setObjectName("legacyAction")
+        if any(token in label for token in _DANGER_ACTION_TEXT):
+            button.setProperty("dangerAction", True)
+        elif any(token in label for token in _PRIMARY_ACTION_TEXT):
+            button.setProperty("primaryAction", True)
+        else:
+            button.setProperty("quietAction", True)
+        button.setProperty("legacyChromeNormalized", True)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.update()
 
 
 @dataclass(frozen=True)
@@ -508,6 +565,7 @@ def install_crimson_application_shell(
     """Replace legacy window chrome while preserving every existing page widget."""
 
     old_central = main_window.centralWidget()
+    normalize_legacy_button_styles(router_tabs)
     shell = CrimsonApplicationShell(
         product=product,
         router_tabs=router_tabs,

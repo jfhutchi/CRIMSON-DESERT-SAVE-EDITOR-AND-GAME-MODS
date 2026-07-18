@@ -69,14 +69,30 @@ class GamePatchesTab(QWidget):
         self.game_path_changed.emit(path)
 
     def set_experimental_mode(self, enabled: bool) -> None:
+        self._experimental_mode = bool(enabled)
         if hasattr(self, '_dev_export_btn_skill'):
             self._dev_export_btn_skill.setVisible(bool(enabled))
+        if hasattr(self, '_storage_grp'):
+            self._storage_grp.setVisible(
+                bool(enabled) or not getattr(self, '_shell_mode', False)
+            )
+        if hasattr(self, '_ride_grp'):
+            self._ride_grp.setVisible(bool(enabled))
+
+    def set_shell_mode(self, enabled: bool) -> None:
+        """Hide controls already represented by the application shell."""
+        self._shell_mode = bool(enabled)
+        for widget in getattr(self, '_shell_redundant_widgets', ()):
+            widget.setVisible(not enabled)
+        if hasattr(self, '_storage_grp'):
+            self._storage_grp.setVisible(self._experimental_mode or not enabled)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        layout.addWidget(make_scope_label("game"))
+        scope_label = make_scope_label("game")
+        layout.addWidget(scope_label)
 
         warning = QLabel(
             "EXPERIMENTAL — Use at your own risk. "
@@ -92,11 +108,13 @@ class GamePatchesTab(QWidget):
         )
         help_row = QHBoxLayout()
         help_row.addWidget(warning, 1)
-        help_row.addWidget(make_help_btn("gpatch", self._show_guide_fn))
+        help_button = make_help_btn("gpatch", self._show_guide_fn)
+        help_row.addWidget(help_button)
         layout.addLayout(help_row)
 
         path_row = QHBoxLayout()
-        path_row.addWidget(QLabel(tr("Game Install Path:")))
+        path_label = QLabel(tr("Game Install Path:"))
+        path_row.addWidget(path_label)
 
         self._paz_game_path = QLineEdit()
         self._paz_game_path.setPlaceholderText(tr("Auto-detect or browse..."))
@@ -113,6 +131,15 @@ class GamePatchesTab(QWidget):
         path_row.addWidget(detect_btn)
 
         layout.addLayout(path_row)
+        self._shell_redundant_widgets = (
+            scope_label,
+            warning,
+            help_button,
+            path_label,
+            self._paz_game_path,
+            browse_btn,
+            detect_btn,
+        )
 
         self._blackstar_timer_panel = BlackstarTimerPanel(
             title="Blackstar Timer", parent=self
@@ -159,6 +186,7 @@ class GamePatchesTab(QWidget):
         storage_check_btn.setVisible(self._experimental_mode)
         storage_btn_row.addWidget(storage_check_btn)
         self._storage_check_btn = storage_check_btn
+        self._storage_grp = storage_grp
 
         self._storage_status = QLabel("")
         self._storage_status.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 4px;")

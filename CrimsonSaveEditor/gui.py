@@ -11,7 +11,7 @@ import sys
 import traceback
 
 log = logging.getLogger(__name__)
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
@@ -2506,9 +2506,14 @@ class MainWindow(QMainWindow):
         self._blackstar_dry_run_active = True
         self._load_thread = None
         self._load_worker = None
+        self._load_handle = None
         self._load_progress = None
+        self._load_population_pending = False
+        self._inventory_population_job = None
+        self._equipment_population_job = None
         self._parc_thread = None
         self._parc_worker = None
+        self._parc_handle = None
         self._parc_status: str = ""
         self._config: dict = self._load_config()
 
@@ -7787,7 +7792,7 @@ QCheckBox::indicator {{
         # Lead the mount workspace with the focused Blackstar surface from the
         # approved mockup; the legacy roster and experimental tools remain
         # available below in the scrollable page.
-        layout.insertWidget(1, self._blackstar_timer_panel)
+        layout.insertWidget(0, self._blackstar_timer_panel)
 
         mount_grp = QGroupBox("Unlock Mounts (Experimental)")
         mount_grid = QGridLayout(mount_grp)
@@ -15953,108 +15958,179 @@ QCheckBox::indicator {{
         return export_dir
 
     def _export_mod_json(self) -> None:
-        try:
+        from crimson_common.gui_task_worker import start_gui_task
+
+        active = getattr(self, "_mod_export_handle", None)
+        if active is not None and active.is_running:
+            self._update_status("A game-mod export is already running")
+            return
+
+        export_dir = self._get_export_dir()
+        path = os.path.join(export_dir, "crimson_save_editor_patch.json")
+
+        def _task(report):
             from mod_export import ModExporter
             from paz_patcher import PazPatchManager
+
+            report("Locating the game installation...", 5)
             game_path = PazPatchManager.find_game_path()
             if not game_path:
-                QMessageBox.warning(self, "Export", "Game installation not found.")
-                return
-
+                raise RuntimeError("Game installation not found.")
             exporter = ModExporter(game_path)
             summary = exporter.get_summary()
             if "No modifications" in summary:
-                QMessageBox.information(self, "Export", summary)
-                return
+                return "empty", summary, path, ""
+            report("Exporting Nexus JSON...", 15)
+            ok, message = exporter.export_nexus_json(
+                path,
+                lambda value: report(str(value), 55),
+            )
+            if not ok:
+                return "failed", message, path, ""
+            report("Verifying exported JSON...", 90)
+            verified, verification = exporter.verify_nexus_json(path)
+            if not verified:
+                return "failed", message, path, verification
+            return "complete", message, path, verification
 
-            export_dir = self._get_export_dir()
-            path = os.path.join(export_dir, "crimson_save_editor_patch.json")
+        def _progress(message: str, _value: int) -> None:
+            if hasattr(self, "_export_status"):
+                self._export_status.setText(message)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
 
-            self._export_status.setText("EXPORTING JSON — DO NOT CLOSE. This may take a few minutes...")
-            self._export_status.setStyleSheet(f"color: {COLORS['error']}; font-weight: bold; font-size: 13px; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("EXPORTING JSON — DO NOT CLOSE")
-            QApplication.processEvents()
-
-            ok, msg = exporter.export_nexus_json(path, lambda s: (
-                self._export_status.setText(s), QApplication.processEvents()
-            ))
-
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("Export complete")
-            if ok:
-                ok_v, msg_v = exporter.verify_nexus_json(path)
-                self._export_status.setText(msg)
-                QMessageBox.information(self, "Export Complete",
-                    f"{msg}\n\nVerification: {msg_v}\n\nSaved to:\n{path}")
+        def _completed(result) -> None:
+            state, message, output_path, verification = result
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText(message)
+            if state == "empty":
+                QMessageBox.information(self, "Export", message)
+            elif state == "complete":
+                if hasattr(self, "_center_status"):
+                    self._center_status.setText("Export complete")
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"{message}\n\nVerification: {verification}\n\nSaved to:\n{output_path}",
+                )
             else:
-                self._export_status.setText(msg)
-                QMessageBox.warning(self, "Export Failed", msg)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            QMessageBox.critical(self, "Export Error", str(e))
+                QMessageBox.warning(
+                    self,
+                    "Export Failed",
+                    f"{message}\n\nVerification: {verification}" if verification else message,
+                )
+
+        def _failed(message: str, details: str) -> None:
+            log.error("Nexus JSON export failed: %s\n%s", message, details)
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText("Export failed")
+            QMessageBox.critical(self, "Export Error", message)
+
+        def _finished() -> None:
+            self._mod_export_handle = None
+
+        _progress("Preparing JSON export...", 0)
+        self._mod_export_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            progress=_progress,
+            finished=_finished,
+        )
 
     def _export_mod_zip(self) -> None:
-        try:
+        from crimson_common.gui_task_worker import start_gui_task
+
+        active = getattr(self, "_mod_export_handle", None)
+        if active is not None and active.is_running:
+            self._update_status("A game-mod export is already running")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Export CDUMM ZIP",
+            "This exports your game-file modifications as a ZIP compatible with "
+            "CrimsonDesert Ultimate Mods Manager.\n\n"
+            "Packaging the PAZ archive can take 5-10 minutes. The export now runs "
+            "in the background, so the interface remains responsive. Do not close "
+            "the application until it reports completion.\n\n"
+            "The ZIP will be saved to the Exports folder next to the executable.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        export_dir = self._get_export_dir()
+        path = os.path.join(export_dir, "CrimsonSaveEditor_Patches.zip")
+
+        def _task(report):
             from mod_export import ModExporter
             from paz_patcher import PazPatchManager
+
+            report("Locating the game installation...", 5)
             game_path = PazPatchManager.find_game_path()
             if not game_path:
-                QMessageBox.warning(self, "Export", "Game installation not found.")
-                return
-
+                raise RuntimeError("Game installation not found.")
             exporter = ModExporter(game_path)
             summary = exporter.get_summary()
             if "No modifications" in summary:
-                QMessageBox.information(self, "Export", summary)
-                return
-
-            reply = QMessageBox.question(
-                self, "Export CDUMM ZIP",
-                "This exports your game file modifications as a ZIP\n"
-                "compatible with CrimsonDesert Ultimate Mods Manager.\n\n"
-                "WARNING: This takes 5-10 MINUTES and the window\n"
-                "WILL FREEZE during export (packaging ~250MB+ PAZ file).\n"
-                "DO NOT CLOSE the program while exporting.\n\n"
-                "The ZIP will be saved to the Exports folder next to the exe.\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                return "empty", summary, path
+            report("Packaging CDUMM archive...", 15)
+            ok, message = exporter.export_cdumm_zip(
+                path,
+                mod_name="CrimsonSaveEditor Patches",
+                progress_callback=lambda value: report(str(value), 55),
             )
-            if reply != QMessageBox.Yes:
-                return
+            return ("complete" if ok else "failed"), message, path
 
-            export_dir = self._get_export_dir()
-            path = os.path.join(export_dir, "CrimsonSaveEditor_Patches.zip")
+        def _progress(message: str, _value: int) -> None:
+            if hasattr(self, "_export_status"):
+                self._export_status.setText(message)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
 
-            self._export_status.setText("EXPORTING — DO NOT CLOSE. This takes 5-10 minutes...")
-            self._export_status.setStyleSheet(f"color: {COLORS['error']}; font-weight: bold; font-size: 13px; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("EXPORTING ZIP — DO NOT CLOSE (5-10 minutes)")
-            QApplication.processEvents()
-
-            ok, msg = exporter.export_cdumm_zip(
-                path, mod_name="CrimsonSaveEditor Patches",
-                progress_callback=lambda s: (
-                    self._export_status.setText(s), QApplication.processEvents()
+        def _completed(result) -> None:
+            state, message, output_path = result
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText(message)
+            if state == "empty":
+                QMessageBox.information(self, "Export", message)
+            elif state == "complete":
+                if hasattr(self, "_center_status"):
+                    self._center_status.setText("Export complete")
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"{message}\n\nSaved to:\n{output_path}\n\nDrag this ZIP into CDUMM to import.",
                 )
-            )
-
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            self._export_status.setText(msg)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("Export complete")
-            if ok:
-                QMessageBox.information(self, "Export Complete",
-                    f"{msg}\n\nSaved to:\n{path}\n\n"
-                    f"Drag this ZIP into CDUMM to import.")
             else:
-                QMessageBox.warning(self, "Export Failed", msg)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            QMessageBox.critical(self, "Export Error", str(e))
+                QMessageBox.warning(self, "Export Failed", message)
+
+        def _failed(message: str, details: str) -> None:
+            log.error("CDUMM ZIP export failed: %s\n%s", message, details)
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText("Export failed")
+            QMessageBox.critical(self, "Export Error", message)
+
+        def _finished() -> None:
+            self._mod_export_handle = None
+
+        _progress("Preparing CDUMM export...", 0)
+        self._mod_export_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            progress=_progress,
+            finished=_finished,
+        )
 
 
     def _cmod_get_loader(self):
@@ -31594,13 +31670,16 @@ QCheckBox::indicator {{
 
     def _load_save(self, path: str) -> None:
         self._blackstar_preview_token = None
-        if self._load_thread is not None:
+        if (
+            (self._load_handle is not None and self._load_handle.is_running)
+            or self._load_population_pending
+        ):
             self._update_status("A save is already loading")
             return
-        if self._parc_worker is not None:
-            self._parc_worker.request_cancel()
+        if self._parc_handle is not None:
+            self._parc_handle.cancel()
 
-        from crimson_common.gui_task_worker import GuiTaskWorker
+        from crimson_common.gui_task_worker import start_gui_task
 
         progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Loading")
@@ -31622,11 +31701,6 @@ QCheckBox::indicator {{
             report("Preparing the editor...", 95)
             return save_data, items, pristine
 
-        thread = QThread(self)
-        worker = GuiTaskWorker(task=_task)
-        worker.moveToThread(thread)
-        self._load_thread = thread
-        self._load_worker = worker
         self._load_progress = progress
         self._set_load_busy(True)
 
@@ -31635,6 +31709,22 @@ QCheckBox::indicator {{
             progress.setValue(value)
             if hasattr(self, "_center_status"):
                 self._center_status.setText(message)
+
+        def _release_load_ui() -> None:
+            self._load_population_pending = False
+            if self._load_progress is progress:
+                progress.close()
+                self._load_progress = None
+            self._set_load_busy(False)
+
+        def _population_failed(message: str, details: str) -> None:
+            log.error("Editor population failed: %s\n%s", message, details)
+            _release_load_ui()
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"The save was loaded, but the editor could not be populated:\n\n{message}\n\n{details}",
+            )
 
         def _on_completed(result) -> None:
             save_data, items, pristine = result
@@ -31648,36 +31738,50 @@ QCheckBox::indicator {{
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            progress.setLabelText("Populating the editor...")
-            progress.setValue(98)
-            self._populate_scanned_items()
+            def _finish_population() -> None:
+                try:
+                    slot_dir = os.path.basename(os.path.dirname(path))
+                    friendly = self._friendly_slot_name(slot_dir)
+                    self._config["last_save_path"] = path
+                    self._config["last_slot"] = friendly
+                    self._save_config()
+                    self._refresh_sidebar()
 
-            slot_dir = os.path.basename(os.path.dirname(path))
-            friendly = self._friendly_slot_name(slot_dir)
-            self._config["last_save_path"] = path
-            self._config["last_slot"] = friendly
-            self._save_config()
-            self._refresh_sidebar()
+                    self._update_schema_write_controls()
+                    schema_notice = ""
+                    if self._save_data.is_schema_supported:
+                        self._quick_save_btn.setToolTip(f"Save to: {path}")
+                    else:
+                        schema_sha256 = self._save_data.schema_identity.schema_sha256
+                        log.warning(
+                            "Loaded unknown full save schema %s read-only; General Save disabled; "
+                            "Blackstar Preview uses its own compatibility check.",
+                            schema_sha256,
+                        )
+                        schema_notice = (
+                            " | General Save disabled (unknown full schema); "
+                            "Blackstar Preview uses its own compatibility check"
+                        )
 
-            self._update_schema_write_controls()
-            schema_notice = ""
-            if self._save_data.is_schema_supported:
-                self._quick_save_btn.setToolTip(f"Save to: {path}")
-            else:
-                schema_sha256 = self._save_data.schema_identity.schema_sha256
-                log.warning(
-                    "Loaded unknown full save schema %s read-only; General Save disabled; "
-                    "Blackstar Preview uses its own compatibility check.",
-                    schema_sha256,
+                    self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
+                    progress.setValue(100)
+                    self._update_status(f"Loaded: {friendly} ({slot_dir}){schema_notice}")
+                except Exception as exc:
+                    _population_failed(str(exc), traceback.format_exc())
+                    return
+                _release_load_ui()
+
+            progress.setCancelButton(None)
+            self._load_population_pending = True
+            try:
+                self._populate_scanned_items(
+                    incremental=True,
+                    progress=_on_progress,
+                    completed=_finish_population,
+                    failed=_population_failed,
                 )
-                schema_notice = (
-                    " | General Save disabled (unknown full schema); "
-                    "Blackstar Preview uses its own compatibility check"
-                )
-
-            self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
-            progress.setValue(100)
-            self._update_status(f"Loaded: {friendly} ({slot_dir}){schema_notice}")
+            except Exception as exc:
+                _population_failed(str(exc), traceback.format_exc())
 
         def _on_failed(message: str, details: str) -> None:
             hint = ""
@@ -31696,25 +31800,22 @@ QCheckBox::indicator {{
         def _on_cancelled() -> None:
             self._update_status("Save loading cancelled; no save was changed")
 
-        def _cleanup() -> None:
-            progress.close()
-            self._load_progress = None
-            self._load_worker = None
-            self._load_thread = None
-            self._set_load_busy(False)
+        def _background_finished() -> None:
+            self._load_handle = None
+            if not self._load_population_pending:
+                _release_load_ui()
 
-        worker.progress.connect(_on_progress, Qt.QueuedConnection)
-        worker.completed.connect(_on_completed, Qt.QueuedConnection)
-        worker.failed.connect(_on_failed, Qt.QueuedConnection)
-        worker.cancelled.connect(_on_cancelled, Qt.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(_cleanup)
-        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
-        thread.started.connect(worker.run)
         progress.show()
-        thread.start()
+        self._load_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            cancelled=_on_cancelled,
+            finished=_background_finished,
+        )
+        progress.canceled.connect(self._load_handle.cancel)
 
     def _set_load_busy(self, busy: bool) -> None:
         for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
@@ -31844,25 +31945,119 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
-        self._populate_scanned_items()
+        self._populate_scanned_items(incremental=True)
 
-    def _populate_scanned_items(self) -> None:
-        self._status_parc_label.setText("Loading... (PARC enriching in background)")
-        self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
-        self._populate_inventory()
-        self._populate_equipment()
-        self._populate_socket_items()
+    def _populate_scanned_items(
+        self,
+        *,
+        incremental: bool = False,
+        schedule_enrichment: bool = True,
+        progress: Callable[[str, int], None] | None = None,
+        completed: Callable[[], None] | None = None,
+        failed: Callable[[str, str], None] | None = None,
+    ) -> None:
+        if schedule_enrichment:
+            self._status_parc_label.setText("Loading... (PARC enriching in background)")
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
+        if not incremental:
+            self._populate_inventory()
+            self._populate_equipment()
+            self._populate_socket_items()
+            self._inv_count_label.setText(str(len(self._items)))
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+            return
 
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._deferred_parc_enrich)
+        from crimson_common.gui_population import IncrementalGuiJob
+
+        inventory = self._filtered_inventory_items()
+        inventory_table = self._inv_table
+        inventory_table.setSortingEnabled(False)
+        inventory_table.setRowCount(0)
+        inventory_table.setRowCount(len(inventory))
+
+        def _fail(message: str, details: str) -> None:
+            inventory_table.setSortingEnabled(True)
+            self._equip_table.setSortingEnabled(True)
+            self._inventory_population_job = None
+            self._equipment_population_job = None
+            if failed is not None:
+                failed(message, details)
+            else:
+                log.error("Incremental editor population failed: %s\n%s", message, details)
+
+        def _equipment_done() -> None:
+            self._equip_table.setSortingEnabled(True)
+            self._equipment_population_job = None
+            try:
+                if progress is not None:
+                    progress("Preparing sockets and editor controls...", 99)
+                self._populate_socket_items()
+                self._inv_count_label.setText(str(len(self._items)))
+                if schedule_enrichment:
+                    QTimer.singleShot(100, self._deferred_parc_enrich)
+                if completed is not None:
+                    completed()
+            except Exception as exc:
+                _fail(str(exc), traceback.format_exc())
+
+        def _inventory_done() -> None:
+            inventory_table.setSortingEnabled(True)
+            self._inventory_population_job = None
+            equipment = self._filtered_equipment_items()
+            equipment_table = self._equip_table
+            equipment_table.setSortingEnabled(False)
+            equipment_table.setRowCount(0)
+            equipment_table.setRowCount(len(equipment))
+            job = IncrementalGuiJob(
+                self,
+                items=equipment,
+                consume=lambda row, item: self._write_equipment_row(row, item),
+                batch_size=72,
+                time_budget_ms=9,
+            )
+            self._equipment_population_job = job
+            job.progress.connect(
+                lambda done, total: progress(
+                    f"Populating equipment ({done:,}/{total:,})...",
+                    98 + int(done / max(1, total)),
+                )
+                if progress is not None
+                else None
+            )
+            job.completed.connect(_equipment_done)
+            job.failed.connect(_fail)
+            job.start()
+
+        job = IncrementalGuiJob(
+            self,
+            items=inventory,
+            consume=lambda row, item: self._write_inventory_row(row, item),
+            batch_size=96,
+            time_budget_ms=9,
+        )
+        self._inventory_population_job = job
+        job.progress.connect(
+            lambda done, total: progress(
+                f"Populating inventory ({done:,}/{total:,})...",
+                95 + int((done / max(1, total)) * 3),
+            )
+            if progress is not None
+            else None
+        )
+        job.completed.connect(_inventory_done)
+        job.failed.connect(_fail)
+        job.start()
 
     def _deferred_parc_enrich(self) -> None:
         if not self._save_data or not self._items:
             return
-        if self._parc_thread is not None:
+        if self._parc_handle is not None and self._parc_handle.is_running:
             return
 
-        from crimson_common.gui_task_worker import GuiTaskWorker
+        from crimson_common.gui_task_worker import start_gui_task
 
         save_data = self._save_data
         items = self._items
@@ -31878,12 +32073,6 @@ QCheckBox::indicator {{
                 save_data.decompressed_blob, items, _on_progress
             )
             return generation, enriched, parc_status
-
-        thread = QThread(self)
-        worker = GuiTaskWorker(task=_task)
-        worker.moveToThread(thread)
-        self._parc_thread = thread
-        self._parc_worker = worker
 
         def _on_progress(message: str, _value: int) -> None:
             self._status_parc_label.setText(message)
@@ -31903,20 +32092,18 @@ QCheckBox::indicator {{
 
         def _cleanup() -> None:
             stale = self._save_data is not save_data
-            self._parc_thread = None
-            self._parc_worker = None
+            self._parc_handle = None
             if stale:
                 QTimer.singleShot(0, self._deferred_parc_enrich)
 
-        worker.progress.connect(_on_progress, Qt.QueuedConnection)
-        worker.completed.connect(_on_completed, Qt.QueuedConnection)
-        worker.failed.connect(_on_failed, Qt.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(_cleanup)
-        thread.started.connect(worker.run)
-        thread.start()
+        self._parc_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            finished=_cleanup,
+        )
 
     def _finish_parc_enrich(self, enriched: int, parc_status: str) -> None:
         self._parc_status = parc_status
@@ -31929,23 +32116,32 @@ QCheckBox::indicator {{
         self._enrich_vendor_names()
         self._update_inv_subtab_counts()
 
-        self._populate_inventory()
-        self._populate_equipment()
-        self._populate_repurchase()
-        self._populate_socket_items()
-        self._populate_repurchase()
-        self._populate_faction_tab()
-        self._refresh_backups()
-        self._inv_count_label.setText(str(len(self._items)))
+        def _after_refresh() -> None:
+            self._populate_repurchase()
+            self._populate_faction_tab()
+            self._refresh_backups()
+            self._inv_count_label.setText(str(len(self._items)))
+            if hasattr(self, "_center_status"):
+                self._center_status.setText("Save data enriched and ready")
+
+        def _refresh_failed(message: str, details: str) -> None:
+            log.error("PARC table refresh failed: %s\n%s", message, details)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText("Save loaded; table refresh failed")
+
+        self._populate_scanned_items(
+            incremental=True,
+            schedule_enrichment=False,
+            progress=lambda message, _value: self._center_status.setText(message)
+            if hasattr(self, "_center_status")
+            else None,
+            completed=_after_refresh,
+            failed=_refresh_failed,
+        )
 
 
-    def _populate_inventory(self) -> None:
-        table = self._inv_table
-        table.setSortingEnabled(False)
-        table.setRowCount(0)
-
+    def _filtered_inventory_items(self) -> List[SaveItem]:
         search = self._inv_search.text().lower().strip()
-
         filtered = self._items
         subtab_idx = self._inv_subtabs.currentIndex() if hasattr(self, '_inv_subtabs') else 0
         if 0 <= subtab_idx < len(self._inv_subtab_filters):
@@ -31967,63 +32163,65 @@ QCheckBox::indicator {{
                 or search in i.category.lower()
                 or search in self._name_db.get_internal_name(i.item_key).lower()
             ]
+        return filtered
+
+    def _populate_inventory(self) -> None:
+        table = self._inv_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        filtered = self._filtered_inventory_items()
 
         table.setRowCount(len(filtered))
 
         for row, item in enumerate(filtered):
-            color = QColor(CATEGORY_COLORS.get(item.category, COLORS["text"]))
-
-            icon_item = QTableWidgetItem()
-            if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(item.item_key)
-                if px:
-                    icon_item.setIcon(QIcon(px))
-                elif self._icon_cache.has_icon(item.item_key):
-                    self._icon_cache.request_icon(item.item_key, self._on_icon_loaded)
-            table.setItem(row, 0, icon_item)
-
-            name_item = QTableWidgetItem(item.name)
-            name_item.setForeground(QBrush(color))
-            name_item.setData(Qt.UserRole, id(item))
-            table.setItem(row, 1, name_item)
-
-            no_item = _num_item(item.item_no)
-            no_item.setForeground(QBrush(QColor(COLORS["text_dim"])))
-            table.setItem(row, 2, no_item)
-
-            source_item = QTableWidgetItem(item.source)
-            table.setItem(row, 3, source_item)
-
-            cat_item = QTableWidgetItem(item.category)
-            cat_item.setForeground(QBrush(color))
-            table.setItem(row, 4, cat_item)
-
-            key_item = _num_item(item.item_key)
-            key_item.setData(Qt.UserRole + 1, item.item_key)
-            table.setItem(row, 5, key_item)
-
-            slot_item = _num_item(item.slot_no)
-            table.setItem(row, 6, slot_item)
-
-            stack_item = _num_item(item.stack_count)
-            table.setItem(row, 7, stack_item)
-
-            enc_text = f"+{item.enchant_level}" if item.has_enchant else "-"
-            enc_item = QTableWidgetItem(enc_text)
-            if item.has_enchant:
-                enc_item.setForeground(QBrush(QColor(COLORS["success"])))
-            table.setItem(row, 8, enc_item)
+            self._write_inventory_row(row, item)
 
         table.setSortingEnabled(True)
+
+    def _write_inventory_row(self, row: int, item: SaveItem) -> None:
+        table = self._inv_table
+        color = QColor(CATEGORY_COLORS.get(item.category, COLORS["text"]))
+
+        icon_item = QTableWidgetItem()
+        if self._icons_enabled:
+            px = self._icon_cache.get_pixmap(item.item_key)
+            if px:
+                icon_item.setIcon(QIcon(px))
+            elif self._icon_cache.has_icon(item.item_key):
+                self._icon_cache.request_icon(item.item_key, self._on_icon_loaded)
+        table.setItem(row, 0, icon_item)
+
+        name_item = QTableWidgetItem(item.name)
+        name_item.setForeground(QBrush(color))
+        name_item.setData(Qt.UserRole, id(item))
+        table.setItem(row, 1, name_item)
+
+        no_item = _num_item(item.item_no)
+        no_item.setForeground(QBrush(QColor(COLORS["text_dim"])))
+        table.setItem(row, 2, no_item)
+        table.setItem(row, 3, QTableWidgetItem(item.source))
+
+        cat_item = QTableWidgetItem(item.category)
+        cat_item.setForeground(QBrush(color))
+        table.setItem(row, 4, cat_item)
+
+        key_item = _num_item(item.item_key)
+        key_item.setData(Qt.UserRole + 1, item.item_key)
+        table.setItem(row, 5, key_item)
+        table.setItem(row, 6, _num_item(item.slot_no))
+        table.setItem(row, 7, _num_item(item.stack_count))
+
+        enc_item = QTableWidgetItem(
+            f"+{item.enchant_level}" if item.has_enchant else "-"
+        )
+        if item.has_enchant:
+            enc_item.setForeground(QBrush(QColor(COLORS["success"])))
+        table.setItem(row, 8, enc_item)
 
     def _filter_equipment(self) -> None:
         self._populate_equipment()
 
-    def _populate_equipment(self) -> None:
-        table = self._equip_table
-        table.setSortingEnabled(False)
-        table.setRowCount(0)
-
+    def _filtered_equipment_items(self) -> List[SaveItem]:
         search = self._equip_search.text().lower().strip()
         equip_items = [i for i in self._items if i.is_equipment or i.has_enchant]
         if search:
@@ -32034,55 +32232,71 @@ QCheckBox::indicator {{
                 or search in i.category.lower()
                 or search in self._name_db.get_internal_name(i.item_key).lower()
             ]
+        return equip_items
+
+    def _populate_equipment(self) -> None:
+        table = self._equip_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        equip_items = self._filtered_equipment_items()
         table.setRowCount(len(equip_items))
 
         for row, item in enumerate(equip_items):
-            color = QColor(CATEGORY_COLORS.get("Equipment", COLORS["text"]))
-
-            icon_item = QTableWidgetItem()
-            if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(item.item_key)
-                if px:
-                    icon_item.setIcon(QIcon(px))
-            table.setItem(row, 0, icon_item)
-
-            name_item = QTableWidgetItem(item.name)
-            name_item.setForeground(QBrush(color))
-            name_item.setData(Qt.UserRole, id(item))
-            table.setItem(row, 1, name_item)
-
-            table.setItem(row, 2, _num_item(item.item_key))
-            table.setItem(row, 3, _num_item(item.slot_no))
-
-            max_enc = self._get_max_enchant(item.item_key)
-            if item.has_enchant:
-                if max_enc >= 0:
-                    enchant_text = f"+{item.enchant_level}/{max_enc}"
-                else:
-                    enchant_text = f"+{item.enchant_level}"
-            else:
-                enchant_text = "-"
-            enchant_item = QTableWidgetItem(enchant_text)
-            if item.has_enchant and max_enc >= 0 and item.enchant_level > max_enc:
-                enchant_item.setForeground(QBrush(QColor(COLORS["error"])))
-                enchant_item.setToolTip(f"OVER LIMIT! Max enchant is +{max_enc}. Game may crash!")
-            elif item.has_enchant and item.enchant_level > 0:
-                enchant_item.setForeground(QBrush(QColor(COLORS["accent"])))
-            table.setItem(row, 4, enchant_item)
-
-            endurance_item = _num_item(item.actual_endurance)
-            if item.socket_count_from_endurance > 0:
-                endurance_item.setText(f"{item.actual_endurance} ({item.socket_count_from_endurance}s)")
-                endurance_item.setToolTip(f"Endurance={item.actual_endurance}, Sockets={item.socket_count_from_endurance} (raw=0x{item.endurance:04X})")
-            table.setItem(row, 5, endurance_item)
-
-            sharpness_item = _num_item(item.sharpness)
-            table.setItem(row, 6, sharpness_item)
-
-            table.setItem(row, 7, _num_item(item.stack_count))
-            table.setItem(row, 8, _num_item(item.item_no))
+            self._write_equipment_row(row, item)
 
         table.setSortingEnabled(True)
+
+    def _write_equipment_row(self, row: int, item: SaveItem) -> None:
+        table = self._equip_table
+        color = QColor(CATEGORY_COLORS.get("Equipment", COLORS["text"]))
+
+        icon_item = QTableWidgetItem()
+        if self._icons_enabled:
+            px = self._icon_cache.get_pixmap(item.item_key)
+            if px:
+                icon_item.setIcon(QIcon(px))
+        table.setItem(row, 0, icon_item)
+
+        name_item = QTableWidgetItem(item.name)
+        name_item.setForeground(QBrush(color))
+        name_item.setData(Qt.UserRole, id(item))
+        table.setItem(row, 1, name_item)
+        table.setItem(row, 2, _num_item(item.item_key))
+        table.setItem(row, 3, _num_item(item.slot_no))
+
+        max_enc = self._get_max_enchant(item.item_key)
+        if item.has_enchant:
+            enchant_text = (
+                f"+{item.enchant_level}/{max_enc}"
+                if max_enc >= 0
+                else f"+{item.enchant_level}"
+            )
+        else:
+            enchant_text = "-"
+        enchant_item = QTableWidgetItem(enchant_text)
+        if item.has_enchant and max_enc >= 0 and item.enchant_level > max_enc:
+            enchant_item.setForeground(QBrush(QColor(COLORS["error"])))
+            enchant_item.setToolTip(
+                f"OVER LIMIT! Max enchant is +{max_enc}. Game may crash!"
+            )
+        elif item.has_enchant and item.enchant_level > 0:
+            enchant_item.setForeground(QBrush(QColor(COLORS["accent"])))
+        table.setItem(row, 4, enchant_item)
+
+        endurance_item = _num_item(item.actual_endurance)
+        if item.socket_count_from_endurance > 0:
+            endurance_item.setText(
+                f"{item.actual_endurance} ({item.socket_count_from_endurance}s)"
+            )
+            endurance_item.setToolTip(
+                f"Endurance={item.actual_endurance}, "
+                f"Sockets={item.socket_count_from_endurance} "
+                f"(raw=0x{item.endurance:04X})"
+            )
+        table.setItem(row, 5, endurance_item)
+        table.setItem(row, 6, _num_item(item.sharpness))
+        table.setItem(row, 7, _num_item(item.stack_count))
+        table.setItem(row, 8, _num_item(item.item_no))
 
     def _toggle_icons(self) -> None:
         self._icons_enabled = not self._icons_enabled

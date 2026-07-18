@@ -11,7 +11,7 @@ import traceback
 
 
 log = logging.getLogger(__name__)
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
@@ -239,7 +239,10 @@ class MainWindow(QMainWindow):
         self._dirty: bool = False
         self._load_thread = None
         self._load_worker = None
+        self._load_handle = None
         self._load_progress = None
+        self._load_population_pending = False
+        self._editor_population_job = None
         self._parc_status: str = ""
         self._tab_loaders: dict = {}
         self._loaded_tabs: set = set()
@@ -1001,6 +1004,7 @@ class MainWindow(QMainWindow):
             docks=(self._save_dock, self._pack_dock),
             preserve_widgets=(self._center_status,),
         )
+        self._patches_tab.set_shell_mode(True)
 
     def _shell_destinations(self) -> tuple[ShellDestination, ...]:
         outer = self._real_tabs
@@ -1034,15 +1038,22 @@ class MainWindow(QMainWindow):
         def routes(*candidates: ShellRoute | None) -> tuple[ShellRoute, ...]:
             return tuple(route for route in candidates if route is not None)
 
-        game_patches = find_route(
-            "Game Patches",
+        blackstar = find_route(
+            "Blackstar",
             self._mods_tabs,
             "Game Patches",
-            "Preview, apply, and restore verified archive patches.",
+            "Preview, apply, and restore Blackstar's verified archive preset.",
             icon_name="mounts",
             game_art_id=1000799,
             badge="DRAGON",
             immersive=True,
+        )
+        game_patches = find_route(
+            "Game Patches",
+            self._mods_tabs,
+            "Game Patches",
+            "Verified archive patches and recovery tools.",
+            icon_name="mods",
         )
         item_buffs = find_route("Item Buffs", self._mods_tabs, tr("tab.itembuffs"))
         merc_pets = find_route("Mercenaries & Pets", self._mods_tabs, "MercPets")
@@ -1058,7 +1069,7 @@ class MainWindow(QMainWindow):
             ShellDestination(
                 "MOUNTS",
                 routes(
-                    game_patches,
+                    blackstar,
                     find_route("Dragon Wheel", self._mods_tabs, "Dragon Wheel"),
                     merc_pets,
                     field_edit,
@@ -3319,11 +3330,14 @@ QCheckBox::indicator {{
             self._load_save(saves[idx]["path"])
 
     def _load_save(self, path: str) -> None:
-        if self._load_thread is not None:
+        if (
+            (self._load_handle is not None and self._load_handle.is_running)
+            or self._load_population_pending
+        ):
             self._update_status("A save is already loading")
             return
 
-        from crimson_common.gui_task_worker import GuiTaskWorker
+        from crimson_common.gui_task_worker import start_gui_task
         from PySide6.QtWidgets import QProgressDialog
 
         progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
@@ -3346,11 +3360,6 @@ QCheckBox::indicator {{
             report("Preparing the editor...", 95)
             return save_data, items, pristine
 
-        thread = QThread(self)
-        worker = GuiTaskWorker(task=_task)
-        worker.moveToThread(thread)
-        self._load_thread = thread
-        self._load_worker = worker
         self._load_progress = progress
         self._set_load_busy(True)
 
@@ -3359,6 +3368,22 @@ QCheckBox::indicator {{
             progress.setValue(value)
             if hasattr(self, "_center_status"):
                 self._center_status.setText(message)
+
+        def _release_load_ui() -> None:
+            self._load_population_pending = False
+            if self._load_progress is progress:
+                progress.close()
+                self._load_progress = None
+            self._set_load_busy(False)
+
+        def _population_failed(message: str, details: str) -> None:
+            log.error("Editor population failed: %s\n%s", message, details)
+            _release_load_ui()
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"The save was loaded, but the editor could not be populated:\n\n{message}\n\n{details}",
+            )
 
         def _on_completed(result) -> None:
             save_data, items, pristine = result
@@ -3370,24 +3395,38 @@ QCheckBox::indicator {{
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            progress.setLabelText("Populating the editor...")
-            progress.setValue(98)
-            self._populate_scanned_items()
+            def _finish_population() -> None:
+                try:
+                    slot_dir = os.path.basename(os.path.dirname(path))
+                    friendly = self._friendly_slot_name(slot_dir)
+                    self._config["last_save_path"] = path
+                    self._config["last_slot"] = friendly
+                    self._save_config()
+                    self._refresh_sidebar()
 
-            slot_dir = os.path.basename(os.path.dirname(path))
-            friendly = self._friendly_slot_name(slot_dir)
-            self._config["last_save_path"] = path
-            self._config["last_slot"] = friendly
-            self._save_config()
-            self._refresh_sidebar()
+                    self._quick_save_btn.setEnabled(True)
+                    self._quick_save_btn.setToolTip(f"Save to: {path}")
+                    self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
+                    self._update_status(f"Loaded: {friendly} ({slot_dir})")
+                    if hasattr(self, "_backup_tab"):
+                        self._backup_tab.set_loaded_path(path)
+                    progress.setValue(100)
+                except Exception as exc:
+                    _population_failed(str(exc), traceback.format_exc())
+                    return
+                _release_load_ui()
 
-            self._quick_save_btn.setEnabled(True)
-            self._quick_save_btn.setToolTip(f"Save to: {path}")
-            self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
-            self._update_status(f"Loaded: {friendly} ({slot_dir})")
-            if hasattr(self, "_backup_tab"):
-                self._backup_tab.set_loaded_path(path)
-            progress.setValue(100)
+            progress.setCancelButton(None)
+            self._load_population_pending = True
+            try:
+                self._populate_scanned_items(
+                    incremental=True,
+                    progress=_on_progress,
+                    completed=_finish_population,
+                    failed=_population_failed,
+                )
+            except Exception as exc:
+                _population_failed(str(exc), traceback.format_exc())
 
         def _on_failed(message: str, details: str) -> None:
             hint = ""
@@ -3406,25 +3445,22 @@ QCheckBox::indicator {{
         def _on_cancelled() -> None:
             self._update_status("Save loading cancelled; no save was changed")
 
-        def _cleanup() -> None:
-            progress.close()
-            self._load_progress = None
-            self._load_worker = None
-            self._load_thread = None
-            self._set_load_busy(False)
+        def _background_finished() -> None:
+            self._load_handle = None
+            if not self._load_population_pending:
+                _release_load_ui()
 
-        worker.progress.connect(_on_progress, Qt.QueuedConnection)
-        worker.completed.connect(_on_completed, Qt.QueuedConnection)
-        worker.failed.connect(_on_failed, Qt.QueuedConnection)
-        worker.cancelled.connect(_on_cancelled, Qt.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(_cleanup)
-        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
-        thread.started.connect(worker.run)
         progress.show()
-        thread.start()
+        self._load_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            cancelled=_on_cancelled,
+            finished=_background_finished,
+        )
+        progress.canceled.connect(self._load_handle.cancel)
 
     def _set_load_busy(self, busy: bool) -> None:
         for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
@@ -3549,31 +3585,114 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
-        self._populate_scanned_items()
+        self._populate_scanned_items(incremental=True)
 
-    def _populate_scanned_items(self) -> None:
+    def _populate_scanned_items(
+        self,
+        *,
+        incremental: bool = False,
+        schedule_enrichment: bool = True,
+        progress: Optional[Callable[[str, int], None]] = None,
+        completed: Optional[Callable[[], None]] = None,
+        failed: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
         self._fix_duplicate_item_nos()
 
         self._loaded_tabs.clear()
 
-        self._status_parc_label.hide()
-        self._parc_progress.setValue(0)
-        self._parc_progress.setFormat("Scanning offsets...")
-        self._parc_progress.show()
-        if hasattr(self, '_inventory_tab'):
-            self._inventory_tab.load(self._save_data, self._items)
-            self._inventory_tab._populate_inventory()
-            self._loaded_tabs.add(self._inventory_tab)
-        if hasattr(self, '_equipment_tab'):
-            self._equipment_tab.load(self._save_data, self._items)
-            self._equipment_tab._populate_equipment()
-            self._loaded_tabs.add(self._equipment_tab)
-        if hasattr(self, '_buffs_tab'):
-            self._buffs_tab.load(self._save_data, self._items)
-            self._loaded_tabs.add(self._buffs_tab)
+        if schedule_enrichment:
+            self._status_parc_label.hide()
+            self._parc_progress.setValue(0)
+            self._parc_progress.setFormat("Scanning offsets...")
+            self._parc_progress.show()
+        if not incremental:
+            if hasattr(self, '_inventory_tab'):
+                self._inventory_tab.load(self._save_data, self._items)
+                self._inventory_tab._populate_inventory()
+                self._loaded_tabs.add(self._inventory_tab)
+            if hasattr(self, '_equipment_tab'):
+                self._equipment_tab.load(self._save_data, self._items)
+                self._equipment_tab._populate_equipment()
+                self._loaded_tabs.add(self._equipment_tab)
+            if hasattr(self, '_buffs_tab'):
+                self._buffs_tab.load(self._save_data, self._items)
+                self._loaded_tabs.add(self._buffs_tab)
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+            return
 
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._deferred_parc_enrich)
+        from crimson_common.gui_population import IncrementalGuiJob
+
+        preparation_steps: list[Callable[[], None]] = []
+        if hasattr(self, '_inventory_tab'):
+            preparation_steps.append(
+                lambda: (
+                    self._inventory_tab.load(self._save_data, self._items),
+                    self._inventory_tab._populate_inventory(),
+                    self._loaded_tabs.add(self._inventory_tab),
+                )
+            )
+        if hasattr(self, '_equipment_tab'):
+            preparation_steps.append(
+                lambda: (
+                    self._equipment_tab.load(self._save_data, self._items),
+                    self._equipment_tab._populate_equipment(),
+                    self._loaded_tabs.add(self._equipment_tab),
+                )
+            )
+
+        def _fail(message: str, details: str) -> None:
+            self._editor_population_job = None
+            if failed is not None:
+                failed(message, details)
+            else:
+                log.error("Incremental editor population failed: %s\n%s", message, details)
+
+        def _done() -> None:
+            self._editor_population_job = None
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+
+        def _load_buffs() -> None:
+            if not hasattr(self, '_buffs_tab'):
+                _done()
+                return
+            self._loaded_tabs.add(self._buffs_tab)
+            self._buffs_tab.load(
+                self._save_data,
+                self._items,
+                completed=_done,
+                failed=_fail,
+                progress=progress,
+            )
+
+        def _prepared() -> None:
+            self._editor_population_job = None
+            _load_buffs()
+
+        job = IncrementalGuiJob(
+            self,
+            items=preparation_steps,
+            consume=lambda _index, step: step(),
+            batch_size=1,
+            time_budget_ms=6,
+        )
+        self._editor_population_job = job
+        job.progress.connect(
+            lambda done, total: progress(
+                f"Preparing editor panels ({done:,}/{total:,})...",
+                96 + int((done / max(1, total)) * 2),
+            )
+            if progress is not None
+            else None
+        )
+        job.completed.connect(_prepared)
+        job.failed.connect(_fail)
+        job.start()
 
     def _deferred_parc_enrich(self) -> None:
         if not self._save_data or not self._items:
@@ -3622,17 +3741,22 @@ QCheckBox::indicator {{
         self._enrich_vendor_names()
 
         self._loaded_tabs.clear()
-        if hasattr(self, '_inventory_tab'):
-            self._inventory_tab._populate_inventory()
-            self._inventory_tab._inv_count_label.setText(str(len(self._items)))
-            self._loaded_tabs.add(self._inventory_tab)
-        if hasattr(self, '_equipment_tab'):
-            self._equipment_tab._populate_equipment()
-            self._loaded_tabs.add(self._equipment_tab)
 
-        self._reload_visible_tabs()
+        def _after_refresh() -> None:
+            if hasattr(self, '_inventory_tab'):
+                self._inventory_tab._inv_count_label.setText(str(len(self._items)))
+            self._reload_visible_tabs()
+            self._prefetch_parse_cache()
 
-        self._prefetch_parse_cache()
+        self._populate_scanned_items(
+            incremental=True,
+            schedule_enrichment=False,
+            progress=lambda message, _value: self._update_status(message),
+            completed=_after_refresh,
+            failed=lambda message, details: log.error(
+                "PARC table refresh failed: %s\n%s", message, details
+            ),
+        )
 
     def _prefetch_parse_cache(self) -> None:
         sd = self._save_data

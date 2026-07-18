@@ -31,6 +31,7 @@ from crimson_common.crimson_shell import (
     ShellDestination,
     ShellRoute,
     install_crimson_application_shell,
+    normalize_legacy_button_styles,
 )
 
 
@@ -245,3 +246,32 @@ def test_both_windows_install_the_structural_shell_after_building_routes() -> No
         assert "install_crimson_application_shell(" in source
         assert "self._shell_destinations()" in source
         assert "Select a save with SAVES or Menu > File > Open" in source
+
+
+def test_legacy_bright_button_palettes_are_normalized_without_removing_controls() -> None:
+    _application()
+    root = QWidget()
+    layout = QVBoxLayout(root)
+    primary = QPushButton("Apply to Game")
+    primary.setStyleSheet("background-color: #B71C1C; color: white; font-weight: bold;")
+    preset = QPushButton("Lightning Weapon")
+    preset.setStyleSheet("background-color: #ff55aa; color: black; padding: 16px;")
+    generic_accent = QPushButton("Give Item")
+    generic_accent.setObjectName("accentBtn")
+    untouched = QPushButton("Section")
+    untouched.setStyleSheet("background: transparent; text-align: left;")
+    long_action = QPushButton("Add Custom Item to Save")
+    long_action.setStyleSheet("background-color: #1565C0; color: white;")
+    for button in (primary, preset, generic_accent, untouched, long_action):
+        layout.addWidget(button)
+
+    normalize_legacy_button_styles(root)
+
+    assert primary.styleSheet() == ""
+    assert primary.property("primaryAction") is True
+    assert preset.styleSheet() == ""
+    assert preset.property("quietAction") is True
+    assert generic_accent.objectName() == "legacyAction"
+    assert generic_accent.property("quietAction") is True
+    assert untouched.styleSheet() != ""
+    assert long_action.text() == "Add to Save"

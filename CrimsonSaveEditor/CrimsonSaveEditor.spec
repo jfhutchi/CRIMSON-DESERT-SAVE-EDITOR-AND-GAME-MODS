@@ -69,6 +69,7 @@ a = Analysis(
         'crimson_common.crimson_theme',
         'crimson_common.crimson_icons',
         'crimson_common.crimson_shell',
+        'crimson_common.gui_population',
         'crimson_common.gui_task_worker',
         'crimson_theme',
         'crimson_rs',

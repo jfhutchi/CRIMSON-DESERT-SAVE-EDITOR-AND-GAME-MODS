@@ -167,7 +167,7 @@ def test_save_editor_mount_workspace_keeps_the_blackstar_surface_visible() -> No
     source = (ROOT / "CrimsonSaveEditor" / "gui.py").read_text(encoding="utf-8")
     assert 'tab.setObjectName("mercenaryScroll")' in source
     assert "tab.setWidgetResizable(True)" in source
-    assert "layout.insertWidget(1, self._blackstar_timer_panel)" in source
+    assert "layout.insertWidget(0, self._blackstar_timer_panel)" in source
 
 
 def test_both_application_theme_entrypoints_share_one_vocabulary() -> None:
