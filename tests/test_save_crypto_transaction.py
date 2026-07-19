@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from dataclasses import replace
 from pathlib import Path
 
+import lz4.block
 import pytest
 
+import parc_inserter3
 import save_crypto
+import save_compat
 from blackstar_unlock import unlock_blackstar
-from blackstar_compat import make_blackstar_apply_token
+from blackstar_compat import BlackstarCompatibilityError, make_blackstar_apply_token
 from save_crypto import (
     VERSION_OFFSET,
     load_save_file,
@@ -23,10 +27,10 @@ def _sha256(path: Path) -> str:
 
 
 def test_serialization_preserves_version_and_round_trips(
-    fixture_save_path: Path,
+    copied_save: Path,
     tmp_path: Path,
 ) -> None:
-    save = load_save_file(str(fixture_save_path))
+    save = load_save_file(str(copied_save))
     serialized = serialize_save_bytes(
         bytes(save.decompressed_blob), save.raw_header, "serialize-test"
     )
@@ -38,6 +42,74 @@ def test_serialization_preserves_version_and_round_trips(
     output.write_bytes(serialized)
     reloaded = load_save_file(str(output))
     assert reloaded.decompressed_blob == save.decompressed_blob
+
+
+def test_load_with_detect_schema_false_preserves_verified_save_fields(
+    copied_save: Path,
+) -> None:
+    detected = load_save_file(str(copied_save))
+
+    undetected = load_save_file(str(copied_save), detect_schema=False)
+
+    assert undetected.raw_header == detected.raw_header
+    assert undetected.decompressed_blob == detected.decompressed_blob
+    assert undetected.original_compressed_size == detected.original_compressed_size
+    assert undetected.original_decompressed_size == detected.original_decompressed_size
+    assert undetected.file_path == detected.file_path
+    assert undetected.is_raw_stream is False
+    assert undetected.schema_identity is None
+    assert undetected.compatibility_profile_id is None
+    assert undetected.is_schema_supported is False
+
+
+def test_load_with_detect_schema_false_still_rejects_hmac_mismatch(
+    copied_save: Path,
+    tmp_path: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    corrupted = bytearray(
+        serialize_save_bytes(
+            bytes(save.decompressed_blob), save.raw_header, "hmac-corruption-setup"
+        )
+    )
+    corrupted[save_crypto.HMAC_OFFSET] ^= 0x01
+    corrupted_path = tmp_path / "hmac-corrupt.save"
+    corrupted_path.write_bytes(corrupted)
+
+    with pytest.raises(Warning, match="HMAC mismatch"):
+        load_save_file(str(corrupted_path), detect_schema=False)
+
+
+def test_load_with_detect_schema_false_still_validates_decompression(
+    copied_save: Path,
+    tmp_path: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    serialized = bytearray(
+        serialize_save_bytes(
+            bytes(save.decompressed_blob), save.raw_header, "lz4-corruption-setup"
+        )
+    )
+    version = struct.unpack_from("<H", serialized, save_crypto.VERSION_OFFSET)[0]
+    payload_size = struct.unpack_from(
+        "<I", serialized, save_crypto.PAYLOAD_SIZE_OFFSET
+    )[0]
+    nonce = bytes(
+        serialized[save_crypto.NONCE_OFFSET:save_crypto.NONCE_OFFSET + 16]
+    )
+    key = save_crypto._generate_save_key(version)
+    invalid_compressed = bytes(payload_size)
+    serialized[
+        save_crypto.HMAC_OFFSET:save_crypto.HMAC_OFFSET + 32
+    ] = save_crypto.compute_hmac(invalid_compressed, key)
+    serialized[save_crypto.PAYLOAD_OFFSET:] = save_crypto.chacha20_crypt(
+        invalid_compressed, nonce, key
+    )
+    corrupted_path = tmp_path / "lz4-corrupt.save"
+    corrupted_path.write_bytes(serialized)
+
+    with pytest.raises(lz4.block.LZ4BlockError):
+        load_save_file(str(corrupted_path), detect_schema=False)
 
 
 def test_transaction_creates_verified_backup_before_atomic_replace(
@@ -88,6 +160,76 @@ def test_backup_failure_leaves_destination_untouched(
     assert not list(copied_save.parent.glob(".save.save.*.tmp"))
 
 
+def test_verified_backup_is_not_reloaded(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    source_bytes = copied_save.read_bytes()
+    original_load = save_crypto.load_save_file
+    loaded_paths: list[Path] = []
+
+    def reject_backup_reload(path, *args, **kwargs):
+        loaded_path = Path(path)
+        loaded_paths.append(loaded_path)
+        if loaded_path.suffix == ".bak":
+            pytest.fail("a byte-identical verified backup must not be reloaded")
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(save_crypto, "load_save_file", reject_backup_reload)
+
+    result = transactional_write_save(
+        destination=copied_save,
+        edited_blob=bytes(save.decompressed_blob),
+        original_header=save.raw_header,
+        backup_source=copied_save,
+        expected_identity=save.schema_identity,
+        operation_id="backup-reload-budget",
+    )
+
+    assert result.backup_path.read_bytes() == source_bytes
+    assert len(loaded_paths) == 1
+    assert loaded_paths[0].suffix == ".tmp"
+
+
+def test_temporary_verification_reloads_without_schema_detection(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    edited_blob = bytes(save.decompressed_blob)
+    original_load = save_crypto.load_save_file
+    temp_verifications = []
+
+    def record_temp_reload(path, *args, **kwargs):
+        reloaded = original_load(path, *args, **kwargs)
+        if Path(path).suffix == ".tmp":
+            temp_verifications.append((kwargs.get("detect_schema"), reloaded))
+        return reloaded
+
+    monkeypatch.setattr(save_crypto, "load_save_file", record_temp_reload)
+
+    transactional_write_save(
+        destination=copied_save,
+        edited_blob=edited_blob,
+        original_header=save.raw_header,
+        backup_source=copied_save,
+        expected_identity=save.schema_identity,
+        operation_id="temporary-reload-budget",
+    )
+
+    assert len(temp_verifications) == 1
+    detect_schema, reloaded = temp_verifications[0]
+    assert detect_schema is False
+    assert hashlib.sha256(reloaded.decompressed_blob).digest() == hashlib.sha256(
+        edited_blob
+    ).digest()
+    assert bytes(reloaded.decompressed_blob) == edited_blob
+    assert reloaded.schema_identity is None
+    assert reloaded.compatibility_profile_id is None
+    assert reloaded.is_schema_supported is False
+
+
 def test_save_as_backs_up_existing_destination_not_loaded_source(
     copied_save: Path,
     tmp_path: Path,
@@ -124,6 +266,7 @@ def test_destination_change_after_backup_aborts_replace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     save = load_save_file(str(copied_save))
+    source_bytes = copied_save.read_bytes()
     original_serialize = save_crypto.serialize_save_bytes
     externally_changed = b"changed by another process"
 
@@ -146,6 +289,131 @@ def test_destination_change_after_backup_aborts_replace(
         )
 
     assert copied_save.read_bytes() == externally_changed
+    backups = list((copied_save.parent / "backups").glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == source_bytes
+    assert not list(copied_save.parent.glob(".save.save.*.tmp"))
+
+
+def test_unsupported_candidate_schema_is_refused_before_backup(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    source_bytes = copied_save.read_bytes()
+    original_compute = save_compat.compute_schema_identity
+
+    def unsupported_candidate(blob, raw_header):
+        identity = original_compute(blob, raw_header)
+        return replace(identity, schema_sha256="0" * 64)
+
+    monkeypatch.setattr(save_compat, "compute_schema_identity", unsupported_candidate)
+
+    with pytest.raises(
+        save_compat.UnknownSaveSchemaError,
+        match="Edited blob schema differs from the loaded schema",
+    ):
+        transactional_write_save(
+            destination=copied_save,
+            edited_blob=bytes(save.decompressed_blob),
+            original_header=save.raw_header,
+            backup_source=copied_save,
+            expected_identity=save.schema_identity,
+            operation_id="unsupported-candidate-test",
+        )
+
+    assert copied_save.read_bytes() == source_bytes
+    assert not (copied_save.parent / "backups").exists()
+
+
+def test_corrupted_temporary_save_cannot_replace_destination(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    source_bytes = copied_save.read_bytes()
+    original_serialize = save_crypto.serialize_save_bytes
+
+    def corrupt_temporary_hmac(*args, **kwargs) -> bytes:
+        serialized = bytearray(original_serialize(*args, **kwargs))
+        serialized[save_crypto.HMAC_OFFSET] ^= 0x01
+        return bytes(serialized)
+
+    monkeypatch.setattr(
+        save_crypto, "serialize_save_bytes", corrupt_temporary_hmac
+    )
+
+    with pytest.raises(Warning, match="HMAC mismatch"):
+        transactional_write_save(
+            destination=copied_save,
+            edited_blob=bytes(save.decompressed_blob),
+            original_header=save.raw_header,
+            backup_source=copied_save,
+            expected_identity=save.schema_identity,
+            operation_id="temporary-corruption-test",
+        )
+
+    assert copied_save.read_bytes() == source_bytes
+    backups = list((copied_save.parent / "backups").glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == source_bytes
+    assert not list(copied_save.parent.glob(".save.save.*.tmp"))
+
+
+def test_scoped_blackstar_transaction_rejects_changed_source(
+    copied_save: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    edited_blob = bytes(save.decompressed_blob)
+    token = make_blackstar_apply_token(
+        copied_save,
+        edited_blob,
+        save.schema_identity,
+        hashlib.sha256(edited_blob).hexdigest(),
+        generation=4,
+    )
+    copied_save.write_bytes(copied_save.read_bytes() + b"changed")
+
+    with pytest.raises(BlackstarCompatibilityError, match="changed after preview"):
+        transactional_write_blackstar(
+            copied_save,
+            edited_blob,
+            save.raw_header,
+            save.schema_identity,
+            token,
+            generation=4,
+            operation_id="scoped-source-race-test",
+        )
+
+    assert not (copied_save.parent / "backups").exists()
+
+
+def test_scoped_blackstar_transaction_binds_expected_schema_hash(
+    copied_save: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    edited_blob = bytes(save.decompressed_blob)
+    token = make_blackstar_apply_token(
+        copied_save,
+        edited_blob,
+        save.schema_identity,
+        hashlib.sha256(edited_blob).hexdigest(),
+        generation=5,
+    )
+    changed_identity = replace(save.schema_identity, schema_sha256="0" * 64)
+
+    with pytest.raises(BlackstarCompatibilityError, match="schema changed after preview"):
+        transactional_write_blackstar(
+            copied_save,
+            edited_blob,
+            save.raw_header,
+            changed_identity,
+            token,
+            generation=5,
+            operation_id="scoped-schema-binding-test",
+        )
+
+    assert not (copied_save.parent / "backups").exists()
 
 
 def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
@@ -185,7 +453,9 @@ def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
 
 
 def test_scoped_blackstar_transaction_writes_unknown_schema_with_backup(
-    early_114_save_path: Path, tmp_path: Path
+    early_114_save_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "early" / "save.save"
     destination.parent.mkdir(parents=True)
@@ -201,10 +471,30 @@ def test_scoped_blackstar_transaction_writes_unknown_schema_with_backup(
         destination, bytes(save.decompressed_blob), save.schema_identity,
         preview.candidate_sha256, generation=3,
     )
+    original_load = save_crypto.load_save_file
+    write_boundary_reloads = []
+
+    def record_write_boundary_reload(path, *args, **kwargs):
+        reloaded = original_load(path, *args, **kwargs)
+        write_boundary_reloads.append((Path(path), kwargs.get("detect_schema")))
+        return reloaded
+
+    def fail_write_boundary_context(*_args, **_kwargs):
+        pytest.fail("scoped write must reuse preview-bound hashes")
+
+    monkeypatch.setattr(
+        save_crypto, "load_save_file", record_write_boundary_reload
+    )
+    monkeypatch.setattr(
+        parc_inserter3, "build_insert_context", fail_write_boundary_context
+    )
     result = transactional_write_blackstar(
         destination, applied.output_blob, save.raw_header, save.schema_identity,
         token, generation=3, operation_id="scoped-write",
     )
     assert result.backup_path.exists()
+    assert len(write_boundary_reloads) == 1
+    assert write_boundary_reloads[0][0].suffix == ".tmp"
+    assert write_boundary_reloads[0][1] is False
     reloaded = load_save_file(str(destination))
     assert hashlib.sha256(reloaded.decompressed_blob).hexdigest() == preview.candidate_sha256

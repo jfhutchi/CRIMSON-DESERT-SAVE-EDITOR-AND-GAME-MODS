@@ -157,7 +157,12 @@ def verify_hmac(data: bytes, expected: bytes, key: bytes = None) -> bool:
     return hmac.compare_digest(compute_hmac(data, key), expected)
 
 
-def load_save_file(path: str, operation_id: str | None = None) -> SaveData:
+def load_save_file(
+    path: str,
+    operation_id: str | None = None,
+    *,
+    detect_schema: bool = True,
+) -> SaveData:
     operation_id = operation_id or new_operation_id("load")
     with phase(log, operation_id, "file_read", path=path):
         with open(path, "rb") as f:
@@ -219,23 +224,27 @@ def load_save_file(path: str, operation_id: str | None = None) -> SaveData:
         original_decompressed_size=uncomp_size,
         file_path=path,
         is_raw_stream=False,
+        schema_identity=None,
+        compatibility_profile_id=None,
+        is_schema_supported=False,
     )
 
-    from save_compat import compute_schema_identity, load_profiles, match_profile
+    if detect_schema:
+        from save_compat import compute_schema_identity, load_profiles, match_profile
 
-    with phase(log, operation_id, "schema_detection"):
-        identity = compute_schema_identity(bytes(save_data.decompressed_blob), header)
-        profile = match_profile(identity, load_profiles())
-    save_data.schema_identity = identity
-    save_data.compatibility_profile_id = profile.profile_id if profile else None
-    save_data.is_schema_supported = profile is not None
-    log.info(
-        "operation=%s schema_result supported=%s profile=%s schema_sha256=%s",
-        operation_id,
-        save_data.is_schema_supported,
-        save_data.compatibility_profile_id,
-        identity.schema_sha256,
-    )
+        with phase(log, operation_id, "schema_detection"):
+            identity = compute_schema_identity(bytes(save_data.decompressed_blob), header)
+            profile = match_profile(identity, load_profiles())
+        save_data.schema_identity = identity
+        save_data.compatibility_profile_id = profile.profile_id if profile else None
+        save_data.is_schema_supported = profile is not None
+        log.info(
+            "operation=%s schema_result supported=%s profile=%s schema_sha256=%s",
+            operation_id,
+            save_data.is_schema_supported,
+            save_data.compatibility_profile_id,
+            identity.schema_sha256,
+        )
 
     if not hmac_ok:
         raise Warning("HMAC mismatch - save may be corrupted but was loaded anyway.")
@@ -373,11 +382,6 @@ def transactional_write_save(
                 raise OSError("Backup size verification failed")
             if _sha256_file(backup_path) != source_hash:
                 raise OSError("Backup SHA-256 verification failed")
-            backup_data = load_save_file(str(backup_path))
-            if not schema_structure_matches(
-                backup_data.schema_identity, expected_identity
-            ):
-                raise UnknownSaveSchemaError("Backup schema differs from loaded schema")
     except Exception:
         if backup_path.exists():
             backup_path.unlink()
@@ -402,13 +406,14 @@ def transactional_write_save(
                 stream.flush()
                 os.fsync(stream.fileno())
         with phase(log, operation_id, "temporary_validation", destination=temp_path):
-            reloaded = load_save_file(str(temp_path))
-            if hashlib.sha256(reloaded.decompressed_blob).digest() != hashlib.sha256(
-                edited_blob
-            ).digest():
+            reloaded = load_save_file(str(temp_path), detect_schema=False)
+            reloaded_blob = bytes(reloaded.decompressed_blob)
+            if (
+                hashlib.sha256(reloaded_blob).digest()
+                != hashlib.sha256(edited_blob).digest()
+                or reloaded_blob != edited_blob
+            ):
                 raise ValueError("Temporary save decompressed hash mismatch")
-            if not schema_structure_matches(reloaded.schema_identity, expected_identity):
-                raise UnknownSaveSchemaError("Temporary save schema differs from loaded schema")
         with phase(log, operation_id, "final_write", destination=destination):
             if destination_was_present:
                 if (
@@ -448,9 +453,7 @@ def transactional_write_blackstar(
     from blackstar_compat import (
         BLACKSTAR_FAMILY_ID,
         BlackstarCompatibilityError,
-        require_blackstar_compatibility,
     )
-    from parc_inserter3 import build_insert_context
 
     destination = Path(destination).resolve()
     if token.family_id != BLACKSTAR_FAMILY_ID:
@@ -464,20 +467,12 @@ def transactional_write_blackstar(
     source_file_hash = _sha256_file(destination)
     if source_file_hash != token.source_file_sha256:
         raise BlackstarCompatibilityError("Source file changed after preview")
-    source = load_save_file(str(destination), operation_id=operation_id)
-    source_blob = bytes(source.decompressed_blob)
-    if hashlib.sha256(source_blob).hexdigest() != token.source_blob_sha256:
-        raise BlackstarCompatibilityError("Source blob changed after preview")
-    if source.schema_identity.schema_sha256 != token.source_schema_sha256:
+    if expected_identity is None:
+        raise BlackstarCompatibilityError("Save has no schema identity")
+    if expected_identity.schema_sha256 != token.source_schema_sha256:
         raise BlackstarCompatibilityError("Source schema changed after preview")
     if hashlib.sha256(edited_blob).hexdigest() != token.candidate_blob_sha256:
         raise BlackstarCompatibilityError("Candidate hash differs from preview")
-    require_blackstar_compatibility(
-        build_insert_context(source_blob), source.schema_identity
-    )
-    require_blackstar_compatibility(
-        build_insert_context(edited_blob), expected_identity
-    )
     return transactional_write_save(
         destination=destination,
         edited_blob=edited_blob,

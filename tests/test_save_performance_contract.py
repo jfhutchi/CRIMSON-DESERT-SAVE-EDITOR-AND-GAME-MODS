@@ -12,6 +12,7 @@ import pytest
 
 import parc_serializer
 import save_parser
+import save_compat
 from save_compat import (
     REQUIRED_TYPES,
     SaveSchemaIdentity,
@@ -19,7 +20,7 @@ from save_compat import (
     compute_schema_identity,
     extract_required_list_encodings,
 )
-from save_crypto import load_save_file
+from save_crypto import load_save_file, transactional_write_save
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -56,6 +57,32 @@ def _legacy_schema_identity(blob: bytes, raw_header: bytes) -> SaveSchemaIdentit
 
 
 SAVE_FIXTURES = tuple(sorted(FIXTURES.glob("**/save.save")))
+
+
+def test_transaction_computes_candidate_schema_identity_once(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    original_compute = save_compat.compute_schema_identity
+    computed_sha256: list[str] = []
+
+    def count_identity(blob, raw_header):
+        computed_sha256.append(hashlib.sha256(blob).hexdigest())
+        return original_compute(blob, raw_header)
+
+    monkeypatch.setattr(save_compat, "compute_schema_identity", count_identity)
+
+    transactional_write_save(
+        destination=copied_save,
+        edited_blob=bytes(save.decompressed_blob),
+        original_header=save.raw_header,
+        backup_source=copied_save,
+        expected_identity=save.schema_identity,
+        operation_id="transaction-identity-budget",
+    )
+
+    assert computed_sha256 == [hashlib.sha256(save.decompressed_blob).hexdigest()]
 
 
 def test_type_signature_accepts_both_parser_type_definitions() -> None:
