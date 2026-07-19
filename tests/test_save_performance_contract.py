@@ -183,23 +183,7 @@ def _schema_semantics(result: dict) -> tuple:
         schema["header_zero"],
         schema["type_count"],
         schema["root_type"],
-        tuple(
-            (
-                type_def.index,
-                type_def.name,
-                tuple(
-                    (
-                        field.name,
-                        field.type_name,
-                        field.meta_kind,
-                        field.meta_size,
-                        field.meta_aux,
-                    )
-                    for field in type_def.fields
-                ),
-            )
-            for type_def in schema["types"]
-        ),
+        tuple(asdict(type_def) for type_def in schema["types"]),
     )
 
 
@@ -228,12 +212,29 @@ def test_parc_layout_adapter_matches_raw_result_semantics(copied_save: Path) -> 
     load_meta = {"input_kind": "raw_blob"}
     parc = editor_parc_serializer.parse_parc_blob(raw)
 
-    expected = editor_save_parser.build_result_from_raw(raw, load_meta)
-    actual = editor_save_parser.build_result_from_parc(raw, load_meta, parc)
+    expected = editor_save_parser.build_result_from_raw(
+        raw,
+        load_meta,
+        include_legacy=True,
+    )
+    actual = editor_save_parser.build_result_from_parc(
+        bytearray(raw),
+        load_meta,
+        parc,
+        include_legacy=True,
+    )
 
     assert actual["input"] == expected["input"]
     assert actual["raw"] == expected["raw"]
     assert _schema_semantics(actual) == _schema_semantics(expected)
+    assert all(
+        isinstance(type_def, editor_save_parser.TypeDef)
+        and all(
+            isinstance(field, editor_save_parser.FieldDef)
+            for field in type_def.fields
+        )
+        for type_def in actual["schema"]["types"]
+    )
     assert actual["toc"]["prefix_zero"] == expected["toc"]["prefix_zero"]
     assert actual["toc"]["entry_count"] == expected["toc"]["entry_count"]
     assert actual["toc"]["stream_size"] == expected["toc"]["stream_size"]
@@ -242,6 +243,23 @@ def test_parc_layout_adapter_matches_raw_result_semantics(copied_save: Path) -> 
         asdict(obj) for obj in expected["objects"]
     ]
     assert len(actual["toc"]["entries"]) == len(parc.toc_entries)
+    for key in ("character", "items", "items_summary", "bagExpansion"):
+        assert editor_save_parser.to_jsonable(actual[key]) == (
+            editor_save_parser.to_jsonable(expected[key])
+        )
+
+    filtered = editor_save_parser.build_result_from_parc(
+        bytearray(raw),
+        load_meta,
+        parc,
+        object_class_names=IDENTITY_OBJECT_CLASSES,
+    )
+    assert [asdict(obj) for obj in filtered["objects"]] == [
+        asdict(obj)
+        for obj in expected["objects"]
+        if obj.class_name in IDENTITY_OBJECT_CLASSES
+    ]
+    assert _toc_semantics(filtered) == _toc_semantics(expected)
 
 
 def test_parc_layout_adapter_forwards_decode_options(
@@ -291,6 +309,82 @@ def test_parc_layout_adapter_forwards_decode_options(
     assert captured["load_meta"] == {"source": "contract"}
     assert captured["object_class_names"] == IDENTITY_OBJECT_CLASSES
     assert captured["include_legacy"] is True
+
+
+def _synthetic_parc(editor_parc_serializer, *, types=(), toc_entries=()):
+    raw = bytes(64)
+    type_list = list(types)
+    return raw, editor_parc_serializer.ParcBlob(
+        raw=raw,
+        header=raw[:14],
+        schema_bytes=b"",
+        schema_offset=14,
+        schema_end=20,
+        toc_header_bytes=bytes(12),
+        toc_offset=20,
+        types=type_list,
+        type_by_index={type_def.index: type_def for type_def in type_list},
+        toc_entries=list(toc_entries),
+        data_start=32 + len(toc_entries) * 20,
+        num_root_entries=0,
+        stream_size=len(raw),
+        block_raw={},
+        modified_blocks={},
+    )
+
+
+def test_parc_layout_adapter_accepts_empty_types() -> None:
+    from CrimsonSaveEditor import parc_serializer as editor_parc_serializer
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    raw, parc = _synthetic_parc(editor_parc_serializer)
+
+    result = editor_save_parser.build_result_from_parc(raw, {}, parc)
+
+    assert result["schema"]["root_type"] == ""
+    assert result["schema"]["types"] == []
+    assert result["toc"]["entries"] == []
+
+
+def test_parc_layout_adapter_resolves_class_name_by_type_index() -> None:
+    from CrimsonSaveEditor import parc_serializer as editor_parc_serializer
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    mapped_type = editor_parc_serializer.TypeDef(
+        index=7,
+        name="MappedType",
+        fields=[],
+    )
+    toc_entry = editor_parc_serializer.TOCEntry(
+        index=0,
+        class_index=7,
+        sentinel1=0,
+        sentinel2=0,
+        data_offset=52,
+        data_size=0,
+    )
+    raw, parc = _synthetic_parc(
+        editor_parc_serializer,
+        types=[mapped_type],
+        toc_entries=[toc_entry],
+    )
+
+    result = editor_save_parser.build_result_from_parc(
+        raw,
+        {},
+        parc,
+        object_class_names=set(),
+    )
+
+    assert result["toc"]["entries"][0].class_name == "MappedType"
+
+
+def test_parc_layout_adapter_uses_concrete_parc_type_contract() -> None:
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    assert editor_save_parser.build_result_from_parc.__annotations__["parc"] == (
+        "ParcBlob"
+    )
 
 
 @pytest.mark.parametrize(

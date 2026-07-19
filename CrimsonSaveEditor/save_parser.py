@@ -7,9 +7,12 @@ import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import save_crypto
+
+if TYPE_CHECKING:
+    from parc_serializer import ParcBlob
 
 
 RAW_MAGIC = b"\xFF\xFF\x04\x00"
@@ -1393,18 +1396,39 @@ def build_result_from_raw(
 def build_result_from_parc(
     raw: bytes | bytearray,
     load_meta: dict[str, Any],
-    parc: Any,
+    parc: ParcBlob,
     *,
     object_class_names: set[str] | None = None,
     include_legacy: bool = False,
 ) -> dict[str, Any]:
     raw = bytes(raw)
+    types = [
+        TypeDef(
+            index=type_def.index,
+            name=type_def.name,
+            fields=[
+                FieldDef(
+                    name=field.name,
+                    type_name=field.type_name,
+                    meta_kind=field.meta_kind,
+                    meta_size=field.meta_size,
+                    meta_aux=field.meta_aux,
+                    start_offset=field.start_offset,
+                    end_offset=field.end_offset,
+                )
+                for field in type_def.fields
+            ],
+            start_offset=type_def.start_offset,
+            end_offset=type_def.end_offset,
+        )
+        for type_def in parc.types
+    ]
     schema = {
         "header_tag": _u16(raw, 0x0E),
         "header_zero": _u16(raw, 0x10),
-        "type_count": len(parc.types),
-        "root_type": parc.types[0].name,
-        "types": parc.types,
+        "type_count": len(types),
+        "root_type": types[0].name if types else "",
+        "types": types,
         "schema_end": parc.schema_end,
     }
     toc_entries = [
@@ -1412,8 +1436,8 @@ def build_result_from_parc(
             index=entry.index,
             class_index=entry.class_index,
             class_name=(
-                parc.types[entry.class_index].name
-                if 0 <= entry.class_index < len(parc.types)
+                parc.type_by_index[entry.class_index].name
+                if entry.class_index in parc.type_by_index
                 else f"<class_{entry.class_index}>"
             ),
             sentinel1=entry.sentinel1,
