@@ -9889,6 +9889,7 @@ QCheckBox::indicator {{
             self._blackstar_preview_token = make_blackstar_apply_token(
                 self._loaded_path, current, self._save_data.schema_identity,
                 result.candidate_sha256, self._save_data.document_generation,
+                source_file_sha256=self._save_data.source_file_sha256,
             )
 
         report = result.report

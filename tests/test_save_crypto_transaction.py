@@ -62,6 +62,18 @@ def test_load_with_detect_schema_false_preserves_verified_save_fields(
     assert undetected.is_schema_supported is False
 
 
+def test_loads_capture_sha256_of_exact_encrypted_input(
+    copied_save: Path,
+) -> None:
+    encrypted_sha256 = hashlib.sha256(copied_save.read_bytes()).hexdigest()
+
+    detected = load_save_file(str(copied_save))
+    undetected = load_save_file(str(copied_save), detect_schema=False)
+
+    assert detected.source_file_sha256 == encrypted_sha256
+    assert undetected.source_file_sha256 == encrypted_sha256
+
+
 def test_load_with_detect_schema_false_still_rejects_hmac_mismatch(
     copied_save: Path,
     tmp_path: Path,
@@ -371,6 +383,7 @@ def test_scoped_blackstar_transaction_rejects_changed_source(
         save.schema_identity,
         hashlib.sha256(edited_blob).hexdigest(),
         generation=4,
+        source_file_sha256=save.source_file_sha256,
     )
     copied_save.write_bytes(copied_save.read_bytes() + b"changed")
 
@@ -388,6 +401,54 @@ def test_scoped_blackstar_transaction_rejects_changed_source(
     assert not (copied_save.parent / "backups").exists()
 
 
+def test_scoped_blackstar_token_rejects_change_between_load_and_creation(
+    copied_save: Path,
+) -> None:
+    loaded_file_sha256 = hashlib.sha256(copied_save.read_bytes()).hexdigest()
+    save = load_save_file(str(copied_save))
+    candidate = unlock_blackstar(
+        save.decompressed_blob,
+        save.schema_identity,
+        False,
+        "scoped-stale-preview-candidate",
+    )
+    assert candidate.output_blob is not None
+
+    replacement = serialize_save_bytes(
+        bytes(save.decompressed_blob),
+        save.raw_header,
+        "scoped-stale-preview-replacement",
+    )
+    assert hashlib.sha256(replacement).hexdigest() != loaded_file_sha256
+    copied_save.write_bytes(replacement)
+    replacement_bytes = copied_save.read_bytes()
+
+    token = make_blackstar_apply_token(
+        copied_save,
+        bytes(save.decompressed_blob),
+        save.schema_identity,
+        candidate.candidate_sha256,
+        generation=6,
+        source_file_sha256=save.source_file_sha256,
+    )
+    assert token.source_file_sha256 == loaded_file_sha256
+    assert token.source_file_sha256 != hashlib.sha256(replacement_bytes).hexdigest()
+
+    with pytest.raises(BlackstarCompatibilityError, match="changed after preview"):
+        transactional_write_blackstar(
+            copied_save,
+            candidate.output_blob,
+            save.raw_header,
+            save.schema_identity,
+            token,
+            generation=6,
+            operation_id="scoped-stale-preview-write",
+        )
+
+    assert copied_save.read_bytes() == replacement_bytes
+    assert not (copied_save.parent / "backups").exists()
+
+
 def test_scoped_blackstar_transaction_binds_expected_schema_hash(
     copied_save: Path,
 ) -> None:
@@ -399,6 +460,7 @@ def test_scoped_blackstar_transaction_binds_expected_schema_hash(
         save.schema_identity,
         hashlib.sha256(edited_blob).hexdigest(),
         generation=5,
+        source_file_sha256=save.source_file_sha256,
     )
     changed_identity = replace(save.schema_identity, schema_sha256="0" * 64)
 
@@ -470,6 +532,7 @@ def test_scoped_blackstar_transaction_writes_unknown_schema_with_backup(
     token = make_blackstar_apply_token(
         destination, bytes(save.decompressed_blob), save.schema_identity,
         preview.candidate_sha256, generation=3,
+        source_file_sha256=save.source_file_sha256,
     )
     original_load = save_crypto.load_save_file
     write_boundary_reloads = []

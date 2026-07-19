@@ -55,12 +55,14 @@ def make_blackstar_apply_token(
     identity: SaveSchemaIdentity,
     candidate_blob_sha256: str,
     generation: int,
+    *,
+    source_file_sha256: str,
 ) -> BlackstarApplyToken:
     path = Path(source_path).resolve()
     return BlackstarApplyToken(
         family_id=BLACKSTAR_FAMILY_ID,
         source_path=str(path),
-        source_file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        source_file_sha256=source_file_sha256,
         source_blob_sha256=hashlib.sha256(source_blob).hexdigest(),
         source_schema_sha256=identity.schema_sha256,
         candidate_blob_sha256=candidate_blob_sha256,

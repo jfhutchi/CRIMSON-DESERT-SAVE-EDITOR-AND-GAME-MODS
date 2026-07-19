@@ -50,6 +50,7 @@ class SaveItem:
 
 @dataclass
 class SaveData:
+    source_file_sha256: str
     raw_header: bytes = b""
     decompressed_blob: bytearray = field(default_factory=bytearray)
     original_compressed_size: int = 0

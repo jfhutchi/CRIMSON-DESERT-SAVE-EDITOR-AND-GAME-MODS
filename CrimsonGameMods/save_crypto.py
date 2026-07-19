@@ -179,6 +179,7 @@ def load_save_file(path: str) -> SaveData:
     header = file_data[:HEADER_SIZE]
 
     save_data = SaveData(
+        source_file_sha256=hashlib.sha256(file_data).hexdigest(),
         raw_header=header,
         decompressed_blob=bytearray(decompressed),
         original_compressed_size=payload_size,
@@ -197,6 +198,7 @@ def load_raw_stream(path: str) -> SaveData:
     with open(path, "rb") as f:
         blob = f.read()
     return SaveData(
+        source_file_sha256=hashlib.sha256(blob).hexdigest(),
         raw_header=b"",
         decompressed_blob=bytearray(blob),
         original_compressed_size=0,

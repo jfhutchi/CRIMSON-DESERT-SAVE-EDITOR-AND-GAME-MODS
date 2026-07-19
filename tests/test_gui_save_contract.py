@@ -71,6 +71,7 @@ def test_blackstar_has_preview_bound_atomic_apply() -> None:
     assert "_blackstar_preview_token" in start
     assert "Apply is enabled only" in start
     assert "make_blackstar_apply_token" in finish
+    assert "source_file_sha256=self._save_data.source_file_sha256" in finish
     assert "worker_result.write_result" in finish
     assert "not self._save_data.is_raw_stream" in controls
     assert "save with Ctrl+S" not in start + finish
