@@ -64,10 +64,15 @@ def build_insert_context(blob: bytes | bytearray) -> ParsedInsertContext:
     import save_parser
 
     raw = bytes(blob)
+    parc = parc_serializer.parse_parc_blob(raw)
     return ParsedInsertContext(
         raw=raw,
-        parc=parc_serializer.parse_parc_blob(raw),
-        result=save_parser.build_result_from_raw(raw, {"input_kind": "raw_blob"}),
+        parc=parc,
+        result=save_parser.build_result_from_parc(
+            raw,
+            {"input_kind": "raw_blob"},
+            parc,
+        ),
     )
 
 

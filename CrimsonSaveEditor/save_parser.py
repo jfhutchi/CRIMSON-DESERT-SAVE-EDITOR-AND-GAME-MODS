@@ -1390,6 +1390,56 @@ def build_result_from_raw(
     )
 
 
+def build_result_from_parc(
+    raw: bytes | bytearray,
+    load_meta: dict[str, Any],
+    parc: Any,
+    *,
+    object_class_names: set[str] | None = None,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    raw = bytes(raw)
+    schema = {
+        "header_tag": _u16(raw, 0x0E),
+        "header_zero": _u16(raw, 0x10),
+        "type_count": len(parc.types),
+        "root_type": parc.types[0].name,
+        "types": parc.types,
+        "schema_end": parc.schema_end,
+    }
+    toc_entries = [
+        TocEntry(
+            index=entry.index,
+            class_index=entry.class_index,
+            class_name=(
+                parc.types[entry.class_index].name
+                if 0 <= entry.class_index < len(parc.types)
+                else f"<class_{entry.class_index}>"
+            ),
+            sentinel1=entry.sentinel1,
+            sentinel2=entry.sentinel2,
+            data_offset=entry.data_offset,
+            data_size=entry.data_size,
+            entry_offset=parc.toc_offset + 12 + entry.index * 20,
+        )
+        for entry in parc.toc_entries
+    ]
+    toc = {
+        "prefix_zero": _u32(parc.toc_header_bytes, 0),
+        "toc_count": len(parc.toc_entries),
+        "stream_size": parc.stream_size,
+        "entries": toc_entries,
+    }
+    return build_result_from_layout(
+        raw,
+        load_meta,
+        schema,
+        toc,
+        object_class_names=object_class_names,
+        include_legacy=include_legacy,
+    )
+
+
 def build_result_from_layout(
     raw: bytes | bytearray,
     load_meta: dict[str, Any],

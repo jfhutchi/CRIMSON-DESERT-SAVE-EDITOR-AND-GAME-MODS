@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import get_args, get_type_hints
@@ -129,6 +130,167 @@ def test_selective_layout_result_retains_full_toc(copied_save: Path) -> None:
     assert result["toc"]["entry_count"] == toc["toc_count"]
     assert len(result["toc"]["entries"]) > len(result["objects"])
     assert {obj.class_name for obj in result["objects"]} == IDENTITY_OBJECT_CLASSES
+
+
+def test_insert_context_reuses_parc_layout_without_schema_or_toc_reparse(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from CrimsonSaveEditor import parc_inserter3 as editor_inserter
+    from CrimsonSaveEditor import parc_serializer as editor_parc_serializer
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    save = load_save_file(str(copied_save))
+    raw = bytes(save.decompressed_blob)
+    call_counts = {"parse_parc_blob": 0, "parse_schema": 0, "parse_toc": 0}
+    original_parse_parc = editor_parc_serializer.parse_parc_blob
+    original_parse_schema = editor_save_parser.parse_schema
+    original_parse_toc = editor_save_parser.parse_toc
+
+    def count_parse_parc(blob):
+        call_counts["parse_parc_blob"] += 1
+        return original_parse_parc(blob)
+
+    def count_parse_schema(blob):
+        call_counts["parse_schema"] += 1
+        return original_parse_schema(blob)
+
+    def count_parse_toc(blob, schema_end, type_names):
+        call_counts["parse_toc"] += 1
+        return original_parse_toc(blob, schema_end, type_names)
+
+    monkeypatch.setitem(sys.modules, "parc_serializer", editor_parc_serializer)
+    monkeypatch.setitem(sys.modules, "save_parser", editor_save_parser)
+    monkeypatch.setattr(editor_parc_serializer, "parse_parc_blob", count_parse_parc)
+    monkeypatch.setattr(editor_save_parser, "parse_schema", count_parse_schema)
+    monkeypatch.setattr(editor_save_parser, "parse_toc", count_parse_toc)
+
+    context = editor_inserter.build_insert_context(raw)
+
+    assert context.raw == raw
+    assert context.parc.raw == raw
+    assert call_counts == {
+        "parse_parc_blob": 1,
+        "parse_schema": 0,
+        "parse_toc": 0,
+    }
+
+
+def _schema_semantics(result: dict) -> tuple:
+    schema = result["schema"]
+    return (
+        schema["header_tag"],
+        schema["header_zero"],
+        schema["type_count"],
+        schema["root_type"],
+        tuple(
+            (
+                type_def.index,
+                type_def.name,
+                tuple(
+                    (
+                        field.name,
+                        field.type_name,
+                        field.meta_kind,
+                        field.meta_size,
+                        field.meta_aux,
+                    )
+                    for field in type_def.fields
+                ),
+            )
+            for type_def in schema["types"]
+        ),
+    )
+
+
+def _toc_semantics(result: dict) -> tuple:
+    return tuple(
+        (
+            entry.index,
+            entry.class_index,
+            entry.class_name,
+            entry.sentinel1,
+            entry.sentinel2,
+            entry.data_offset,
+            entry.data_size,
+            entry.entry_offset,
+        )
+        for entry in result["toc"]["entries"]
+    )
+
+
+def test_parc_layout_adapter_matches_raw_result_semantics(copied_save: Path) -> None:
+    from CrimsonSaveEditor import parc_serializer as editor_parc_serializer
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    save = load_save_file(str(copied_save))
+    raw = bytes(save.decompressed_blob)
+    load_meta = {"input_kind": "raw_blob"}
+    parc = editor_parc_serializer.parse_parc_blob(raw)
+
+    expected = editor_save_parser.build_result_from_raw(raw, load_meta)
+    actual = editor_save_parser.build_result_from_parc(raw, load_meta, parc)
+
+    assert actual["input"] == expected["input"]
+    assert actual["raw"] == expected["raw"]
+    assert _schema_semantics(actual) == _schema_semantics(expected)
+    assert actual["toc"]["prefix_zero"] == expected["toc"]["prefix_zero"]
+    assert actual["toc"]["entry_count"] == expected["toc"]["entry_count"]
+    assert actual["toc"]["stream_size"] == expected["toc"]["stream_size"]
+    assert _toc_semantics(actual) == _toc_semantics(expected)
+    assert [asdict(obj) for obj in actual["objects"]] == [
+        asdict(obj) for obj in expected["objects"]
+    ]
+    assert len(actual["toc"]["entries"]) == len(parc.toc_entries)
+
+
+def test_parc_layout_adapter_forwards_decode_options(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from CrimsonSaveEditor import parc_serializer as editor_parc_serializer
+    from CrimsonSaveEditor import save_parser as editor_save_parser
+
+    save = load_save_file(str(copied_save))
+    raw = bytes(save.decompressed_blob)
+    parc = editor_parc_serializer.parse_parc_blob(raw)
+    sentinel = object()
+    captured: dict = {}
+
+    def capture_layout(
+        blob,
+        load_meta,
+        schema,
+        toc,
+        *,
+        object_class_names=None,
+        include_legacy=False,
+    ):
+        captured.update(
+            raw=blob,
+            load_meta=load_meta,
+            schema=schema,
+            toc=toc,
+            object_class_names=object_class_names,
+            include_legacy=include_legacy,
+        )
+        return sentinel
+
+    monkeypatch.setattr(editor_save_parser, "build_result_from_layout", capture_layout)
+
+    result = editor_save_parser.build_result_from_parc(
+        raw,
+        {"source": "contract"},
+        parc,
+        object_class_names=IDENTITY_OBJECT_CLASSES,
+        include_legacy=True,
+    )
+
+    assert result is sentinel
+    assert captured["raw"] == raw
+    assert captured["load_meta"] == {"source": "contract"}
+    assert captured["object_class_names"] == IDENTITY_OBJECT_CLASSES
+    assert captured["include_legacy"] is True
 
 
 @pytest.mark.parametrize(
