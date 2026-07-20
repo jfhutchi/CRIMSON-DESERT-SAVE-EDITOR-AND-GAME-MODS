@@ -269,9 +269,9 @@ def _fixup_global_self_references(
     for block_start, block_end, _ in shifted_blocks:
         pos = block_start
         while pos < block_end - 12:
-            if out[pos:pos + 8] != sentinel:
-                pos += 1
-                continue
+            pos = out.find(sentinel, pos, block_end - 5)
+            if pos == -1:
+                break
 
             ref_pos = pos + 8
             if ref_pos + 4 > block_end:
