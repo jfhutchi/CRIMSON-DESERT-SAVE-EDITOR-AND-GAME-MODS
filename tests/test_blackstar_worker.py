@@ -38,7 +38,15 @@ def test_worker_emits_ordered_progress_and_one_terminal_signal(monkeypatch) -> N
         return expected
 
     monkeypatch.setattr(blackstar_worker, "unlock_blackstar", fake_unlock)
-    monkeypatch.setattr(blackstar_worker, "transactional_write_blackstar", lambda **_kwargs: "written", raising=False)
+    write_calls = []
+
+    def fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return "written"
+
+    monkeypatch.setattr(
+        blackstar_worker, "transactional_write_blackstar", fake_write, raising=False
+    )
     worker = _worker(dry_run=False)
     progress = []
     completed = []
@@ -54,6 +62,7 @@ def test_worker_emits_ordered_progress_and_one_terminal_signal(monkeypatch) -> N
     assert [event.completed for event in progress] == [1, 2, 6, 7]
     assert completed[0].result is expected
     assert completed[0].write_result == "written"
+    assert write_calls[0]["loaded_blob"] == b"fixture-copy"
     assert not failed
     assert not cancelled
 

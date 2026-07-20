@@ -333,6 +333,8 @@ def transactional_write_save(
     expected_identity: SaveSchemaIdentity | None,
     operation_id: str,
     scope_family_id: str | None = None,
+    *,
+    expected_protected_source_sha256: str | None = None,
 ) -> SaveWriteResult:
     from save_compat import (
         UnknownSaveSchemaError,
@@ -359,6 +361,10 @@ def transactional_write_save(
         raise IsADirectoryError(f"Save destination is not a file: {destination}")
 
     destination_was_present = destination.is_file()
+    occupied_save_as = (
+        destination_was_present
+        and destination.resolve() != backup_source.resolve()
+    )
     # Save As may target another occupied slot. Preserve the bytes that are
     # actually about to be replaced; for a new path, preserve the loaded source.
     protected_source = destination if destination_was_present else backup_source
@@ -369,6 +375,7 @@ def transactional_write_save(
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = backup_dir / f"{protected_source.name}.{stamp}.bak"
+    backup_verified = False
     try:
         with phase(
             log,
@@ -378,14 +385,49 @@ def transactional_write_save(
             destination=backup_path,
         ):
             source_hash = _sha256_file(protected_source)
+            if (
+                expected_protected_source_sha256 is not None
+                and not hmac.compare_digest(
+                    source_hash, expected_protected_source_sha256
+                )
+            ):
+                if scope_family_id is not None:
+                    from blackstar_compat import BlackstarCompatibilityError
+
+                    raise BlackstarCompatibilityError(
+                        "Source file changed after preview"
+                    )
+                raise RuntimeError("Protected save source changed before backup")
             source_size = protected_source.stat().st_size
             shutil.copy2(protected_source, backup_path)
             if backup_path.stat().st_size != source_size:
                 raise OSError("Backup size verification failed")
             if _sha256_file(backup_path) != source_hash:
                 raise OSError("Backup SHA-256 verification failed")
+            backup_verified = True
+        if occupied_save_as:
+            with phase(
+                log,
+                operation_id,
+                "backup_validation",
+                destination=backup_path,
+            ):
+                backup_save = load_save_file(str(backup_path))
+                if backup_save.schema_identity is None:
+                    raise UnknownSaveSchemaError(
+                        "Occupied Save As destination has no schema identity"
+                    )
+                require_supported_identity(
+                    backup_save.schema_identity, load_profiles()
+                )
+                if not schema_structure_matches(
+                    backup_save.schema_identity, expected_identity
+                ):
+                    raise UnknownSaveSchemaError(
+                        "Occupied Save As destination schema differs from the loaded schema"
+                    )
     except Exception:
-        if backup_path.exists():
+        if backup_path.exists() and not backup_verified:
             backup_path.unlink()
         raise
 
@@ -451,6 +493,8 @@ def transactional_write_blackstar(
     token,
     generation: int,
     operation_id: str,
+    *,
+    loaded_blob: bytes,
 ) -> SaveWriteResult:
     from blackstar_compat import (
         BLACKSTAR_FAMILY_ID,
@@ -473,6 +517,10 @@ def transactional_write_blackstar(
         raise BlackstarCompatibilityError("Save has no schema identity")
     if expected_identity.schema_sha256 != token.source_schema_sha256:
         raise BlackstarCompatibilityError("Source schema changed after preview")
+    if not hmac.compare_digest(
+        hashlib.sha256(loaded_blob).hexdigest(), token.source_blob_sha256
+    ):
+        raise BlackstarCompatibilityError("Source blob changed after preview")
     if hashlib.sha256(edited_blob).hexdigest() != token.candidate_blob_sha256:
         raise BlackstarCompatibilityError("Candidate hash differs from preview")
     return transactional_write_save(
@@ -483,4 +531,5 @@ def transactional_write_blackstar(
         expected_identity=expected_identity,
         operation_id=operation_id,
         scope_family_id=BLACKSTAR_FAMILY_ID,
+        expected_protected_source_sha256=token.source_file_sha256,
     )

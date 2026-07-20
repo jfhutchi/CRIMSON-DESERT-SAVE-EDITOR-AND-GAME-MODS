@@ -27,6 +27,8 @@ def test_main_save_requires_known_schema_and_mandatory_transactional_backup() ->
     assert "backup_source=self._loaded_path" in method
     assert "expected_identity=self._save_data.schema_identity" in method
     assert "verified backup is mandatory" in method
+    assert "self._save_data.source_file_sha256 = result.output_sha256" in method
+    assert "self._blackstar_preview_token = None" in method
     assert '"Backup Save?"' not in method
 
 
@@ -35,6 +37,8 @@ def test_quest_editor_uses_the_same_safe_writer() -> None:
     assert "transactional_write_save(" in quest_save
     assert "backup_source=self._save_path" in quest_save
     assert "is_schema_supported" in quest_save
+    assert "self._save_data.source_file_sha256 = result.output_sha256" in quest_save
+    assert "parent._blackstar_preview_token = None" in quest_save
     assert "transactional_write_save(" not in main_save
     assert "write_save_file(" not in _source()
 

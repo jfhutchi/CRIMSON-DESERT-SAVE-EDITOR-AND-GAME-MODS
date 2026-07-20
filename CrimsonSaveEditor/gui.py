@@ -1533,6 +1533,10 @@ class QuestEditorWindow(QDialog):
             )
             with open(self._save_path, "rb") as stream:
                 self._save_data.raw_header = stream.read(HEADER_SIZE)
+            self._save_data.source_file_sha256 = result.output_sha256
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_blackstar_preview_token"):
+                parent._blackstar_preview_token = None
             self._status.setText(f"Saved to {os.path.basename(self._save_path)}")
             QMessageBox.information(
                 self,
@@ -31901,6 +31905,8 @@ QCheckBox::indicator {{
             )
             with open(path, "rb") as stream:
                 self._save_data.raw_header = stream.read(HEADER_SIZE)
+            self._save_data.source_file_sha256 = result.output_sha256
+            self._blackstar_preview_token = None
             self._save_data.file_path = path
             self._loaded_path = path
             self._dirty = False

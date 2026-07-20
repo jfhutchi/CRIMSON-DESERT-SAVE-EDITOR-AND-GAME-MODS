@@ -273,6 +273,60 @@ def test_save_as_backs_up_existing_destination_not_loaded_source(
     assert _sha256(result.backup_path) == destination_hash
 
 
+def test_save_as_rejects_invalid_occupied_destination_after_verified_backup(
+    copied_save: Path,
+    tmp_path: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    destination = tmp_path / "invalid-slot" / "save.save"
+    destination.parent.mkdir(parents=True)
+    invalid_bytes = b"NOT!" + bytes(200)
+    destination.write_bytes(invalid_bytes)
+
+    with pytest.raises(ValueError, match="Bad magic"):
+        transactional_write_save(
+            destination=destination,
+            edited_blob=bytes(save.decompressed_blob),
+            original_header=save.raw_header,
+            backup_source=copied_save,
+            expected_identity=save.schema_identity,
+            operation_id="save-as-invalid-destination-test",
+        )
+
+    assert destination.read_bytes() == invalid_bytes
+    backups = list((destination.parent / "backups").glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == invalid_bytes
+    assert not list(destination.parent.glob(".save.save.*.tmp"))
+
+
+def test_save_as_rejects_unknown_occupied_destination_after_verified_backup(
+    copied_save: Path,
+    early_114_save_path: Path,
+    tmp_path: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    destination = tmp_path / "unknown-slot" / "save.save"
+    destination.parent.mkdir(parents=True)
+    unknown_bytes = early_114_save_path.read_bytes()
+    destination.write_bytes(unknown_bytes)
+
+    with pytest.raises(save_compat.UnknownSaveSchemaError):
+        transactional_write_save(
+            destination=destination,
+            edited_blob=bytes(save.decompressed_blob),
+            original_header=save.raw_header,
+            backup_source=copied_save,
+            expected_identity=save.schema_identity,
+            operation_id="save-as-unknown-destination-test",
+        )
+
+    assert destination.read_bytes() == unknown_bytes
+    backups = list((destination.parent / "backups").glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == unknown_bytes
+    assert not list(destination.parent.glob(".save.save.*.tmp"))
+
 def test_destination_change_after_backup_aborts_replace(
     copied_save: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -395,6 +449,7 @@ def test_scoped_blackstar_transaction_rejects_changed_source(
             save.schema_identity,
             token,
             generation=4,
+            loaded_blob=edited_blob,
             operation_id="scoped-source-race-test",
         )
 
@@ -442,6 +497,7 @@ def test_scoped_blackstar_token_rejects_change_between_load_and_creation(
             save.schema_identity,
             token,
             generation=6,
+            loaded_blob=bytes(save.decompressed_blob),
             operation_id="scoped-stale-preview-write",
         )
 
@@ -472,11 +528,88 @@ def test_scoped_blackstar_transaction_binds_expected_schema_hash(
             changed_identity,
             token,
             generation=5,
+            loaded_blob=edited_blob,
             operation_id="scoped-schema-binding-test",
         )
 
     assert not (copied_save.parent / "backups").exists()
 
+
+def test_scoped_blackstar_rejects_race_before_backup_hash(
+    copied_save: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = load_save_file(str(copied_save))
+    loaded_blob = bytes(save.decompressed_blob)
+    token = make_blackstar_apply_token(
+        copied_save,
+        loaded_blob,
+        save.schema_identity,
+        hashlib.sha256(loaded_blob).hexdigest(),
+        generation=8,
+        source_file_sha256=save.source_file_sha256,
+    )
+    replacement = serialize_save_bytes(
+        loaded_blob, save.raw_header, "scoped-backup-race-replacement"
+    )
+    real_sha256_file = save_crypto._sha256_file
+    destination_hash_calls = 0
+
+    def mutate_before_authoritative_hash(path: Path) -> str:
+        nonlocal destination_hash_calls
+        if Path(path).resolve() == copied_save.resolve():
+            destination_hash_calls += 1
+            if destination_hash_calls == 2:
+                copied_save.write_bytes(replacement)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(save_crypto, "_sha256_file", mutate_before_authoritative_hash)
+
+    with pytest.raises(BlackstarCompatibilityError, match="changed after preview"):
+        transactional_write_blackstar(
+            copied_save,
+            loaded_blob,
+            save.raw_header,
+            save.schema_identity,
+            token,
+            generation=8,
+            operation_id="scoped-backup-race-test",
+            loaded_blob=loaded_blob,
+        )
+
+    assert destination_hash_calls == 2
+    assert copied_save.read_bytes() == replacement
+    assert not list((copied_save.parent / "backups").glob("*.bak"))
+    assert not list(copied_save.parent.glob(".save.save.*.tmp"))
+
+
+def test_scoped_blackstar_rejects_loaded_blob_not_bound_to_preview(
+    copied_save: Path,
+) -> None:
+    save = load_save_file(str(copied_save))
+    loaded_blob = bytes(save.decompressed_blob)
+    token = make_blackstar_apply_token(
+        copied_save,
+        loaded_blob,
+        save.schema_identity,
+        hashlib.sha256(loaded_blob).hexdigest(),
+        generation=9,
+        source_file_sha256=save.source_file_sha256,
+    )
+
+    with pytest.raises(BlackstarCompatibilityError, match="Source blob changed after preview"):
+        transactional_write_blackstar(
+            copied_save,
+            loaded_blob,
+            save.raw_header,
+            save.schema_identity,
+            token,
+            generation=9,
+            operation_id="scoped-loaded-blob-binding-test",
+            loaded_blob=loaded_blob + b"tampered",
+        )
+
+    assert not (copied_save.parent / "backups").exists()
 
 def test_blackstar_apply_write_reload_is_idempotent(copied_save: Path) -> None:
     save = load_save_file(str(copied_save))
@@ -554,6 +687,7 @@ def test_scoped_blackstar_transaction_writes_unknown_schema_with_backup(
     result = transactional_write_blackstar(
         destination, applied.output_blob, save.raw_header, save.schema_identity,
         token, generation=3, operation_id="scoped-write",
+        loaded_blob=bytes(save.decompressed_blob),
     )
     assert result.backup_path.exists()
     assert len(write_boundary_reloads) == 1

@@ -80,6 +80,7 @@ class BlackstarWorker(QObject):
                     original_header=self._original_header,
                     expected_identity=self._identity, token=self._apply_token,
                     generation=self.generation, operation_id=self._operation_id,
+                    loaded_blob=self._blob,
                 )
         except BlackstarCancelledError:
             self.cancelled.emit()
