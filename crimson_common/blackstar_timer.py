@@ -440,30 +440,46 @@ class BlackstarTimerService:
 
     def _normalize_token_archive_hashes(
         self,
-        game: Path,
         archive_hashes: tuple[ArchiveFileHash, ...],
     ) -> dict[str, str]:
         expected_hashes: dict[str, str] = {}
         for expected in archive_hashes:
             try:
-                path = self._contained_path(game, expected.relative_path)
+                relative = self._archive_relative_path(
+                    expected.relative_path
+                ).as_posix()
             except BackupConflictError as exc:
                 raise StalePreviewError(str(exc)) from exc
-            relative = path.relative_to(game).as_posix()
             if relative in expected_hashes:
                 raise StalePreviewError("Source archive changed after preview")
             expected_hashes[relative] = expected.sha256
         return expected_hashes
 
+    @staticmethod
+    def _resolve_preview_game_root(game_dir: Path) -> Path:
+        expanded = game_dir.expanduser()
+        try:
+            return expanded.resolve(strict=True)
+        except OSError as exc:
+            raise StalePreviewError(
+                "Source archive changed after preview"
+            ) from exc
+        except RuntimeError as exc:
+            if not str(exc).startswith("Symlink loop from "):
+                raise
+            raise StalePreviewError(
+                "Source archive changed after preview"
+            ) from exc
+
     def validate_preview_token(self, token: PreviewToken) -> None:
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
-        game = token.game_dir.expanduser().resolve(strict=True)
+        expected_hashes = self._normalize_token_archive_hashes(
+            token.archive_hashes
+        )
+        game = self._resolve_preview_game_root(token.game_dir)
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
-        expected_hashes = self._normalize_token_archive_hashes(
-            game, token.archive_hashes
-        )
         process_report = self._process_report(game)
         if process_report is not None:
             raise StalePreviewError("Source archive changed after preview")
@@ -525,14 +541,17 @@ class BlackstarTimerService:
         token: PreviewToken,
         progress: Callable[[str, int], None] | None = None,
     ) -> TransactionReport:
-        self._emit_progress(progress, "process_check", 5)
-        self._ensure_game_closed()
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
-        game = token.game_dir.expanduser().resolve(strict=True)
+        expected_hashes = self._normalize_token_archive_hashes(
+            token.archive_hashes
+        )
+        game = self._resolve_preview_game_root(token.game_dir)
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
 
+        self._emit_progress(progress, "process_check", 5)
+        self._ensure_game_closed()
         process_report = self._process_report(game)
         inspection = None
         if process_report is not None:
@@ -567,9 +586,6 @@ class BlackstarTimerService:
                 duration_seconds=current.duration_seconds,
             )
 
-        expected_hashes = self._normalize_token_archive_hashes(
-            game, token.archive_hashes
-        )
         process_report = self._process_report(game)
         if process_report is not None:
             raise StalePreviewError("Source archive changed after preview")
@@ -1593,7 +1609,7 @@ class BlackstarTimerService:
         return path
 
     @staticmethod
-    def _contained_path(root: Path, relative: str) -> Path:
+    def _archive_relative_path(relative: str) -> Path:
         if "\\" in relative:
             raise BackupConflictError(f"Unsafe backup path: {relative}")
         parts = relative.split("/")
@@ -1603,8 +1619,13 @@ class BlackstarTimerService:
             or relative.startswith("/")
         ):
             raise BackupConflictError(f"Unsafe backup path: {relative}")
+        return Path(*parts)
+
+    @classmethod
+    def _contained_path(cls, root: Path, relative: str) -> Path:
+        relative_path = cls._archive_relative_path(relative)
         root = root.resolve()
-        candidate = (root / Path(*parts)).resolve()
+        candidate = (root / relative_path).resolve()
         try:
             candidate.relative_to(root)
         except ValueError as exc:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 from collections import Counter
 from dataclasses import FrozenInstanceError, replace
@@ -344,6 +345,167 @@ def test_preview_token_rejects_unsafe_path_before_source_inspection(
     assert service.body_read_count == 0
 
 
+@pytest.mark.parametrize("action", ["validate", "apply"])
+def test_token_missing_root_is_stale_before_process_or_inspection(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
+    assert preview.token is not None
+    preserved = tmp_path / "preserved-game"
+    archive.game_dir.rename(preserved)
+    before = _snapshot(preserved)
+    process_calls = 0
+
+    def check_process() -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return False
+
+    service = _CountingInspectionService(profile, process_checker=check_process)
+
+    with pytest.raises(StalePreviewError) as raised:
+        if action == "validate":
+            service.validate_preview_token(preview.token)
+        else:
+            service.apply(preview.token)
+
+    assert type(raised.value) is StalePreviewError
+    assert str(raised.value) == "Source archive changed after preview"
+    assert process_calls == 0
+    assert service.entry_lookup_count == 0
+    assert service.body_read_count == 0
+    assert not archive.game_dir.exists()
+    assert _snapshot(preserved) == before
+
+
+@pytest.mark.parametrize("action", ["validate", "apply"])
+def test_unsafe_token_precedes_missing_root_and_all_external_work(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
+    assert preview.token is not None
+    unsafe = replace(
+        preview.token,
+        archive_hashes=(ArchiveFileHash("../outside.bin", "0" * 64),),
+    )
+    preserved = tmp_path / "preserved-game"
+    archive.game_dir.rename(preserved)
+    before = _snapshot(preserved)
+    process_calls = 0
+
+    def check_process() -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return False
+
+    service = _CountingInspectionService(profile, process_checker=check_process)
+
+    with pytest.raises(StalePreviewError) as raised:
+        if action == "validate":
+            service.validate_preview_token(unsafe)
+        else:
+            service.apply(unsafe)
+
+    assert type(raised.value) is StalePreviewError
+    assert str(raised.value) == "Unsafe backup path: ../outside.bin"
+    assert process_calls == 0
+    assert service.entry_lookup_count == 0
+    assert service.body_read_count == 0
+    assert not archive.game_dir.exists()
+    assert _snapshot(preserved) == before
+    assert not (tmp_path / "outside.bin").exists()
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only link resolution")
+@pytest.mark.parametrize("action", ["validate", "apply"])
+@pytest.mark.parametrize(
+    "root_kind",
+    ["broken_junction", "junction_loop", "broken_symlink", "symlink_loop"],
+)
+def test_token_broken_or_looped_root_is_stale_without_external_work(
+    tmp_path: Path,
+    action: str,
+    root_kind: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
+    assert preview.token is not None
+    preserved = tmp_path / "preserved-game"
+    archive.game_dir.rename(preserved)
+    before = _snapshot(preserved)
+    missing_target = tmp_path / "missing-target"
+    peer = tmp_path / "root-link-peer"
+    links: list[Path] = []
+
+    try:
+        if root_kind == "broken_junction":
+            _create_junction(
+                archive.game_dir,
+                missing_target,
+                create_target=False,
+            )
+            links.append(archive.game_dir)
+        elif root_kind == "junction_loop":
+            _create_junction(archive.game_dir, peer, create_target=False)
+            _create_junction(peer, archive.game_dir, create_target=False)
+            links.extend([archive.game_dir, peer])
+        else:
+            try:
+                if root_kind == "broken_symlink":
+                    os.symlink(
+                        missing_target,
+                        archive.game_dir,
+                        target_is_directory=True,
+                    )
+                    links.append(archive.game_dir)
+                else:
+                    os.symlink(peer, archive.game_dir, target_is_directory=True)
+                    os.symlink(
+                        archive.game_dir,
+                        peer,
+                        target_is_directory=True,
+                    )
+                    links.extend([archive.game_dir, peer])
+            except OSError as exc:
+                pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+        process_calls = 0
+
+        def check_process() -> bool:
+            nonlocal process_calls
+            process_calls += 1
+            return False
+
+        service = _CountingInspectionService(
+            profile,
+            process_checker=check_process,
+        )
+
+        with pytest.raises(StalePreviewError) as raised:
+            if action == "validate":
+                service.validate_preview_token(preview.token)
+            else:
+                service.apply(preview.token)
+
+        assert type(raised.value) is StalePreviewError
+        assert str(raised.value) == "Source archive changed after preview"
+        assert process_calls == 0
+        assert service.entry_lookup_count == 0
+        assert service.body_read_count == 0
+        assert _snapshot(preserved) == before
+        assert not missing_target.exists()
+    finally:
+        for link in links:
+            _remove_directory_link(link)
+
+
 def test_preview_token_rejects_duplicate_paths_before_source_inspection(
     tmp_path: Path,
 ) -> None:
@@ -451,8 +613,14 @@ def _archive_contents(paths: tuple[Path, Path, Path]) -> dict[Path, bytes]:
     return {path: path.read_bytes() for path in paths}
 
 
-def _create_junction(link: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
+def _create_junction(
+    link: Path,
+    target: Path,
+    *,
+    create_target: bool = True,
+) -> None:
+    if create_target:
+        target.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
         check=False,
@@ -462,6 +630,13 @@ def _create_junction(link: Path, target: Path) -> None:
     )
     assert result.returncode == 0, result.stderr or result.stdout
     assert os.path.isjunction(link)
+
+
+def _remove_directory_link(path: Path) -> None:
+    if os.path.isjunction(path):
+        os.rmdir(path)
+    elif path.is_symlink():
+        path.unlink()
 
 
 def _file_tree(root: Path) -> dict[str, bytes]:
