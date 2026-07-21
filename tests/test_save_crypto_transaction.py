@@ -162,6 +162,10 @@ assert Path.cwd().resolve() == expected_cwd
 
 sys.path.insert(0, str(app_dir))
 assert Path(sys.path[0]).resolve() == app_dir
+repo_local_site_packages = (
+    app_dir.parent / ".venv" / "Lib" / "site-packages"
+).resolve()
+sys.path.insert(1, str(repo_local_site_packages))
 import save_crypto
 import models
 
@@ -174,14 +178,43 @@ assert actual_models == expected_models
 assert save_crypto.SaveData is models.SaveData
 
 repo_root = app_dir.parent
-repo_entries = []
-for entry in sys.path:
-    if not entry:
-        continue
-    resolved = Path(entry).resolve()
-    if resolved == repo_root or repo_root in resolved.parents:
-        repo_entries.append(resolved)
-assert repo_entries == [app_dir]
+app_source_roots = {
+    (repo_root / "CrimsonSaveEditor").resolve(),
+    (repo_root / "CrimsonGameMods").resolve(),
+}
+
+
+def app_source_entries():
+    return [
+        Path(entry).resolve()
+        for entry in sys.path
+        if entry and Path(entry).resolve() in app_source_roots
+    ]
+
+
+def assert_app_source_isolation():
+    assert app_source_entries() == [app_dir]
+
+
+assert_app_source_isolation()
+opposing_app_dir = next(
+    source_root
+    for source_root in app_source_roots
+    if source_root != app_dir
+)
+sys.path.append(str(opposing_app_dir))
+try:
+    try:
+        assert_app_source_isolation()
+    except AssertionError:
+        opposing_source_rejected = True
+    else:
+        opposing_source_rejected = False
+finally:
+    removed_path = Path(sys.path.pop()).resolve()
+assert removed_path == opposing_app_dir
+assert opposing_source_rejected
+assert_app_source_isolation()
 
 payload = bytes(range(256)) * 4
 if operation == "write":
@@ -254,6 +287,9 @@ print(json.dumps({
     "app_dir": str(app_dir),
     "save_crypto_file": str(actual_crypto),
     "models_file": str(actual_models),
+    "repo_local_site_packages": str(repo_local_site_packages),
+    "app_source_entries": [str(path) for path in app_source_entries()],
+    "opposing_source_rejected": opposing_source_rejected,
     "payload_sha256": hashlib.sha256(payload).hexdigest(),
     "version": version,
 }))
@@ -357,6 +393,13 @@ def test_isolated_save_crypto_cross_app_interoperability(
         assert Path(report["app_dir"]) == expected_dir
         assert Path(report["save_crypto_file"]) == expected_dir / "save_crypto.py"
         assert Path(report["models_file"]) == expected_dir / "models.py"
+        assert Path(report["repo_local_site_packages"]) == (
+            ROOT / ".venv" / "Lib" / "site-packages"
+        ).resolve()
+        assert [Path(path) for path in report["app_source_entries"]] == [
+            expected_dir
+        ]
+        assert report["opposing_source_rejected"] is True
         assert report["version"] == version
     assert writer["payload_sha256"] == reader["payload_sha256"]
 
