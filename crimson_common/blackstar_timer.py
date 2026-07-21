@@ -409,7 +409,10 @@ class BlackstarTimerService:
             archive_hashes=tuple(
                 ArchiveFileHash(
                     relative_path=path.relative_to(detection.game_dir).as_posix(),
-                    sha256=self._hash_file(path),
+                    sha256=self._hash_file(
+                        path,
+                        "preview:" + path.relative_to(detection.game_dir).as_posix(),
+                    ),
                 )
                 for path in inspection.paths
             ),
@@ -455,7 +458,7 @@ class BlackstarTimerService:
     def validate_preview_token(self, token: PreviewToken) -> None:
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
-        game = token.game_dir.expanduser().resolve()
+        game = token.game_dir.expanduser().resolve(strict=True)
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
         expected_hashes = self._normalize_token_archive_hashes(
@@ -500,7 +503,10 @@ class BlackstarTimerService:
                 raise StalePreviewError(
                     f"Source archive changed after preview: {relative}"
                 )
-            current_hashes[relative] = self._hash_file(path)
+            current_hashes[relative] = self._hash_file(
+                path,
+                f"source-revalidation:{relative}",
+            )
 
         if current_hashes != expected_hashes:
             changed = sorted(
@@ -523,7 +529,7 @@ class BlackstarTimerService:
         self._ensure_game_closed()
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
-        game = token.game_dir.expanduser().resolve()
+        game = token.game_dir.expanduser().resolve(strict=True)
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
 
@@ -613,26 +619,66 @@ class BlackstarTimerService:
                 token.entry_offset,
                 slot_payload,
                 expected_paz.source_entry_sha256,
+                trusted_root=game,
             )
             self._emit_progress(progress, "paz_write", 50)
             self._inject_fault("after_paz_write")
 
+            pamt_relative = pamt_path.relative_to(game).as_posix()
+            papgt_relative = papgt_path.relative_to(game).as_posix()
+            source_pamt = self._read_metadata_bytes(
+                backup_dir / pamt_relative,
+                f"metadata-build:{pamt_relative}",
+            )
+            source_papgt = self._read_metadata_bytes(
+                backup_dir / papgt_relative,
+                f"metadata-build:{papgt_relative}",
+            )
             new_pamt, new_papgt = self._build_metadata_bytes(
                 backup_dir,
                 entry,
                 len(candidate_compressed),
                 expected_paz.checksum,
                 expected_paz.size,
+                source_metadata=(source_pamt, source_papgt),
+            )
+            self._assert_metadata_unchanged(
+                pamt_path,
+                source_pamt,
+                f"metadata-guard-after-paz:{pamt_relative}",
+            )
+            self._assert_metadata_unchanged(
+                papgt_path,
+                source_papgt,
+                f"metadata-guard-after-paz:{papgt_relative}",
             )
             expected_post_hashes = {
                 paz_path.relative_to(game).as_posix(): expected_paz.sha256,
-                pamt_path.relative_to(game).as_posix(): self._sha256_bytes(new_pamt),
-                papgt_path.relative_to(game).as_posix(): self._sha256_bytes(new_papgt),
+                pamt_relative: self._sha256_bytes(new_pamt),
+                papgt_relative: self._sha256_bytes(new_papgt),
             }
-            self._atomic_write(pamt_path, new_pamt, "pamt")
+            self._atomic_write(
+                pamt_path,
+                new_pamt,
+                "pamt",
+                trusted_root=game,
+                expected_current=source_pamt,
+                metadata_guard_operation=(
+                    f"metadata-guard-before-replace:{pamt_relative}"
+                ),
+            )
             self._emit_progress(progress, "pamt_update", 65)
             self._inject_fault("after_pamt_write")
-            self._atomic_write(papgt_path, new_papgt, "papgt")
+            self._atomic_write(
+                papgt_path,
+                new_papgt,
+                "papgt",
+                trusted_root=game,
+                expected_current=source_papgt,
+                metadata_guard_operation=(
+                    f"metadata-guard-before-replace:{papgt_relative}"
+                ),
+            )
             self._emit_progress(progress, "papgt_update", 80)
             self._inject_fault("after_papgt_write")
             verified, post_hashes = self._verify_archive_set(
@@ -643,11 +689,14 @@ class BlackstarTimerService:
                 token.candidate_body_sha256,
             )
             self._emit_progress(progress, "post_write_verification", 95)
-            manifest = self._read_manifest(manifest_path)
+            manifest = self._read_manifest(
+                manifest_path,
+                "manifest-finalization",
+            )
             manifest["post_apply_hashes"] = post_hashes
             manifest["finalized"] = True
             manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
-            self._write_manifest(manifest_path, manifest)
+            self._write_manifest(manifest_path, manifest, trusted_root=game)
         except Exception as exc:
             if not mutation_attempted:
                 raise
@@ -660,13 +709,16 @@ class BlackstarTimerService:
                     TimerStatus.VANILLA,
                     token.source_body_sha256,
                 )
-                manifest = self._read_manifest(manifest_path)
+                manifest = self._read_manifest(
+                    manifest_path,
+                    "manifest-rollback",
+                )
                 manifest["post_apply_hashes"] = {}
                 manifest["finalized"] = False
                 manifest.pop("finalized_at", None)
                 manifest["rolled_back"] = True
                 manifest["rollback_reason"] = str(exc)
-                self._write_manifest(manifest_path, manifest)
+                self._write_manifest(manifest_path, manifest, trusted_root=game)
             except Exception as rollback_exc:
                 raise TimerTransactionError(
                     f"Apply failed: {exc}; rollback also failed: {rollback_exc}"
@@ -799,7 +851,9 @@ class BlackstarTimerService:
         entry_offset: int,
         entry_size: int,
         replacement: bytes | None = None,
+        operation: str | None = None,
     ) -> _PazIdentity:
+        del operation
         size = path.stat().st_size
         entry_end = entry_offset + entry_size
         if entry_offset < 0 or entry_size < 0 or entry_end > size:
@@ -880,19 +934,79 @@ class BlackstarTimerService:
         entry_offset: int,
         slot_payload: bytes,
         source_entry_sha256: str,
+        trusted_root: Path | None = None,
     ) -> None:
+        if trusted_root is not None:
+            self._assert_safe_archive_path(
+                trusted_root,
+                paz_path,
+                "paz-open",
+                require_exists=True,
+            )
         with paz_path.open("r+b") as handle:
             handle.seek(entry_offset)
-            source_entry = handle.read(len(slot_payload))
+            source_entry = self._read_paz_slot(
+                handle,
+                len(slot_payload),
+                "paz-patch:"
+                + (
+                    paz_path.relative_to(trusted_root).as_posix()
+                    if trusted_root is not None
+                    else paz_path.name
+                )
+                + "-slot",
+            )
             if (
                 len(source_entry) != len(slot_payload)
                 or self._sha256_bytes(source_entry) != source_entry_sha256
             ):
                 raise StalePreviewError("Source archive changed after preview")
+            if trusted_root is not None:
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    paz_path,
+                    "paz-write",
+                    require_exists=True,
+                )
             handle.seek(entry_offset)
             self._write_all(handle, slot_payload, "paz-slot")
             self._flush_file(handle, "paz-slot")
             self._fsync_file(handle, "paz-slot")
+
+    @staticmethod
+    def _read_metadata_bytes(path: Path, operation: str) -> bytes:
+        del operation
+        return path.read_bytes()
+
+    @staticmethod
+    def _parse_pamt_bytes(data: bytes, operation: str) -> dict:
+        del operation
+        return crimson_rs.parse_pamt_bytes(data)
+
+    @staticmethod
+    def _parse_papgt_bytes(data: bytes, operation: str) -> dict:
+        del operation
+        return crimson_rs.parse_papgt_bytes(data)
+
+    @staticmethod
+    def _read_paz_slot(
+        handle: BinaryIO,
+        size: int,
+        operation: str,
+    ) -> bytes:
+        del operation
+        return handle.read(size)
+
+    def _assert_metadata_unchanged(
+        self,
+        path: Path,
+        expected: bytes,
+        operation: str,
+    ) -> None:
+        if self._read_metadata_bytes(path, operation) != expected:
+            raise StalePreviewError(
+                f"Live metadata changed during apply: {path.name}"
+            )
 
     def _build_metadata_bytes(
         self,
@@ -901,9 +1015,22 @@ class BlackstarTimerService:
         candidate_compressed_size: int,
         paz_checksum: int,
         paz_size: int,
+        source_metadata: tuple[bytes, bytes] | None = None,
     ) -> tuple[bytes, bytes]:
         _paz_path, pamt_path, papgt_path = self._source_paths(game, entry)
-        pamt = crimson_rs.parse_pamt_file(str(pamt_path))
+        pamt_operation = (
+            "metadata-build:" + pamt_path.relative_to(game).as_posix()
+        )
+        papgt_operation = (
+            "metadata-build:" + papgt_path.relative_to(game).as_posix()
+        )
+        if source_metadata is None:
+            source_metadata = (
+                self._read_metadata_bytes(pamt_path, pamt_operation),
+                self._read_metadata_bytes(papgt_path, papgt_operation),
+            )
+        source_pamt, source_papgt = source_metadata
+        pamt = self._parse_pamt_bytes(source_pamt, pamt_operation)
         pamt_entry = self._find_entry_in_document(pamt)
         pamt_entry["compressed_size"] = candidate_compressed_size
         chunk_id = int(pamt_entry["chunk_id"])
@@ -917,10 +1044,13 @@ class BlackstarTimerService:
             "<I", pamt_bytes, 0, crimson_rs.calculate_checksum(bytes(pamt_bytes[12:]))
         )
         new_pamt = bytes(pamt_bytes)
-        verified_pamt = crimson_rs.parse_pamt_bytes(new_pamt)
+        verified_pamt = self._parse_pamt_bytes(
+            new_pamt,
+            "metadata-build:candidate:0008/0.pamt",
+        )
         pamt_checksum = int(verified_pamt["checksum"])
 
-        papgt = crimson_rs.parse_papgt_file(str(papgt_path))
+        papgt = self._parse_papgt_bytes(source_papgt, papgt_operation)
         groups = [
             item
             for item in papgt["entries"]
@@ -936,41 +1066,113 @@ class BlackstarTimerService:
             "<I", papgt_bytes, 4, crimson_rs.calculate_checksum(bytes(papgt_bytes[12:]))
         )
         new_papgt = bytes(papgt_bytes)
-        crimson_rs.parse_papgt_bytes(new_papgt)
+        self._parse_papgt_bytes(
+            new_papgt,
+            "metadata-build:candidate:meta/0.papgt",
+        )
         return new_pamt, new_papgt
+
+    def _mkdir_safe_archive_directory(
+        self,
+        game: Path,
+        directory: Path,
+        operation: str,
+        *,
+        exist_ok: bool,
+    ) -> bool:
+        self._assert_safe_archive_path(
+            game,
+            directory,
+            operation,
+            require_exists=False,
+        )
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            self._assert_safe_archive_path(
+                game,
+                directory,
+                operation,
+                require_exists=True,
+            )
+            if not exist_ok:
+                raise
+            if not directory.is_dir():
+                raise NotADirectoryError(
+                    f"Backup path component is not a directory: {directory}"
+                )
+            return False
+        self._assert_safe_archive_path(
+            game,
+            directory,
+            operation,
+            require_exists=True,
+        )
+        return True
 
     def _copy_backup_file(
         self,
+        game: Path,
         source: Path,
         destination: Path,
         operation: str,
     ) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with (
-            source.open("rb") as source_handle,
-            destination.open("xb") as backup_handle,
-        ):
-            while True:
-                block = source_handle.read(1024 * 1024)
-                if not block:
-                    break
-                self._write_all(backup_handle, block, operation)
-            self._flush_file(backup_handle, operation)
-            self._fsync_file(backup_handle, operation)
+        current = game
+        for part in destination.parent.relative_to(game).parts:
+            current = current / part
+            self._mkdir_safe_archive_directory(
+                game,
+                current,
+                f"backup-parent:{current.relative_to(game).as_posix()}",
+                exist_ok=True,
+            )
+
+        self._assert_safe_archive_path(
+            game,
+            source,
+            f"{operation}:source-open",
+            require_exists=True,
+        )
+        with source.open("rb") as source_handle:
+            self._assert_safe_archive_path(
+                game,
+                destination,
+                f"{operation}:destination-open",
+                require_exists=False,
+            )
+            with destination.open("xb") as backup_handle:
+                self._assert_safe_archive_path(
+                    game,
+                    destination,
+                    f"{operation}:destination-write",
+                    require_exists=True,
+                )
+                while True:
+                    block = source_handle.read(1024 * 1024)
+                    if not block:
+                        break
+                    self._write_all(backup_handle, block, operation)
+                self._flush_file(backup_handle, operation)
+                self._fsync_file(backup_handle, operation)
 
     def _create_backup_root(self, game: Path, root: Path) -> None:
         current = game
         for part in root.relative_to(game).parts:
             current = current / part
-            try:
-                current.mkdir()
-            except FileExistsError:
-                if not current.is_dir():
-                    raise NotADirectoryError(
-                        f"Backup path component is not a directory: {current}"
-                    )
-            else:
-                relative = current.relative_to(game).as_posix()
+            relative = current.relative_to(game).as_posix()
+            created = self._mkdir_safe_archive_directory(
+                game,
+                current,
+                f"backup-root-mkdir:{relative}",
+                exist_ok=True,
+            )
+            if created:
+                self._assert_safe_archive_path(
+                    game,
+                    current.parent,
+                    f"backup-root-parent:{relative}",
+                    require_exists=True,
+                )
                 self._sync_directory(
                     current.parent,
                     f"backup-root-parent:{relative}",
@@ -988,7 +1190,18 @@ class BlackstarTimerService:
         self._create_backup_root(game, root)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         backup_dir = root / timestamp
-        backup_dir.mkdir(exist_ok=False)
+        self._mkdir_safe_archive_directory(
+            game,
+            backup_dir,
+            "backup-timestamp-mkdir",
+            exist_ok=False,
+        )
+        self._assert_safe_archive_path(
+            game,
+            root,
+            "backup-root-directory",
+            require_exists=True,
+        )
         self._sync_directory(root, "backup-root-directory")
 
         expected_paz: _PazIdentity | None = None
@@ -997,7 +1210,13 @@ class BlackstarTimerService:
             relative_text = relative.as_posix()
             destination = backup_dir / relative
             operation = f"backup:{relative_text}"
-            self._copy_backup_file(path, destination, operation)
+            self._copy_backup_file(game, path, destination, operation)
+            self._assert_safe_archive_path(
+                game,
+                destination.parent,
+                f"backup-directory:{relative_text}",
+                require_exists=True,
+            )
             self._sync_directory(
                 destination.parent,
                 f"backup-directory:{relative_text}",
@@ -1009,10 +1228,14 @@ class BlackstarTimerService:
                     token.entry_offset,
                     token.source_compressed_size,
                     replacement=slot_payload,
+                    operation=f"backup-verification:{relative_text}",
                 )
                 backup_hash = expected_paz.source_sha256
             else:
-                backup_hash = self._hash_file(destination)
+                backup_hash = self._hash_file(
+                    destination,
+                    f"backup-verification:{relative_text}",
+                )
             if backup_hash != expected:
                 raise OSError(f"Backup verification failed: {relative_text}")
 
@@ -1031,8 +1254,11 @@ class BlackstarTimerService:
             "rolled_back": False,
             "restored": False,
         }
-        self._write_manifest(backup_dir / "manifest.json", manifest)
-        self._sync_directory(backup_dir, "backup-directory")
+        self._write_manifest(
+            backup_dir / "manifest.json",
+            manifest,
+            trusted_root=game,
+        )
         if expected_paz is None:
             raise OSError("Backup PAZ identity was not calculated")
         return backup_dir, expected_paz
@@ -1053,10 +1279,15 @@ class BlackstarTimerService:
         paz_relative, paz_path = contained_paths[0]
         pamt_relative, pamt_path = contained_paths[1]
         papgt_relative, papgt_path = contained_paths[2]
-        pamt_bytes = pamt_path.read_bytes()
-        papgt_bytes = papgt_path.read_bytes()
-        entry_mapping, chunk_checksum, chunk_size = (
-            self._verify_integrity_bytes(pamt_bytes, papgt_bytes)
+        pamt_operation = f"post-write-verification:{pamt_relative}"
+        papgt_operation = f"post-write-verification:{papgt_relative}"
+        pamt_bytes = self._read_metadata_bytes(pamt_path, pamt_operation)
+        papgt_bytes = self._read_metadata_bytes(papgt_path, papgt_operation)
+        entry_mapping, chunk_checksum, chunk_size = self._verify_integrity_bytes(
+            pamt_bytes,
+            papgt_bytes,
+            pamt_operation,
+            papgt_operation,
         )
         entry = _ArchiveEntry.from_mapping(entry_mapping)
         expected_paz_path = self._source_paths(game, entry)[0].resolve()
@@ -1067,6 +1298,7 @@ class BlackstarTimerService:
             paz_path,
             entry.chunk_offset,
             entry.compressed_size,
+            operation=f"post-write-verification:{paz_relative}",
         )
         current_hashes = {
             paz_relative: paz_identity.sha256,
@@ -1119,8 +1351,10 @@ class BlackstarTimerService:
         self,
         pamt_bytes: bytes,
         papgt_bytes: bytes,
+        pamt_operation: str = "integrity:pamt",
+        papgt_operation: str = "integrity:papgt",
     ) -> tuple[dict, int, int]:
-        pamt = crimson_rs.parse_pamt_bytes(pamt_bytes)
+        pamt = self._parse_pamt_bytes(pamt_bytes, pamt_operation)
         if int(pamt["checksum"]) != crimson_rs.calculate_checksum(pamt_bytes[12:]):
             raise ValueError("PAMT payload checksum mismatch")
         entry = self._find_entry_in_document(pamt)
@@ -1130,7 +1364,7 @@ class BlackstarTimerService:
         if len(chunks) != 1:
             raise ValueError("PAMT chunk identity is ambiguous")
 
-        papgt = crimson_rs.parse_papgt_bytes(papgt_bytes)
+        papgt = self._parse_papgt_bytes(papgt_bytes, papgt_operation)
         if int(papgt["checksum"]) != crimson_rs.calculate_checksum(papgt_bytes[12:]):
             raise ValueError("PAPGT payload checksum mismatch")
         groups = [
@@ -1191,6 +1425,172 @@ class BlackstarTimerService:
             raise BackupConflictError(
                 f"Could not resolve the enrolled timer archive paths: {exc}"
             ) from exc
+
+    @staticmethod
+    def _windows_path_attributes_no_follow(
+        path: Path,
+        operation: str,
+    ) -> int:
+        from ctypes import wintypes
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FileInformation),
+        ]
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(path),
+            0x0080,  # FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,
+            None,
+        )
+        handle_value = (
+            handle
+            if isinstance(handle, int)
+            else ctypes.cast(handle, ctypes.c_void_p).value
+        )
+        if handle_value in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_last_error()
+            raise ctypes.WinError(
+                error,
+                f"Containment handle open failed ({operation}): {path}",
+            )
+
+        information = FileInformation()
+        information_error: OSError | None = None
+        if not get_information(handle, ctypes.byref(information)):
+            error = ctypes.get_last_error()
+            information_error = ctypes.WinError(
+                error,
+                f"Containment handle query failed ({operation}): {path}",
+            )
+
+        close_error: OSError | None = None
+        if not close_handle(handle):
+            error = ctypes.get_last_error()
+            close_error = ctypes.WinError(
+                error,
+                f"Containment handle close failed ({operation}): {path}",
+            )
+
+        if information_error is not None:
+            if close_error is not None:
+                raise information_error from close_error
+            raise information_error
+        if close_error is not None:
+            raise close_error
+        return int(information.dwFileAttributes)
+
+    @classmethod
+    def _assert_safe_archive_path(
+        cls,
+        root: Path,
+        path: Path,
+        operation: str,
+        *,
+        require_exists: bool,
+    ) -> Path:
+        try:
+            root = root.resolve(strict=True)
+        except OSError as exc:
+            raise BackupConflictError(
+                f"Trusted game root is unavailable during {operation}: {root}"
+            ) from exc
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise BackupConflictError(
+                f"Archive path escapes trusted game root during {operation}: {path}"
+            ) from exc
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise BackupConflictError(
+                f"Unsafe archive path during {operation}: {path}"
+            )
+
+        current = root
+        for part in relative.parts:
+            current = current / part
+            try:
+                current.lstat()
+            except FileNotFoundError as exc:
+                if require_exists:
+                    raise BackupConflictError(
+                        f"Archive path disappeared during {operation}: {current}"
+                    ) from exc
+                break
+            except OSError as exc:
+                raise BackupConflictError(
+                    f"Archive path cannot be inspected during {operation}: {current}"
+                ) from exc
+
+            if os.name == "nt":
+                try:
+                    attributes = cls._windows_path_attributes_no_follow(
+                        current,
+                        operation,
+                    )
+                except OSError as exc:
+                    raise BackupConflictError(
+                        f"Archive path cannot be inspected during {operation}: "
+                        f"{current}: {exc}"
+                    ) from exc
+                if attributes & 0x00000400:
+                    raise BackupConflictError(
+                        f"Archive descendant is a reparse point during {operation}: "
+                        f"{current}"
+                    )
+
+            try:
+                resolved_component = current.resolve(strict=True)
+                resolved_component.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise BackupConflictError(
+                    f"Archive path escapes trusted game root during {operation}: "
+                    f"{current}"
+                ) from exc
+
+        try:
+            resolved = path.resolve(strict=require_exists)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise BackupConflictError(
+                f"Archive path escapes trusted game root during {operation}: {path}"
+            ) from exc
+        return path
 
     @staticmethod
     def _contained_path(root: Path, relative: str) -> Path:
@@ -1335,23 +1735,94 @@ class BlackstarTimerService:
         path: Path,
         data: bytes,
         operation: str | None = None,
+        *,
+        trusted_root: Path | None = None,
+        expected_current: bytes | None = None,
+        metadata_guard_operation: str | None = None,
     ) -> None:
         operation = operation or f"atomic:{path.name}"
+        if (expected_current is None) != (metadata_guard_operation is None):
+            raise ValueError(
+                "Metadata replacement requires both expected bytes and a guard label"
+            )
+        if trusted_root is not None:
+            self._assert_safe_archive_path(
+                trusted_root,
+                path.parent,
+                f"{operation}:temp-parent",
+                require_exists=True,
+            )
+            self._assert_safe_archive_path(
+                trusted_root,
+                path,
+                f"{operation}:target",
+                require_exists=False,
+            )
+
         descriptor, raw_path = tempfile.mkstemp(
             prefix=f".{path.name}.timer-", dir=path.parent
         )
         temp_path = Path(raw_path)
         try:
+            if trusted_root is not None:
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    temp_path,
+                    f"{operation}:temp-write",
+                    require_exists=True,
+                )
             with os.fdopen(descriptor, "wb") as handle:
+                if trusted_root is not None:
+                    self._assert_safe_archive_path(
+                        trusted_root,
+                        temp_path,
+                        f"{operation}:temp-write",
+                        require_exists=True,
+                    )
                 self._write_all(handle, data, operation)
                 self._flush_file(handle, operation)
                 self._fsync_file(handle, operation)
+
+            if expected_current is not None:
+                assert metadata_guard_operation is not None
+                self._assert_metadata_unchanged(
+                    path,
+                    expected_current,
+                    metadata_guard_operation,
+                )
+            if trusted_root is not None:
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    temp_path,
+                    f"{operation}:replace-source",
+                    require_exists=True,
+                )
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    path,
+                    f"{operation}:replace-target",
+                    require_exists=expected_current is not None or path.exists(),
+                )
             os.replace(temp_path, path)
+            if trusted_root is not None:
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    path,
+                    f"{operation}:replaced-target",
+                    require_exists=True,
+                )
             directory_operation = (
                 "manifest-directory"
                 if operation == "manifest"
                 else f"{operation}-directory"
             )
+            if trusted_root is not None:
+                self._assert_safe_archive_path(
+                    trusted_root,
+                    path.parent,
+                    directory_operation,
+                    require_exists=True,
+                )
             self._sync_directory(path.parent, directory_operation)
         except Exception:
             try:
@@ -1361,12 +1832,27 @@ class BlackstarTimerService:
             temp_path.unlink(missing_ok=True)
             raise
 
-    def _write_manifest(self, path: Path, manifest: dict) -> None:
+    def _write_manifest(
+        self,
+        path: Path,
+        manifest: dict,
+        *,
+        trusted_root: Path | None = None,
+    ) -> None:
         payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-        self._atomic_write(path, payload, "manifest")
+        self._atomic_write(
+            path,
+            payload,
+            "manifest",
+            trusted_root=trusted_root,
+        )
 
-    @staticmethod
-    def _read_manifest(path: Path) -> dict:
+    def _read_manifest(
+        self,
+        path: Path,
+        operation: str | None = None,
+    ) -> dict:
+        del operation
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -1578,7 +2064,8 @@ class BlackstarTimerService:
         )
 
     @staticmethod
-    def _hash_file(path: Path) -> str:
+    def _hash_file(path: Path, operation: str | None = None) -> str:
+        del operation
         digest = hashlib.sha256()
         with path.open("rb") as handle:
             for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -1586,10 +2073,13 @@ class BlackstarTimerService:
         return digest.hexdigest()
 
     def _find_entry(self, game: Path) -> dict:
-        pamt_path = game / self.profile.group_name / "0.pamt"
+        relative = f"{self.profile.group_name}/0.pamt"
+        pamt_path = game / Path(relative)
         if not pamt_path.is_file():
             raise FileNotFoundError(f"PAMT not found: {pamt_path}")
-        pamt = crimson_rs.parse_pamt_file(str(pamt_path))
+        operation = f"source-inspection:{relative}"
+        pamt_bytes = self._read_metadata_bytes(pamt_path, operation)
+        pamt = self._parse_pamt_bytes(pamt_bytes, operation)
         return self._find_entry_in_document(pamt)
 
     def _validate_entry(self, entry: dict) -> None:
@@ -1613,10 +2103,26 @@ class BlackstarTimerService:
             raise FileNotFoundError(f"PAZ not found: {paz_path}")
         offset = archive_entry.chunk_offset
         compressed_size = archive_entry.compressed_size
-        with paz_path.open("rb") as handle:
-            handle.seek(offset)
-            compressed = handle.read(compressed_size)
+        relative = paz_path.relative_to(game).as_posix()
+        compressed = self._read_paz_entry(
+            paz_path,
+            offset,
+            compressed_size,
+            f"source-inspection:{relative}-entry",
+        )
         return self._decompress_entry(compressed, archive_entry)
+
+    @staticmethod
+    def _read_paz_entry(
+        path: Path,
+        offset: int,
+        size: int,
+        operation: str,
+    ) -> bytes:
+        del operation
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read(size)
 
     def _decompress_entry(
         self,

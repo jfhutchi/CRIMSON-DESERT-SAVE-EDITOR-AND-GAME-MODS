@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
+import subprocess
+from collections import Counter
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import BinaryIO, Callable
@@ -48,9 +51,15 @@ class _CountingInspectionService(BlackstarTimerService):
         self.body_read_count += 1
         return super()._read_body(game, entry)
 
-    def _hash_file(self, path: Path) -> str:
+    def _hash_file(
+        self,
+        path: Path,
+        operation: str | None = None,
+    ) -> str:
         self.hash_call_count += 1
-        return super()._hash_file(path)
+        if operation is None:
+            return super()._hash_file(path)
+        return super()._hash_file(path, operation)
 
     def _decompress_stream(
         self,
@@ -442,6 +451,27 @@ def _archive_contents(paths: tuple[Path, Path, Path]) -> dict[Path, bytes]:
     return {path: path.read_bytes() for path in paths}
 
 
+def _create_junction(link: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert os.path.isjunction(link)
+
+
+def _file_tree(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def _only_backup_manifest(game: Path) -> tuple[Path, dict]:
     backup_root = (
         game / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
@@ -584,7 +614,6 @@ def test_apply_rolls_back_when_paz_open_for_write_fails(
         )
     ] + [
         ("backup_root", None),
-        ("backup_directory_final", None),
         ("manifest_fsync", None),
         ("manifest_directory", None),
     ],
@@ -657,9 +686,6 @@ def test_backup_durability_failure_prevents_source_mutation(
                 failure_stage == "backup_root"
                 and operation == "backup-root-directory"
             ) or (
-                failure_stage == "backup_directory_final"
-                and operation == "backup-directory"
-            ) or (
                 failure_stage == "manifest_directory"
                 and operation == "manifest-directory"
             )
@@ -687,8 +713,6 @@ def test_backup_durability_failure_prevents_source_mutation(
         expected_operation = f"backup-root-parent:{target_relative}"
     elif failure_stage == "backup_root":
         expected_operation = "backup-root-directory"
-    elif failure_stage == "backup_directory_final":
-        expected_operation = "backup-directory"
     elif failure_stage.startswith("backup_"):
         expected_operation = f"backup:{target_relative}"
     elif failure_stage == "manifest_fsync":
@@ -755,11 +779,9 @@ def test_backup_and_manifest_are_durable_before_paz_mutation(
         "backup-directory:0008/0.pamt",
         "backup-directory:meta/0.papgt",
         "manifest-directory",
-        "backup-directory",
     } <= synced_directories
-    assert sync_events.index("manifest-directory") < sync_events.index(
-        "backup-directory"
-    )
+    assert sync_events.count("manifest-directory") == 1
+    assert "backup-directory" not in sync_events
 
 
 class _FakeWindowsFunction:
@@ -869,6 +891,137 @@ def test_windows_directory_sync_propagates_win32_errors(
         assert events == ["create", "flush", "close"]
 
 
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "bin64",
+        "bin64/SEModLoad",
+        "bin64/SEModLoad/Backups",
+        "bin64/SEModLoad/Backups/BlackstarTimer",
+    ],
+)
+def test_apply_rejects_backup_hierarchy_junctions(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    outside = tmp_path / ("outside-" + relative.replace("/", "-"))
+    link = archive.game_dir / Path(relative)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    _create_junction(link, outside)
+
+    with pytest.raises(BackupConflictError, match="reparse"):
+        service.apply(preview.token)
+
+    assert _file_tree(outside) == {}
+    assert _archive_contents(paths) == before
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
+def test_apply_rejects_timestamp_directory_swapped_to_junction(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    outside = tmp_path / "outside-timestamp"
+    outside.mkdir()
+
+    class TimestampSwapService(BlackstarTimerService):
+        swapped = False
+
+        def _sync_directory(self, path: Path, operation: str) -> None:
+            super()._sync_directory(path, operation)
+            if operation == "backup-root-directory" and not self.swapped:
+                candidates = [item for item in path.iterdir() if item.is_dir()]
+                assert len(candidates) == 1
+                candidates[0].rmdir()
+                _create_junction(candidates[0], outside)
+                self.swapped = True
+
+    service = TimestampSwapService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(BackupConflictError, match="reparse"):
+        service.apply(preview.token)
+
+    assert service.swapped is True
+    assert _file_tree(outside) == {}
+    assert _archive_contents(paths) == before
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
+def test_apply_rechecks_containment_immediately_before_backup_copy(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    outside = tmp_path / "outside-copy-swap"
+    outside.mkdir()
+
+    class CopySwapService(BlackstarTimerService):
+        swapped = False
+
+        def _copy_backup_file(
+            self,
+            game: Path,
+            source: Path,
+            destination: Path,
+            operation: str,
+        ) -> None:
+            if not self.swapped:
+                backup_dir = destination.parents[1]
+                backup_dir.rmdir()
+                _create_junction(backup_dir, outside)
+                self.swapped = True
+            return super()._copy_backup_file(
+                game,
+                source,
+                destination,
+                operation,
+            )
+
+    service = CopySwapService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(BackupConflictError, match="reparse"):
+        service.apply(preview.token)
+
+    assert service.swapped is True
+    assert _file_tree(outside) == {}
+    assert _archive_contents(paths) == before
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
+def test_resolved_game_root_remains_valid_when_supplied_through_junction(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path / "real")
+    alias = tmp_path / "game-alias"
+    _create_junction(alias, archive.game_dir)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+
+    preview = service.preview(alias)
+    assert preview.token is not None
+    assert preview.token.game_dir == archive.game_dir.resolve(strict=True)
+
+    result = service.apply(preview.token)
+
+    assert result.status is TimerStatus.APPLIED
+    assert result.game_dir == archive.game_dir.resolve(strict=True)
+
+
 @pytest.mark.parametrize("window", ["before", "during"])
 @pytest.mark.parametrize("region", ["outside", "inside"])
 def test_apply_rejects_paz_tampering_against_backup_snapshot(
@@ -921,6 +1074,88 @@ def test_apply_rejects_paz_tampering_against_backup_snapshot(
     assert tampered is True
     assert _archive_contents(paths) == before
     _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+@pytest.mark.parametrize(
+    "tamper_stage",
+    [
+        "before_pamt",
+        "during_pamt",
+        "before_papgt",
+        "during_papgt",
+    ],
+)
+def test_apply_detects_live_metadata_tamper_and_restores_originals(
+    tmp_path: Path,
+    tamper_stage: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    pamt_path, papgt_path = paths[1], paths[2]
+    tampered = False
+    external_bytes: bytes | None = None
+
+    def tamper(path: Path) -> None:
+        nonlocal tampered, external_bytes
+        payload = bytearray(path.read_bytes())
+        payload[-1] ^= 0x5A
+        external_bytes = bytes(payload)
+        path.write_bytes(external_bytes)
+        tampered = True
+
+    class MetadataTamperService(BlackstarTimerService):
+        def _build_metadata_bytes(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[bytes, bytes]:
+            result = super()._build_metadata_bytes(*args, **kwargs)
+            if tamper_stage == "before_pamt" and not tampered:
+                tamper(pamt_path)
+            return result
+
+        def _write_all(
+            self,
+            handle: BinaryIO,
+            data: bytes,
+            operation: str,
+        ) -> None:
+            super()._write_all(handle, data, operation)
+            if tamper_stage == "during_pamt" and operation == "pamt" and not tampered:
+                tamper(pamt_path)
+            if (
+                tamper_stage == "during_papgt"
+                and operation == "papgt"
+                and not tampered
+            ):
+                tamper(papgt_path)
+
+        def _inject_fault(self, phase: str) -> None:
+            if (
+                tamper_stage == "before_papgt"
+                and phase == "after_pamt_write"
+                and not tampered
+            ):
+                tamper(papgt_path)
+            return super()._inject_fault(phase)
+
+    service = MetadataTamperService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert tampered is True
+    assert external_bytes is not None
+    assert external_bytes not in _archive_contents(paths).values()
+    assert _archive_contents(paths) == before
+    _manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is True
+    assert "metadata" in manifest["rollback_reason"].lower()
 
 
 def test_apply_rolls_back_appended_paz_bytes_after_write(
@@ -1047,15 +1282,56 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
             self.active_identity_streams = 0
             self.peak_identity_streams = 0
             self.backup_copy_passes = 0
+            self.large_bulk_passes: Counter[str] = Counter()
+            self.metadata_file_passes: Counter[str] = Counter()
+            self.metadata_reads: Counter[str] = Counter()
+            self.metadata_parses: Counter[str] = Counter()
+            self.bounded_paz_reads: Counter[str] = Counter()
+            self.control_reads: Counter[str] = Counter()
+
+        def reset_counts(self) -> None:
+            super().reset_counts()
+            self.identity_stream_calls = 0
+            self.active_identity_streams = 0
+            self.peak_identity_streams = 0
+            self.backup_copy_passes = 0
+            self.large_bulk_passes.clear()
+            self.metadata_file_passes.clear()
+            self.metadata_reads.clear()
+            self.metadata_parses.clear()
+            self.bounded_paz_reads.clear()
+            self.control_reads.clear()
+
+        def _hash_file(
+            self,
+            path: Path,
+            operation: str | None = None,
+        ) -> str:
+            label = operation or "unlabeled"
+            counter = (
+                self.large_bulk_passes
+                if path.suffix == ".paz"
+                else self.metadata_file_passes
+            )
+            counter[f"hash:{label}"] += 1
+            return super()._hash_file(path, operation)
 
         def _copy_backup_file(
             self,
+            game: Path,
             source: Path,
             destination: Path,
             operation: str,
         ) -> None:
             self.backup_copy_passes += 1
+            counter = (
+                self.large_bulk_passes
+                if source.suffix == ".paz"
+                else self.metadata_file_passes
+            )
+            counter[f"copy:{operation}"] += 1
             return super()._copy_backup_file(
+                game,
                 source,
                 destination,
                 operation,
@@ -1066,6 +1342,8 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
             *args: object,
             **kwargs: object,
         ) -> object:
+            operation = str(kwargs.get("operation", "unlabeled"))
+            self.large_bulk_passes[f"identity:{operation}"] += 1
             self.identity_stream_calls += 1
             self.active_identity_streams += 1
             self.peak_identity_streams = max(
@@ -1076,6 +1354,59 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
                 return super()._stream_paz_identity(*args, **kwargs)
             finally:
                 self.active_identity_streams -= 1
+
+        def _read_metadata_bytes(
+            self,
+            path: Path,
+            operation: str,
+        ) -> bytes:
+            self.metadata_reads[operation] += 1
+            return super()._read_metadata_bytes(path, operation)
+
+        def _parse_pamt_bytes(
+            self,
+            data: bytes,
+            operation: str,
+        ) -> dict:
+            self.metadata_parses[f"pamt:{operation}"] += 1
+            return super()._parse_pamt_bytes(data, operation)
+
+        def _parse_papgt_bytes(
+            self,
+            data: bytes,
+            operation: str,
+        ) -> dict:
+            self.metadata_parses[f"papgt:{operation}"] += 1
+            return super()._parse_papgt_bytes(data, operation)
+
+        def _read_paz_entry(
+            self,
+            path: Path,
+            offset: int,
+            size: int,
+            operation: str,
+        ) -> bytes:
+            self.bounded_paz_reads[operation] += 1
+            return super()._read_paz_entry(path, offset, size, operation)
+
+        def _read_paz_slot(
+            self,
+            handle: BinaryIO,
+            size: int,
+            operation: str,
+        ) -> bytes:
+            self.bounded_paz_reads[operation] += 1
+            return super()._read_paz_slot(handle, size, operation)
+
+        def _read_manifest(
+            self,
+            path: Path,
+            operation: str | None = None,
+        ) -> dict:
+            self.control_reads[operation or "unlabeled"] += 1
+            if operation is None:
+                return super()._read_manifest(path)
+            return super()._read_manifest(path, operation)
 
     service = StreamingIdentityService()
     preview = service.preview(archive.game_dir)
@@ -1095,15 +1426,59 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
     service.apply(preview.token)
 
     assert full_paz_reads == []
+    assert service.large_bulk_passes == Counter(
+        {
+            "hash:source-revalidation:0008/0.paz": 1,
+            "copy:backup:0008/0.paz": 1,
+            "identity:backup-verification:0008/0.paz": 1,
+            "identity:post-write-verification:0008/0.paz": 1,
+        }
+    )
+    assert service.metadata_file_passes == Counter(
+        {
+            "hash:source-revalidation:0008/0.pamt": 1,
+            "hash:source-revalidation:meta/0.papgt": 1,
+            "hash:backup-verification:0008/0.pamt": 1,
+            "hash:backup-verification:meta/0.papgt": 1,
+            "copy:backup:0008/0.pamt": 1,
+            "copy:backup:meta/0.papgt": 1,
+        }
+    )
+    assert service.metadata_reads == Counter(
+        {
+            "source-inspection:0008/0.pamt": 1,
+            "metadata-build:0008/0.pamt": 1,
+            "metadata-build:meta/0.papgt": 1,
+            "metadata-guard-after-paz:0008/0.pamt": 1,
+            "metadata-guard-after-paz:meta/0.papgt": 1,
+            "metadata-guard-before-replace:0008/0.pamt": 1,
+            "metadata-guard-before-replace:meta/0.papgt": 1,
+            "post-write-verification:0008/0.pamt": 1,
+            "post-write-verification:meta/0.papgt": 1,
+        }
+    )
+    assert service.metadata_parses == Counter(
+        {
+            "pamt:source-inspection:0008/0.pamt": 1,
+            "pamt:metadata-build:0008/0.pamt": 1,
+            "pamt:metadata-build:candidate:0008/0.pamt": 1,
+            "papgt:metadata-build:meta/0.papgt": 1,
+            "papgt:metadata-build:candidate:meta/0.papgt": 1,
+            "pamt:post-write-verification:0008/0.pamt": 1,
+            "papgt:post-write-verification:meta/0.papgt": 1,
+        }
+    )
+    assert service.bounded_paz_reads == Counter(
+        {
+            "source-inspection:0008/0.paz-entry": 1,
+            "paz-patch:0008/0.paz-slot": 1,
+        }
+    )
+    assert service.control_reads == Counter({"manifest-finalization": 1})
     assert service.identity_stream_calls == 2
     assert service.peak_identity_streams == 1
     assert service.backup_copy_passes == 3
     assert service.hash_call_count == 5
-    assert (
-        service.hash_call_count
-        + service.identity_stream_calls
-        + service.backup_copy_passes
-    ) == 10
     assert service.decompress_call_count == 2
     assert not hasattr(service, "_build_transaction_bytes")
 
