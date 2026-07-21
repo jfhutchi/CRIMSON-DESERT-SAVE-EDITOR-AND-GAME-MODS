@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -133,6 +136,229 @@ def test_both_save_serializers_round_trip_authenticated_fixture(
 
 
 SYNTHETIC_SAVE_BLOB = bytes(range(256)) * 4
+ROOT = Path(__file__).resolve().parents[1]
+APP_DIRS = {
+    "save-editor": ROOT / "CrimsonSaveEditor",
+    "game-mods": ROOT / "CrimsonGameMods",
+}
+ISOLATED_SAVE_CRYPTO_SCRIPT = r"""
+import hashlib
+import inspect
+import json
+import struct
+import sys
+from pathlib import Path
+
+operation = sys.argv[1]
+app_dir = Path(sys.argv[2]).resolve()
+container_path = Path(sys.argv[3]).resolve()
+version = int(sys.argv[4])
+expected_cwd = Path(sys.argv[5]).resolve()
+
+assert operation in {"write", "read"}
+assert sys.flags.isolated == 1
+assert sys.flags.ignore_environment == 1
+assert Path.cwd().resolve() == expected_cwd
+
+sys.path.insert(0, str(app_dir))
+assert Path(sys.path[0]).resolve() == app_dir
+import save_crypto
+import models
+
+expected_crypto = (app_dir / "save_crypto.py").resolve()
+expected_models = (app_dir / "models.py").resolve()
+actual_crypto = Path(save_crypto.__file__).resolve()
+actual_models = Path(models.__file__).resolve()
+assert actual_crypto == expected_crypto
+assert actual_models == expected_models
+assert save_crypto.SaveData is models.SaveData
+
+repo_root = app_dir.parent
+repo_entries = []
+for entry in sys.path:
+    if not entry:
+        continue
+    resolved = Path(entry).resolve()
+    if resolved == repo_root or repo_root in resolved.parents:
+        repo_entries.append(resolved)
+assert repo_entries == [app_dir]
+
+payload = bytes(range(256)) * 4
+if operation == "write":
+    header = bytearray(save_crypto.HEADER_SIZE)
+    header[
+        save_crypto.MAGIC_OFFSET:save_crypto.MAGIC_OFFSET + 4
+    ] = b"SAVE"
+    struct.pack_into(
+        "<H",
+        header,
+        save_crypto.VERSION_OFFSET,
+        version,
+    )
+    save_crypto.write_save_file(
+        str(container_path),
+        payload,
+        bytes(header),
+    )
+else:
+    serialized = container_path.read_bytes()
+    serialized_version = struct.unpack_from(
+        "<H",
+        serialized,
+        save_crypto.VERSION_OFFSET,
+    )[0]
+    assert serialized_version == version
+    uncompressed_size = struct.unpack_from(
+        "<I",
+        serialized,
+        save_crypto.UNCOMP_SIZE_OFFSET,
+    )[0]
+    payload_size = struct.unpack_from(
+        "<I",
+        serialized,
+        save_crypto.PAYLOAD_SIZE_OFFSET,
+    )[0]
+    nonce = serialized[
+        save_crypto.NONCE_OFFSET:save_crypto.NONCE_OFFSET + 16
+    ]
+    stored_hmac = serialized[
+        save_crypto.HMAC_OFFSET:save_crypto.HMAC_OFFSET + 32
+    ]
+    ciphertext = serialized[
+        save_crypto.PAYLOAD_OFFSET:save_crypto.PAYLOAD_OFFSET + payload_size
+    ]
+    key = save_crypto._generate_save_key(version)
+    compressed = save_crypto.chacha20_crypt(ciphertext, nonce, key)
+    assert save_crypto.verify_hmac(compressed, stored_hmac, key)
+    assert save_crypto.lz4.block.decompress(
+        compressed,
+        uncompressed_size=uncompressed_size,
+    ) == payload
+
+    load_kwargs = {}
+    if "detect_schema" in inspect.signature(save_crypto.load_save_file).parameters:
+        load_kwargs["detect_schema"] = False
+    reloaded = save_crypto.load_save_file(str(container_path), **load_kwargs)
+    assert bytes(reloaded.decompressed_blob) == payload
+    assert struct.unpack_from(
+        "<H",
+        reloaded.raw_header,
+        save_crypto.VERSION_OFFSET,
+    )[0] == version
+
+print(json.dumps({
+    "operation": operation,
+    "isolated": sys.flags.isolated,
+    "ignore_environment": sys.flags.ignore_environment,
+    "cwd": str(Path.cwd().resolve()),
+    "app_dir": str(app_dir),
+    "save_crypto_file": str(actual_crypto),
+    "models_file": str(actual_models),
+    "payload_sha256": hashlib.sha256(payload).hexdigest(),
+    "version": version,
+}))
+"""
+
+
+def _run_isolated_save_crypto(
+    operation: str,
+    app_dir: Path,
+    container_path: Path,
+    version: int,
+    cwd: Path,
+) -> dict:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            ISOLATED_SAVE_CRYPTO_SCRIPT,
+            operation,
+            str(app_dir),
+            str(container_path),
+            str(version),
+            str(cwd),
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"isolated {operation} failed:\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize(
+    ("writer_name", "reader_name", "version"),
+    (
+        pytest.param(
+            "save-editor",
+            "game-mods",
+            1,
+            id="save-editor-to-game-mods-v1",
+        ),
+        pytest.param(
+            "save-editor",
+            "game-mods",
+            2,
+            id="save-editor-to-game-mods-v2",
+        ),
+        pytest.param(
+            "game-mods",
+            "save-editor",
+            1,
+            id="game-mods-to-save-editor-v1",
+        ),
+        pytest.param(
+            "game-mods",
+            "save-editor",
+            2,
+            id="game-mods-to-save-editor-v2",
+        ),
+    ),
+)
+def test_isolated_save_crypto_cross_app_interoperability(
+    tmp_path: Path,
+    writer_name: str,
+    reader_name: str,
+    version: int,
+) -> None:
+    writer_dir = APP_DIRS[writer_name].resolve()
+    reader_dir = APP_DIRS[reader_name].resolve()
+    container_path = tmp_path / f"{writer_name}-to-{reader_name}-v{version}.save"
+
+    writer = _run_isolated_save_crypto(
+        "write",
+        writer_dir,
+        container_path,
+        version,
+        tmp_path,
+    )
+    reader = _run_isolated_save_crypto(
+        "read",
+        reader_dir,
+        container_path,
+        version,
+        tmp_path,
+    )
+
+    for report, expected_dir in (
+        (writer, writer_dir),
+        (reader, reader_dir),
+    ):
+        assert report["isolated"] == 1
+        assert report["ignore_environment"] == 1
+        assert Path(report["cwd"]) == tmp_path.resolve()
+        assert Path(report["app_dir"]) == expected_dir
+        assert Path(report["save_crypto_file"]) == expected_dir / "save_crypto.py"
+        assert Path(report["models_file"]) == expected_dir / "models.py"
+        assert report["version"] == version
+    assert writer["payload_sha256"] == reader["payload_sha256"]
 
 
 @pytest.mark.parametrize(
