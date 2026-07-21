@@ -44,6 +44,10 @@ class GameRunningError(RuntimeError):
     """Raised when an archive write is requested while the game is open."""
 
 
+class _ArchiveSourceError(RuntimeError):
+    """Wraps only source-inspection errors translated by legacy detection."""
+
+
 def is_crimson_desert_running() -> bool:
     if os.name != "nt":
         return False
@@ -123,6 +127,15 @@ class PreviewToken:
 
 
 @dataclass(frozen=True)
+class _ArchiveInspection:
+    report: DetectionReport
+    # Private snapshot owned by this inspection; consumers treat it as read-only.
+    entry: dict
+    body: bytes
+    paths: tuple[Path, Path, Path]
+
+
+@dataclass(frozen=True)
 class PreviewReport:
     status: TimerStatus
     reason: str
@@ -192,92 +205,17 @@ class BlackstarTimerService:
 
     def detect(self, game_dir: str | Path) -> DetectionReport:
         game = Path(game_dir).expanduser().resolve()
+        process_report = self._process_report(game)
+        if process_report is not None:
+            return process_report
         try:
-            if self._process_checker():
-                return self._report(
-                    TimerStatus.GAME_RUNNING,
-                    game,
-                    "Crimson Desert is running; close it before previewing or writing",
-                )
-        except (OSError, subprocess.SubprocessError) as exc:
-            return self._report(
-                TimerStatus.UNKNOWN,
-                game,
-                f"Could not verify whether Crimson Desert is running: {exc}",
-            )
-        try:
-            entry = self._find_entry(game)
-            self._validate_entry(entry)
-            body = self._read_body(game, entry)
-        except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as exc:
+            return self._inspect(game).report
+        except _ArchiveSourceError as exc:
             return self._report(
                 TimerStatus.UNKNOWN,
                 game,
                 f"Archive compatibility check failed: {exc}",
             )
-
-        digest = hashlib.sha256(body).hexdigest()
-        cooldown = self._read_u64(body, self.profile.cooldown_offset)
-        duration = self._read_u64(body, self.profile.duration_offset)
-        values = (cooldown, duration)
-        vanilla_values = (
-            self.profile.vanilla_cooldown_seconds,
-            self.profile.vanilla_duration_seconds,
-        )
-        applied_values = (
-            self.profile.preset_cooldown_seconds,
-            self.profile.preset_duration_seconds,
-        )
-        details = {
-            "body_sha256": digest,
-            "cooldown_seconds": cooldown,
-            "duration_seconds": duration,
-            "entry_offset": int(entry["chunk_offset"]),
-            "compressed_size": int(entry["compressed_size"]),
-            "uncompressed_size": int(entry["uncompressed_size"]),
-        }
-        if (
-            digest == self.profile.vanilla_body_sha256
-            and values == vanilla_values
-            and int(entry["compressed_size"])
-            == self.profile.vanilla_compressed_size
-        ):
-            return self._report(
-                TimerStatus.VANILLA,
-                game,
-                "Enrolled vanilla Blackstar timer schema detected",
-                **details,
-            )
-        if digest == self.profile.applied_body_sha256 and values == applied_values:
-            return self._report(
-                TimerStatus.APPLIED,
-                game,
-                "Verified Blackstar timer preset is already applied",
-                **details,
-            )
-        if values[0] in (vanilla_values[0], applied_values[0]) and values[1] in (
-            vanilla_values[1],
-            applied_values[1],
-        ) and values not in (vanilla_values, applied_values):
-            return self._report(
-                TimerStatus.PARTIAL,
-                game,
-                "Blackstar timer fields are only partially patched",
-                **details,
-            )
-        if values not in (vanilla_values, applied_values):
-            return self._report(
-                TimerStatus.PARTIAL,
-                game,
-                "Blackstar timer field values do not match an enrolled state",
-                **details,
-            )
-        return self._report(
-            TimerStatus.UNKNOWN,
-            game,
-            "Characterinfo body hash is not enrolled for this game version",
-            **details,
-        )
 
     def preview(
         self,
@@ -285,7 +223,21 @@ class BlackstarTimerService:
         progress: Callable[[str, int], None] | None = None,
     ) -> PreviewReport:
         self._emit_progress(progress, "process_check", 5)
-        detection = self.detect(game_dir)
+        game = Path(game_dir).expanduser().resolve()
+        process_report = self._process_report(game)
+        inspection = None
+        if process_report is not None:
+            detection = process_report
+        else:
+            try:
+                inspection = self._inspect(game)
+                detection = inspection.report
+            except _ArchiveSourceError as exc:
+                detection = self._report(
+                    TimerStatus.UNKNOWN,
+                    game,
+                    f"Archive compatibility check failed: {exc}",
+                )
         if detection.status is not TimerStatus.VANILLA:
             return PreviewReport(
                 status=detection.status,
@@ -302,10 +254,12 @@ class BlackstarTimerService:
                 candidate_compressed_size=None,
                 slot_capacity=detection.compressed_size,
             )
+        if inspection is None or detection.body_sha256 is None:
+            raise ValueError("Vanilla detection is missing its archive inspection")
 
         self._emit_progress(progress, "pamt_lookup", 20)
-        entry = self._find_entry(detection.game_dir)
-        source = self._read_body(detection.game_dir, entry)
+        entry = inspection.entry
+        source = inspection.body
         self._emit_progress(progress, "decompression", 40)
         candidate = self._build_candidate(source)
         candidate_hash = hashlib.sha256(candidate).hexdigest()
@@ -332,7 +286,6 @@ class BlackstarTimerService:
         if verified != candidate:
             raise ValueError("Candidate failed independent compression verification")
         self._emit_progress(progress, "candidate_verification", 90)
-        source_paths = self._source_paths(detection.game_dir, entry)
         token = PreviewToken(
             profile_id=self.profile.profile_id,
             game_dir=detection.game_dir,
@@ -341,9 +294,9 @@ class BlackstarTimerService:
                     relative_path=path.relative_to(detection.game_dir).as_posix(),
                     sha256=self._hash_file(path),
                 )
-                for path in source_paths
+                for path in inspection.paths
             ),
-            source_body_sha256=hashlib.sha256(source).hexdigest(),
+            source_body_sha256=detection.body_sha256,
             candidate_body_sha256=candidate_hash,
             entry_offset=int(entry["chunk_offset"]),
             source_compressed_size=int(entry["compressed_size"]),
@@ -371,16 +324,21 @@ class BlackstarTimerService:
         game = token.game_dir.expanduser().resolve()
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
-        for expected in token.archive_hashes:
-            try:
-                path = self._contained_path(game, expected.relative_path)
-            except BackupConflictError as exc:
-                raise StalePreviewError(str(exc)) from exc
-            if not path.is_file() or self._hash_file(path) != expected.sha256:
-                raise StalePreviewError(
-                    f"Source archive changed after preview: {expected.relative_path}"
-                )
-        detection = self.detect(game)
+        process_report = self._process_report(game)
+        if process_report is not None:
+            raise StalePreviewError("Source archive changed after preview")
+        try:
+            inspection = self._inspect(game)
+        except _ArchiveSourceError as exc:
+            raise StalePreviewError("Source archive changed after preview") from exc
+        self._validate_token_against_inspection(token, inspection)
+
+    def _validate_token_against_inspection(
+        self,
+        token: PreviewToken,
+        inspection: _ArchiveInspection,
+    ) -> dict[str, str]:
+        detection = inspection.report
         if (
             detection.status is not TimerStatus.VANILLA
             or detection.body_sha256 != token.source_body_sha256
@@ -388,6 +346,42 @@ class BlackstarTimerService:
             or detection.compressed_size != token.source_compressed_size
         ):
             raise StalePreviewError("Source archive changed after preview")
+
+        game = detection.game_dir
+        expected_hashes: dict[str, str] = {}
+        for expected in token.archive_hashes:
+            try:
+                self._contained_path(game, expected.relative_path)
+            except BackupConflictError as exc:
+                raise StalePreviewError(str(exc)) from exc
+            if expected.relative_path in expected_hashes:
+                raise StalePreviewError("Source archive changed after preview")
+            expected_hashes[expected.relative_path] = expected.sha256
+
+        current_hashes: dict[str, str] = {}
+        for source_path in inspection.paths:
+            try:
+                relative = source_path.resolve().relative_to(game).as_posix()
+                path = self._contained_path(game, relative)
+            except (BackupConflictError, ValueError) as exc:
+                raise StalePreviewError(str(exc)) from exc
+            if not path.is_file():
+                raise StalePreviewError(
+                    f"Source archive changed after preview: {relative}"
+                )
+            current_hashes[relative] = self._hash_file(path)
+
+        if current_hashes != expected_hashes:
+            changed = sorted(
+                key
+                for key in current_hashes.keys() | expected_hashes.keys()
+                if current_hashes.get(key) != expected_hashes.get(key)
+            )
+            detail = f": {changed[0]}" if changed else ""
+            raise StalePreviewError(
+                f"Source archive changed after preview{detail}"
+            )
+        return current_hashes
 
     def apply(
         self,
@@ -930,6 +924,22 @@ class BlackstarTimerService:
         if callback is not None:
             callback(phase, value)
 
+    def _process_report(self, game: Path) -> DetectionReport | None:
+        try:
+            if self._process_checker():
+                return self._report(
+                    TimerStatus.GAME_RUNNING,
+                    game,
+                    "Crimson Desert is running; close it before previewing or writing",
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return self._report(
+                TimerStatus.UNKNOWN,
+                game,
+                f"Could not verify whether Crimson Desert is running: {exc}",
+            )
+        return None
+
     def _ensure_game_closed(self) -> None:
         try:
             running = self._process_checker()
@@ -945,6 +955,85 @@ class BlackstarTimerService:
     @staticmethod
     def _sha256_bytes(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
+
+    def _inspect(self, game: Path) -> _ArchiveInspection:
+        try:
+            entry = dict(self._find_entry(game))
+            self._validate_entry(entry)
+            body = self._read_body(game, entry)
+            paths = self._source_paths(game, entry)
+        except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as exc:
+            raise _ArchiveSourceError(str(exc)) from exc
+
+        digest = hashlib.sha256(body).hexdigest()
+        cooldown = self._read_u64(body, self.profile.cooldown_offset)
+        duration = self._read_u64(body, self.profile.duration_offset)
+        values = (cooldown, duration)
+        vanilla_values = (
+            self.profile.vanilla_cooldown_seconds,
+            self.profile.vanilla_duration_seconds,
+        )
+        applied_values = (
+            self.profile.preset_cooldown_seconds,
+            self.profile.preset_duration_seconds,
+        )
+        details = {
+            "body_sha256": digest,
+            "cooldown_seconds": cooldown,
+            "duration_seconds": duration,
+            "entry_offset": int(entry["chunk_offset"]),
+            "compressed_size": int(entry["compressed_size"]),
+            "uncompressed_size": int(entry["uncompressed_size"]),
+        }
+        if (
+            digest == self.profile.vanilla_body_sha256
+            and values == vanilla_values
+            and int(entry["compressed_size"])
+            == self.profile.vanilla_compressed_size
+        ):
+            report = self._report(
+                TimerStatus.VANILLA,
+                game,
+                "Enrolled vanilla Blackstar timer schema detected",
+                **details,
+            )
+        elif digest == self.profile.applied_body_sha256 and values == applied_values:
+            report = self._report(
+                TimerStatus.APPLIED,
+                game,
+                "Verified Blackstar timer preset is already applied",
+                **details,
+            )
+        elif values[0] in (vanilla_values[0], applied_values[0]) and values[1] in (
+            vanilla_values[1],
+            applied_values[1],
+        ) and values not in (vanilla_values, applied_values):
+            report = self._report(
+                TimerStatus.PARTIAL,
+                game,
+                "Blackstar timer fields are only partially patched",
+                **details,
+            )
+        elif values not in (vanilla_values, applied_values):
+            report = self._report(
+                TimerStatus.PARTIAL,
+                game,
+                "Blackstar timer field values do not match an enrolled state",
+                **details,
+            )
+        else:
+            report = self._report(
+                TimerStatus.UNKNOWN,
+                game,
+                "Characterinfo body hash is not enrolled for this game version",
+                **details,
+            )
+        return _ArchiveInspection(
+            report=report,
+            entry=entry,
+            body=body,
+            paths=paths,
+        )
 
     def _build_candidate(self, source: bytes) -> bytes:
         candidate = bytearray(source)
