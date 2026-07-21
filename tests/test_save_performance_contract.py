@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import struct
@@ -9,8 +10,11 @@ from pathlib import Path
 from typing import get_args, get_type_hints
 
 import pytest
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 import parc_serializer
+import save_crypto
+from CrimsonGameMods import save_crypto as game_mods_save_crypto
 import save_parser
 import save_compat
 from save_compat import (
@@ -23,6 +27,7 @@ from save_compat import (
 from save_crypto import load_save_file, transactional_write_save
 
 
+ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 IDENTITY_OBJECT_CLASSES = {"MercenaryClanSaveData", "KnowledgeSaveData"}
 
@@ -429,3 +434,112 @@ def test_schema_identity_matches_legacy_two_parser_reference(
     legacy = _legacy_schema_identity(blob, save.raw_header)
 
     assert asdict(actual) == asdict(legacy)
+
+
+@pytest.mark.parametrize(
+    ("crypto_module", "writer_name"),
+    (
+        pytest.param(save_crypto, "serialize_save_bytes", id="save-editor"),
+        pytest.param(game_mods_save_crypto, "write_save_file", id="game-mods"),
+    ),
+)
+def test_save_writers_use_hc3_compression(
+    copied_save: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crypto_module,
+    writer_name: str,
+) -> None:
+    save = load_save_file(str(copied_save))
+    calls: list[dict] = []
+    real_compress = crypto_module.lz4.block.compress
+
+    def record_compression(data, **kwargs):
+        calls.append(kwargs)
+        return real_compress(data, **kwargs)
+
+    monkeypatch.setattr(crypto_module.lz4.block, "compress", record_compression)
+    blob = bytes(save.decompressed_blob)
+    if writer_name == "serialize_save_bytes":
+        crypto_module.serialize_save_bytes(blob, save.raw_header, "hc3-contract")
+    else:
+        crypto_module.write_save_file(
+            str(tmp_path / "game-mods-hc3.save"),
+            blob,
+            save.raw_header,
+        )
+
+    assert calls == [
+        {
+            "store_size": False,
+            "mode": "high_compression",
+            "compression": 3,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("crypto_module", "relative_path"),
+    (
+        pytest.param(
+            save_crypto,
+            "CrimsonSaveEditor/save_crypto.py",
+            id="save-editor",
+        ),
+        pytest.param(
+            game_mods_save_crypto,
+            "CrimsonGameMods/save_crypto.py",
+            id="game-mods",
+        ),
+    ),
+)
+def test_save_crypto_requires_module_level_cryptography(
+    crypto_module,
+    relative_path: str,
+) -> None:
+    source = (ROOT / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    top_level_crypto_imports = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "cryptography.hazmat.primitives.ciphers"
+        for alias in node.names
+    }
+
+    assert top_level_crypto_imports == {"Cipher", "algorithms"}
+    assert crypto_module.Cipher is Cipher
+    assert crypto_module.algorithms is algorithms
+    for fallback_name in ("_rotl32", "_quarter_round", "_chacha20_block"):
+        assert fallback_name not in source
+
+    chacha = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "chacha20_crypt"
+    )
+    assert not any(isinstance(node, ast.Try) for node in ast.walk(chacha))
+    assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(chacha))
+
+
+@pytest.mark.parametrize(
+    ("app_dir", "spec_name"),
+    (
+        pytest.param("CrimsonSaveEditor", "CrimsonSaveEditor.spec", id="save-editor"),
+        pytest.param("CrimsonGameMods", "CrimsonGameMods.spec", id="game-mods"),
+    ),
+)
+def test_native_cryptography_is_a_required_packaged_dependency(
+    app_dir: str,
+    spec_name: str,
+) -> None:
+    requirements = (ROOT / app_dir / "requirements.txt").read_text(encoding="utf-8")
+    spec = (ROOT / app_dir / spec_name).read_text(encoding="utf-8")
+
+    assert "cryptography==49.0.0" in requirements.splitlines()
+    for hidden_import in (
+        "cryptography",
+        "cryptography.hazmat.primitives.ciphers",
+        "cryptography.hazmat.primitives.ciphers.algorithms",
+    ):
+        assert repr(hidden_import) in spec

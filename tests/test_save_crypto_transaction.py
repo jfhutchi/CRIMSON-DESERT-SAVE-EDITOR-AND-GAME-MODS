@@ -11,6 +11,7 @@ import pytest
 import parc_inserter3
 import save_crypto
 import save_compat
+from CrimsonGameMods import save_crypto as game_mods_save_crypto
 from blackstar_unlock import unlock_blackstar
 from blackstar_compat import BlackstarCompatibilityError, make_blackstar_apply_token
 from save_crypto import (
@@ -24,6 +25,111 @@ from save_crypto import (
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+CHACHA20_ZERO_VECTOR = bytes.fromhex(
+    "76b8e0ada0f13d90405d6ae55386bd28"
+    "bdd219b8a08ded1aa836efcc8b770dc7"
+    "da41597c5157488d7724e03fb8d84a37"
+    "6a43b8f41518a11cc387b669b2ee6586"
+)
+
+
+@pytest.mark.parametrize(
+    "crypto_module",
+    (
+        pytest.param(save_crypto, id="save-editor"),
+        pytest.param(game_mods_save_crypto, id="game-mods"),
+    ),
+)
+def test_chacha20_crypt_matches_known_zero_vector(crypto_module) -> None:
+    encrypted = crypto_module.chacha20_crypt(
+        bytes(64),
+        nonce16=bytes(16),
+        key=bytes(32),
+    )
+
+    assert encrypted == CHACHA20_ZERO_VECTOR
+    assert crypto_module.chacha20_crypt(
+        encrypted,
+        nonce16=bytes(16),
+        key=bytes(32),
+    ) == bytes(64)
+
+
+@pytest.mark.parametrize(
+    ("crypto_module", "writer_name"),
+    (
+        pytest.param(save_crypto, "serialize_save_bytes", id="save-editor"),
+        pytest.param(game_mods_save_crypto, "write_save_file", id="game-mods"),
+    ),
+)
+def test_both_save_serializers_round_trip_authenticated_fixture(
+    copied_save: Path,
+    tmp_path: Path,
+    crypto_module,
+    writer_name: str,
+) -> None:
+    loaded = load_save_file(str(copied_save))
+    original_blob = bytes(loaded.decompressed_blob)
+    original_version = struct.unpack_from(
+        "<H", loaded.raw_header, save_crypto.VERSION_OFFSET
+    )[0]
+    output = tmp_path / f"{crypto_module.__name__.replace('.', '-')}.save"
+
+    if writer_name == "serialize_save_bytes":
+        serialized = crypto_module.serialize_save_bytes(
+            original_blob,
+            loaded.raw_header,
+            "authenticated-round-trip",
+        )
+        output.write_bytes(serialized)
+    else:
+        crypto_module.write_save_file(
+            str(output),
+            original_blob,
+            loaded.raw_header,
+        )
+        serialized = output.read_bytes()
+
+    assert serialized[crypto_module.MAGIC_OFFSET:crypto_module.MAGIC_OFFSET + 4] == b"SAVE"
+    version = struct.unpack_from(
+        "<H", serialized, crypto_module.VERSION_OFFSET
+    )[0]
+    assert version == original_version
+    uncompressed_size = struct.unpack_from(
+        "<I", serialized, crypto_module.UNCOMP_SIZE_OFFSET
+    )[0]
+    payload_size = struct.unpack_from(
+        "<I", serialized, crypto_module.PAYLOAD_SIZE_OFFSET
+    )[0]
+    assert uncompressed_size == len(original_blob)
+    assert len(serialized) == crypto_module.PAYLOAD_OFFSET + payload_size
+
+    nonce = serialized[
+        crypto_module.NONCE_OFFSET:crypto_module.NONCE_OFFSET + 16
+    ]
+    stored_hmac = serialized[
+        crypto_module.HMAC_OFFSET:crypto_module.HMAC_OFFSET + 32
+    ]
+    ciphertext = serialized[
+        crypto_module.PAYLOAD_OFFSET:crypto_module.PAYLOAD_OFFSET + payload_size
+    ]
+    key = crypto_module._generate_save_key(version)
+    compressed = crypto_module.chacha20_crypt(ciphertext, nonce, key)
+
+    assert crypto_module.verify_hmac(compressed, stored_hmac, key)
+    assert stored_hmac == crypto_module.compute_hmac(compressed, key)
+    assert lz4.block.decompress(
+        compressed,
+        uncompressed_size=uncompressed_size,
+    ) == original_blob
+
+    reloaded = crypto_module.load_save_file(str(output))
+    assert bytes(reloaded.decompressed_blob) == original_blob
+    assert struct.unpack_from(
+        "<H", reloaded.raw_header, crypto_module.VERSION_OFFSET
+    )[0] == original_version
 
 
 def test_serialization_preserves_version_and_round_trips(
