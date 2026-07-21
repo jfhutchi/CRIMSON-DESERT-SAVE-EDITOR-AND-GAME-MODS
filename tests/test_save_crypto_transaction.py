@@ -132,6 +132,114 @@ def test_both_save_serializers_round_trip_authenticated_fixture(
     )[0] == original_version
 
 
+SYNTHETIC_SAVE_BLOB = bytes(range(256)) * 4
+
+
+@pytest.mark.parametrize(
+    ("crypto_module", "writer_name", "version"),
+    (
+        pytest.param(
+            save_crypto,
+            "serialize_save_bytes",
+            1,
+            id="save-editor-v1",
+        ),
+        pytest.param(
+            save_crypto,
+            "serialize_save_bytes",
+            2,
+            id="save-editor-v2",
+        ),
+        pytest.param(
+            game_mods_save_crypto,
+            "write_save_file",
+            1,
+            id="game-mods-v1",
+        ),
+        pytest.param(
+            game_mods_save_crypto,
+            "write_save_file",
+            2,
+            id="game-mods-v2",
+        ),
+    ),
+)
+def test_save_serializers_preserve_synthetic_header_version(
+    tmp_path: Path,
+    crypto_module,
+    writer_name: str,
+    version: int,
+) -> None:
+    original_header = bytearray(crypto_module.HEADER_SIZE)
+    original_header[
+        crypto_module.MAGIC_OFFSET:crypto_module.MAGIC_OFFSET + 4
+    ] = b"SAVE"
+    struct.pack_into(
+        "<H",
+        original_header,
+        crypto_module.VERSION_OFFSET,
+        version,
+    )
+    output = tmp_path / f"{crypto_module.__name__.replace('.', '-')}-v{version}.save"
+
+    if writer_name == "serialize_save_bytes":
+        serialized = crypto_module.serialize_save_bytes(
+            SYNTHETIC_SAVE_BLOB,
+            bytes(original_header),
+            f"synthetic-v{version}",
+        )
+        output.write_bytes(serialized)
+    else:
+        crypto_module.write_save_file(
+            str(output),
+            SYNTHETIC_SAVE_BLOB,
+            bytes(original_header),
+        )
+        serialized = output.read_bytes()
+
+    serialized_version = struct.unpack_from(
+        "<H",
+        serialized,
+        crypto_module.VERSION_OFFSET,
+    )[0]
+    assert serialized_version == version
+
+    uncompressed_size = struct.unpack_from(
+        "<I",
+        serialized,
+        crypto_module.UNCOMP_SIZE_OFFSET,
+    )[0]
+    payload_size = struct.unpack_from(
+        "<I",
+        serialized,
+        crypto_module.PAYLOAD_SIZE_OFFSET,
+    )[0]
+    nonce = serialized[
+        crypto_module.NONCE_OFFSET:crypto_module.NONCE_OFFSET + 16
+    ]
+    stored_hmac = serialized[
+        crypto_module.HMAC_OFFSET:crypto_module.HMAC_OFFSET + 32
+    ]
+    ciphertext = serialized[
+        crypto_module.PAYLOAD_OFFSET:crypto_module.PAYLOAD_OFFSET + payload_size
+    ]
+    key = crypto_module._generate_save_key(version)
+    compressed = crypto_module.chacha20_crypt(ciphertext, nonce, key)
+
+    assert uncompressed_size == len(SYNTHETIC_SAVE_BLOB)
+    assert crypto_module.verify_hmac(compressed, stored_hmac, key)
+    assert lz4.block.decompress(
+        compressed,
+        uncompressed_size=uncompressed_size,
+    ) == SYNTHETIC_SAVE_BLOB
+
+    if crypto_module is save_crypto:
+        reloaded = crypto_module.load_save_file(str(output), detect_schema=False)
+    else:
+        reloaded = crypto_module.load_save_file(str(output))
+    assert bytes(reloaded.decompressed_blob) == SYNTHETIC_SAVE_BLOB
+
+
 def test_serialization_preserves_version_and_round_trips(
     copied_save: Path,
     tmp_path: Path,
