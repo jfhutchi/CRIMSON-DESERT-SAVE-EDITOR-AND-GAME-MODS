@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from typing import Callable
 
 import crimson_rs
 import pytest
@@ -27,8 +28,12 @@ def _never_query_live_game_process(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _CountingInspectionService(BlackstarTimerService):
-    def __init__(self, profile: TimerProfile) -> None:
-        super().__init__(profile)
+    def __init__(
+        self,
+        profile: TimerProfile,
+        process_checker: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(profile, process_checker=process_checker)
         self.entry_lookup_count = 0
         self.body_read_count = 0
 
@@ -39,6 +44,21 @@ class _CountingInspectionService(BlackstarTimerService):
     def _read_body(self, game: Path, entry: dict) -> bytes:
         self.body_read_count += 1
         return super()._read_body(game, entry)
+
+    def reset_counts(self) -> None:
+        self.entry_lookup_count = 0
+        self.body_read_count = 0
+
+
+class _EntryOwnershipService(BlackstarTimerService):
+    def __init__(self, profile: TimerProfile) -> None:
+        super().__init__(profile)
+        self.source_entry: dict | None = None
+
+    def _find_entry(self, game: Path) -> dict:
+        entry = super()._find_entry(game)
+        self.source_entry = entry
+        return entry
 
 
 def _snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
@@ -63,12 +83,14 @@ def test_detects_only_enrolled_vanilla(tmp_path: Path) -> None:
 
 def test_detect_translates_missing_archive_source_to_unknown(tmp_path: Path) -> None:
     archive = make_timer_archive(tmp_path)
-    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
 
     report = service.detect(tmp_path / "missing")
 
     assert report.status is TimerStatus.UNKNOWN
     assert "PAMT not found" in report.reason
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 0
 
 
 def test_detect_translates_entry_validation_failure_to_unknown(
@@ -76,7 +98,7 @@ def test_detect_translates_entry_validation_failure_to_unknown(
 ) -> None:
     archive = make_timer_archive(tmp_path)
     profile = TimerProfile(**archive.profile_kwargs())
-    service = BlackstarTimerService(
+    service = _CountingInspectionService(
         replace(profile, entry_offset=profile.entry_offset + 1)
     )
 
@@ -84,21 +106,34 @@ def test_detect_translates_entry_validation_failure_to_unknown(
 
     assert report.status is TimerStatus.UNKNOWN
     assert "Unexpected entry offset" in report.reason
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 0
 
 
-def test_detect_translates_decompression_source_failure_to_unknown(
+def test_detect_translates_native_decompression_failure_to_unknown(
     tmp_path: Path,
 ) -> None:
     archive = make_timer_archive(tmp_path)
-    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
     paz = archive.game_dir / "0008" / "0.paz"
-    truncated_size = archive.entry_offset + archive.vanilla_compressed_size - 1
-    paz.write_bytes(paz.read_bytes()[:truncated_size])
+    paz_bytes = bytearray(paz.read_bytes())
+    paz_bytes[archive.entry_offset] ^= 0xFF
+    compressed = bytes(
+        paz_bytes[
+            archive.entry_offset:
+            archive.entry_offset + archive.vanilla_compressed_size
+        ]
+    )
+    with pytest.raises(OSError):
+        crimson_rs.decompress_data(compressed, 2, archive.body_size)
+    paz.write_bytes(paz_bytes)
 
     report = service.detect(archive.game_dir)
 
     assert report.status is TimerStatus.UNKNOWN
-    assert "truncated" in report.reason
+    assert "compatibility check failed" in report.reason
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 1
 
 
 @pytest.mark.parametrize("operation", ["detect", "preview", "token"])
@@ -111,7 +146,7 @@ def test_timer_offset_classification_errors_propagate(
     valid_service = BlackstarTimerService(profile)
     preview = valid_service.preview(archive.game_dir)
     assert preview.token is not None
-    invalid_service = BlackstarTimerService(
+    invalid_service = _CountingInspectionService(
         replace(profile, cooldown_offset=profile.uncompressed_size)
     )
 
@@ -122,6 +157,23 @@ def test_timer_offset_classification_errors_propagate(
             invalid_service.preview(archive.game_dir)
         else:
             invalid_service.validate_preview_token(preview.token)
+    assert invalid_service.entry_lookup_count == 1
+    assert invalid_service.body_read_count == 1
+
+
+def test_archive_inspection_owns_an_immutable_entry_snapshot(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = _EntryOwnershipService(TimerProfile(**archive.profile_kwargs()))
+
+    inspection = service._inspect(archive.game_dir)
+
+    assert service.source_entry is not None
+    assert not isinstance(inspection.entry, dict)
+    assert inspection.entry.compressed_size == inspection.report.compressed_size
+    service.source_entry["compressed_size"] = -1
+    assert inspection.entry.compressed_size == inspection.report.compressed_size
+    with pytest.raises(FrozenInstanceError):
+        inspection.entry.compressed_size = -1
 
 
 def test_detects_exact_applied_body(tmp_path: Path) -> None:
@@ -201,8 +253,7 @@ def test_preview_token_is_bound_to_all_source_files(tmp_path: Path) -> None:
     service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
     preview = service.preview(archive.game_dir)
     assert preview.token is not None
-    service.entry_lookup_count = 0
-    service.body_read_count = 0
+    service.reset_counts()
 
     service.validate_preview_token(preview.token)
 
@@ -210,43 +261,103 @@ def test_preview_token_is_bound_to_all_source_files(tmp_path: Path) -> None:
     assert service.body_read_count == 1
     paz = archive.game_dir / "0008" / "0.paz"
     paz.write_bytes(paz.read_bytes() + b"unrelated-change")
+    service.reset_counts()
 
-    try:
+    with pytest.raises(StalePreviewError, match="changed after preview"):
         service.validate_preview_token(preview.token)
-    except StalePreviewError as exc:
-        assert "changed after preview" in str(exc)
-    else:
-        raise AssertionError("Changed source archive was accepted")
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 1
 
 
-def test_preview_token_rejects_archive_path_outside_game_directory(
+@pytest.mark.parametrize(
+    "source_state",
+    ["valid", "running", "process_error", "missing", "corrupt"],
+)
+def test_preview_token_rejects_unsafe_path_before_source_inspection(
     tmp_path: Path,
+    source_state: str,
 ) -> None:
     archive = make_timer_archive(tmp_path)
-    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
-    preview = service.preview(archive.game_dir)
+    profile = TimerProfile(**archive.profile_kwargs())
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
     assert preview.token is not None
     unsafe = replace(
         preview.token,
         archive_hashes=(ArchiveFileHash("../outside.bin", "0" * 64),),
     )
+    process_calls = {"count": 0}
 
-    with pytest.raises(StalePreviewError, match="Unsafe backup path"):
+    def check_process() -> bool:
+        process_calls["count"] += 1
+        if source_state == "process_error":
+            raise OSError("process unavailable")
+        return source_state == "running"
+
+    if source_state == "missing":
+        (archive.game_dir / "0008" / "0.pamt").unlink()
+    elif source_state == "corrupt":
+        paz = archive.game_dir / "0008" / "0.paz"
+        paz_bytes = bytearray(paz.read_bytes())
+        paz_bytes[archive.entry_offset] ^= 0xFF
+        paz.write_bytes(paz_bytes)
+    service = _CountingInspectionService(profile, process_checker=check_process)
+
+    with pytest.raises(
+        StalePreviewError,
+        match=r"^Unsafe backup path: \.\./outside\.bin$",
+    ):
         service.validate_preview_token(unsafe)
+
+    assert process_calls["count"] == 0
+    assert service.entry_lookup_count == 0
+    assert service.body_read_count == 0
+
+
+def test_preview_token_rejects_duplicate_paths_before_source_inspection(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    preview = BlackstarTimerService(profile).preview(archive.game_dir)
+    assert preview.token is not None
+    duplicate = replace(
+        preview.token,
+        archive_hashes=(
+            preview.token.archive_hashes[0],
+            preview.token.archive_hashes[0],
+        ),
+    )
+    process_calls = {"count": 0}
+
+    def check_process() -> bool:
+        process_calls["count"] += 1
+        return False
+
+    service = _CountingInspectionService(profile, process_checker=check_process)
+
+    with pytest.raises(StalePreviewError, match="changed after preview"):
+        service.validate_preview_token(duplicate)
+
+    assert process_calls["count"] == 0
+    assert service.entry_lookup_count == 0
+    assert service.body_read_count == 0
 
 
 def test_preview_token_requires_all_source_archive_hashes(tmp_path: Path) -> None:
     archive = make_timer_archive(tmp_path)
-    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
     preview = service.preview(archive.game_dir)
     assert preview.token is not None
     incomplete = replace(
         preview.token,
         archive_hashes=preview.token.archive_hashes[:-1],
     )
+    service.reset_counts()
 
     with pytest.raises(StalePreviewError, match="changed after preview"):
         service.validate_preview_token(incomplete)
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 1
 
 
 @pytest.mark.parametrize(
@@ -258,15 +369,18 @@ def test_preview_token_rejects_stale_inspection_metadata(
     field_name: str,
 ) -> None:
     archive = make_timer_archive(tmp_path)
-    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
     preview = service.preview(archive.game_dir)
     assert preview.token is not None
     current = getattr(preview.token, field_name)
     stale_value = "0" * 64 if isinstance(current, str) else current + 1
     stale = replace(preview.token, **{field_name: stale_value})
+    service.reset_counts()
 
     with pytest.raises(StalePreviewError, match="changed after preview"):
         service.validate_preview_token(stale)
+    assert service.entry_lookup_count == 1
+    assert service.body_read_count == 1
 
 
 def test_preview_refuses_unknown_schema_without_token(tmp_path: Path) -> None:

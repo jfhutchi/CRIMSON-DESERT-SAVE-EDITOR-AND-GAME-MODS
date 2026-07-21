@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 import crimson_rs
 
@@ -127,10 +127,30 @@ class PreviewToken:
 
 
 @dataclass(frozen=True)
+class _ArchiveEntry:
+    chunk_offset: int
+    compressed_size: int
+    uncompressed_size: int
+    chunk_id: int
+    compression: int
+    crypto: int
+
+    @classmethod
+    def from_mapping(cls, entry: Mapping[str, object]) -> _ArchiveEntry:
+        return cls(
+            chunk_offset=int(entry["chunk_offset"]),
+            compressed_size=int(entry["compressed_size"]),
+            uncompressed_size=int(entry["uncompressed_size"]),
+            chunk_id=int(entry["chunk_id"]),
+            compression=int(entry["compression"]),
+            crypto=int(entry["crypto"]),
+        )
+
+
+@dataclass(frozen=True)
 class _ArchiveInspection:
     report: DetectionReport
-    # Private snapshot owned by this inspection; consumers treat it as read-only.
-    entry: dict
+    entry: _ArchiveEntry
     body: bytes
     paths: tuple[Path, Path, Path]
 
@@ -268,10 +288,10 @@ class BlackstarTimerService:
                 "Candidate body hash does not match the enrolled applied schema"
             )
         candidate_compressed = bytes(
-            crimson_rs.compress_data(candidate, int(entry["compression"]))
+            crimson_rs.compress_data(candidate, entry.compression)
         )
         self._emit_progress(progress, "candidate_compression", 70)
-        slot_capacity = int(entry["compressed_size"])
+        slot_capacity = entry.compressed_size
         if len(candidate_compressed) > slot_capacity:
             raise ValueError(
                 "Candidate compressed stream does not fit the enrolled PAZ slot"
@@ -279,8 +299,8 @@ class BlackstarTimerService:
         verified = bytes(
             crimson_rs.decompress_data(
                 candidate_compressed,
-                int(entry["compression"]),
-                int(entry["uncompressed_size"]),
+                entry.compression,
+                entry.uncompressed_size,
             )
         )
         if verified != candidate:
@@ -298,8 +318,8 @@ class BlackstarTimerService:
             ),
             source_body_sha256=detection.body_sha256,
             candidate_body_sha256=candidate_hash,
-            entry_offset=int(entry["chunk_offset"]),
-            source_compressed_size=int(entry["compressed_size"]),
+            entry_offset=entry.chunk_offset,
+            source_compressed_size=entry.compressed_size,
             candidate_compressed_size=len(candidate_compressed),
         )
         return PreviewReport(
@@ -318,12 +338,32 @@ class BlackstarTimerService:
             slot_capacity=slot_capacity,
         )
 
+    def _normalize_token_archive_hashes(
+        self,
+        game: Path,
+        archive_hashes: tuple[ArchiveFileHash, ...],
+    ) -> dict[str, str]:
+        expected_hashes: dict[str, str] = {}
+        for expected in archive_hashes:
+            try:
+                path = self._contained_path(game, expected.relative_path)
+            except BackupConflictError as exc:
+                raise StalePreviewError(str(exc)) from exc
+            relative = path.relative_to(game).as_posix()
+            if relative in expected_hashes:
+                raise StalePreviewError("Source archive changed after preview")
+            expected_hashes[relative] = expected.sha256
+        return expected_hashes
+
     def validate_preview_token(self, token: PreviewToken) -> None:
         if token.profile_id != self.profile.profile_id:
             raise StalePreviewError("Preview profile does not match this service")
         game = token.game_dir.expanduser().resolve()
         if game != token.game_dir:
             raise StalePreviewError("Preview game path is no longer normalized")
+        expected_hashes = self._normalize_token_archive_hashes(
+            game, token.archive_hashes
+        )
         process_report = self._process_report(game)
         if process_report is not None:
             raise StalePreviewError("Source archive changed after preview")
@@ -331,12 +371,15 @@ class BlackstarTimerService:
             inspection = self._inspect(game)
         except _ArchiveSourceError as exc:
             raise StalePreviewError("Source archive changed after preview") from exc
-        self._validate_token_against_inspection(token, inspection)
+        self._validate_token_against_inspection(
+            token, inspection, expected_hashes
+        )
 
     def _validate_token_against_inspection(
         self,
         token: PreviewToken,
         inspection: _ArchiveInspection,
+        expected_hashes: dict[str, str],
     ) -> dict[str, str]:
         detection = inspection.report
         if (
@@ -348,15 +391,6 @@ class BlackstarTimerService:
             raise StalePreviewError("Source archive changed after preview")
 
         game = detection.game_dir
-        expected_hashes: dict[str, str] = {}
-        for expected in token.archive_hashes:
-            try:
-                self._contained_path(game, expected.relative_path)
-            except BackupConflictError as exc:
-                raise StalePreviewError(str(exc)) from exc
-            if expected.relative_path in expected_hashes:
-                raise StalePreviewError("Source archive changed after preview")
-            expected_hashes[expected.relative_path] = expected.sha256
 
         current_hashes: dict[str, str] = {}
         for source_path in inspection.paths:
@@ -958,10 +992,11 @@ class BlackstarTimerService:
 
     def _inspect(self, game: Path) -> _ArchiveInspection:
         try:
-            entry = dict(self._find_entry(game))
-            self._validate_entry(entry)
-            body = self._read_body(game, entry)
-            paths = self._source_paths(game, entry)
+            source_entry = dict(self._find_entry(game))
+            self._validate_entry(source_entry)
+            body = self._read_body(game, source_entry)
+            paths = self._source_paths(game, source_entry)
+            entry = _ArchiveEntry.from_mapping(source_entry)
         except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as exc:
             raise _ArchiveSourceError(str(exc)) from exc
 
@@ -981,15 +1016,14 @@ class BlackstarTimerService:
             "body_sha256": digest,
             "cooldown_seconds": cooldown,
             "duration_seconds": duration,
-            "entry_offset": int(entry["chunk_offset"]),
-            "compressed_size": int(entry["compressed_size"]),
-            "uncompressed_size": int(entry["uncompressed_size"]),
+            "entry_offset": entry.chunk_offset,
+            "compressed_size": entry.compressed_size,
+            "uncompressed_size": entry.uncompressed_size,
         }
         if (
             digest == self.profile.vanilla_body_sha256
             and values == vanilla_values
-            and int(entry["compressed_size"])
-            == self.profile.vanilla_compressed_size
+            and entry.compressed_size == self.profile.vanilla_compressed_size
         ):
             report = self._report(
                 TimerStatus.VANILLA,
