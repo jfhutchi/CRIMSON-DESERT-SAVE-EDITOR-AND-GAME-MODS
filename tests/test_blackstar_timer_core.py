@@ -36,6 +36,8 @@ class _CountingInspectionService(BlackstarTimerService):
         super().__init__(profile, process_checker=process_checker)
         self.entry_lookup_count = 0
         self.body_read_count = 0
+        self.hash_call_count = 0
+        self.decompress_call_count = 0
 
     def _find_entry(self, game: Path) -> dict:
         self.entry_lookup_count += 1
@@ -45,9 +47,28 @@ class _CountingInspectionService(BlackstarTimerService):
         self.body_read_count += 1
         return super()._read_body(game, entry)
 
+    def _hash_file(self, path: Path) -> str:
+        self.hash_call_count += 1
+        return super()._hash_file(path)
+
+    def _decompress_stream(
+        self,
+        compressed: bytes,
+        compression: int,
+        uncompressed_size: int,
+    ) -> bytes:
+        self.decompress_call_count += 1
+        return super()._decompress_stream(
+            compressed,
+            compression,
+            uncompressed_size,
+        )
+
     def reset_counts(self) -> None:
         self.entry_lookup_count = 0
         self.body_read_count = 0
+        self.hash_call_count = 0
+        self.decompress_call_count = 0
 
 
 class _EntryOwnershipService(BlackstarTimerService):
@@ -406,6 +427,108 @@ def _target_entry(pamt: dict) -> dict:
     ]
     assert len(matches) == 1
     return matches[0]
+
+
+def test_apply_has_bounded_archive_work(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = _CountingInspectionService(TimerProfile(**archive.profile_kwargs()))
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    service.reset_counts()
+
+    service.apply(preview.token)
+
+    violations = []
+    if service.hash_call_count > 6:
+        violations.append(f"hash calls: {service.hash_call_count} > 6")
+    if service.decompress_call_count != 2:
+        violations.append(
+            f"decompressions: {service.decompress_call_count} != 2"
+        )
+    if hasattr(service, "_build_transaction_bytes"):
+        violations.append("full PAZ candidate builder still exists")
+    assert violations == []
+
+
+def test_apply_failure_keeps_backup_manifest_unfinalized(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    def fail_after_paz(phase: str) -> None:
+        if phase == "after_paz_write":
+            raise RuntimeError("injected failure: after_paz_write")
+
+    service = BlackstarTimerService(profile, fault_injector=fail_after_paz)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    backup_root = (
+        archive.game_dir
+        / "bin64"
+        / "SEModLoad"
+        / "Backups"
+        / "BlackstarTimer"
+    )
+    backups = [path for path in backup_root.iterdir() if path.is_dir()]
+    assert len(backups) == 1
+    manifest = json.loads(
+        (backups[0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["post_apply_hashes"] == {}
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is True
+
+
+def test_apply_combined_verification_failure_rolls_back_before_finalization(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = [
+        archive.game_dir / "0008" / "0.paz",
+        archive.game_dir / "0008" / "0.pamt",
+        archive.game_dir / "meta" / "0.papgt",
+    ]
+    before = {path: path.read_bytes() for path in paths}
+
+    class VerificationFailureService(BlackstarTimerService):
+        def __init__(self) -> None:
+            super().__init__(profile)
+            self.verification_calls = 0
+
+        def _verify_archive_set(self, *args: object, **kwargs: object) -> object:
+            self.verification_calls += 1
+            if self.verification_calls == 1:
+                raise ValueError("injected combined verification failure")
+            return super()._verify_archive_set(*args, **kwargs)
+
+    service = VerificationFailureService()
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert service.verification_calls == 2
+    assert {path: path.read_bytes() for path in paths} == before
+    backup_root = (
+        archive.game_dir
+        / "bin64"
+        / "SEModLoad"
+        / "Backups"
+        / "BlackstarTimer"
+    )
+    backups = [path for path in backup_root.iterdir() if path.is_dir()]
+    assert len(backups) == 1
+    manifest = json.loads(
+        (backups[0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["post_apply_hashes"] == {}
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is True
 
 
 def test_apply_updates_real_compressed_length_and_integrity_chain(
