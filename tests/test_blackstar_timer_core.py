@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -574,6 +575,16 @@ def test_apply_rolls_back_when_paz_open_for_write_fails(
             "meta/0.papgt",
         )
     ] + [
+        ("backup_root_parent", relative)
+        for relative in (
+            "bin64",
+            "bin64/SEModLoad",
+            "bin64/SEModLoad/Backups",
+            "bin64/SEModLoad/Backups/BlackstarTimer",
+        )
+    ] + [
+        ("backup_root", None),
+        ("backup_directory_final", None),
         ("manifest_fsync", None),
         ("manifest_directory", None),
     ],
@@ -590,6 +601,7 @@ def test_backup_durability_failure_prevents_source_mutation(
 
     class BackupDurabilityFailureService(BlackstarTimerService):
         failed = False
+        failed_operation: str | None = None
         mutation_attempted = False
 
         def _write_all(
@@ -604,6 +616,7 @@ def test_backup_durability_failure_prevents_source_mutation(
                 and not self.failed
             ):
                 self.failed = True
+                self.failed_operation = operation
                 handle.write(data[:max(1, len(data) // 2)])
                 raise OSError("injected backup write failure")
             return super()._write_all(handle, data, operation)
@@ -611,23 +624,25 @@ def test_backup_durability_failure_prevents_source_mutation(
         def _flush_file(self, handle: BinaryIO, operation: str) -> None:
             if (
                 failure_stage == "backup_flush"
-                and operation.startswith("backup:")
+                and operation == f"backup:{target_relative}"
                 and not self.failed
             ):
                 self.failed = True
+                self.failed_operation = operation
                 raise OSError("injected backup flush failure")
             return super()._flush_file(handle, operation)
 
         def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
             should_fail = (
                 failure_stage == "backup_fsync"
-                and operation.startswith("backup:")
+                and operation == f"backup:{target_relative}"
             ) or (
                 failure_stage == "manifest_fsync"
                 and operation == "manifest"
             )
             if should_fail and not self.failed:
                 self.failed = True
+                self.failed_operation = operation
                 raise OSError(f"injected {failure_stage} failure")
             return super()._fsync_file(handle, operation)
 
@@ -636,11 +651,21 @@ def test_backup_durability_failure_prevents_source_mutation(
                 failure_stage == "backup_directory"
                 and operation == f"backup-directory:{target_relative}"
             ) or (
+                failure_stage == "backup_root_parent"
+                and operation == f"backup-root-parent:{target_relative}"
+            ) or (
+                failure_stage == "backup_root"
+                and operation == "backup-root-directory"
+            ) or (
+                failure_stage == "backup_directory_final"
+                and operation == "backup-directory"
+            ) or (
                 failure_stage == "manifest_directory"
                 and operation == "manifest-directory"
             )
             if should_fail and not self.failed:
                 self.failed = True
+                self.failed_operation = operation
                 raise OSError(f"injected {failure_stage} failure")
             return super()._sync_directory(path, operation)
 
@@ -656,6 +681,21 @@ def test_backup_durability_failure_prevents_source_mutation(
         service.apply(preview.token)
 
     assert service.failed is True
+    if failure_stage == "backup_directory":
+        expected_operation = f"backup-directory:{target_relative}"
+    elif failure_stage == "backup_root_parent":
+        expected_operation = f"backup-root-parent:{target_relative}"
+    elif failure_stage == "backup_root":
+        expected_operation = "backup-root-directory"
+    elif failure_stage == "backup_directory_final":
+        expected_operation = "backup-directory"
+    elif failure_stage.startswith("backup_"):
+        expected_operation = f"backup:{target_relative}"
+    elif failure_stage == "manifest_fsync":
+        expected_operation = "manifest"
+    else:
+        expected_operation = "manifest-directory"
+    assert service.failed_operation == expected_operation
     assert service.mutation_attempted is False
     assert _archive_contents(paths) == before
 
@@ -671,7 +711,8 @@ def test_backup_and_manifest_are_durable_before_paz_mutation(
             super().__init__(profile)
             self.synced_files: set[str] = set()
             self.synced_directories: set[str] = set()
-            self.mutation_prerequisites: tuple[set[str], set[str]] | None = None
+            self.sync_events: list[str] = []
+            self.mutation_prerequisites: tuple[set[str], set[str], list[str]] | None = None
 
         def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
             super()._fsync_file(handle, operation)
@@ -680,11 +721,13 @@ def test_backup_and_manifest_are_durable_before_paz_mutation(
         def _sync_directory(self, path: Path, operation: str) -> None:
             super()._sync_directory(path, operation)
             self.synced_directories.add(operation)
+            self.sync_events.append(operation)
 
         def _patch_paz_slot(self, *args: object, **kwargs: object) -> None:
             self.mutation_prerequisites = (
                 set(self.synced_files),
                 set(self.synced_directories),
+                list(self.sync_events),
             )
             return super()._patch_paz_slot(*args, **kwargs)
 
@@ -695,7 +738,7 @@ def test_backup_and_manifest_are_durable_before_paz_mutation(
     service.apply(preview.token)
 
     assert service.mutation_prerequisites is not None
-    synced_files, synced_directories = service.mutation_prerequisites
+    synced_files, synced_directories, sync_events = service.mutation_prerequisites
     assert {
         "backup:0008/0.paz",
         "backup:0008/0.pamt",
@@ -703,11 +746,127 @@ def test_backup_and_manifest_are_durable_before_paz_mutation(
         "manifest",
     } <= synced_files
     assert {
+        "backup-root-parent:bin64",
+        "backup-root-parent:bin64/SEModLoad",
+        "backup-root-parent:bin64/SEModLoad/Backups",
+        "backup-root-parent:bin64/SEModLoad/Backups/BlackstarTimer",
+        "backup-root-directory",
         "backup-directory:0008/0.paz",
         "backup-directory:0008/0.pamt",
         "backup-directory:meta/0.papgt",
         "manifest-directory",
+        "backup-directory",
     } <= synced_directories
+    assert sync_events.index("manifest-directory") < sync_events.index(
+        "backup-directory"
+    )
+
+
+class _FakeWindowsFunction:
+    def __init__(self, callback: Callable[..., int]) -> None:
+        self.callback = callback
+        self.argtypes: list[object] | None = None
+        self.restype: object | None = None
+
+    def __call__(self, *args: object) -> int:
+        return self.callback(*args)
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only API contract")
+def test_windows_directory_sync_uses_probed_createfile_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, tuple[object, ...]]] = []
+    handle = 123
+
+    class FakeKernel32:
+        CreateFileW = _FakeWindowsFunction(
+            lambda *args: events.append(("create", args)) or handle
+        )
+        FlushFileBuffers = _FakeWindowsFunction(
+            lambda *args: events.append(("flush", args)) or 1
+        )
+        CloseHandle = _FakeWindowsFunction(
+            lambda *args: events.append(("close", args)) or 1
+        )
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: FakeKernel32())
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+
+    service._sync_directory(tmp_path, "test-directory")
+
+    assert events == [
+        (
+            "create",
+            (
+                str(tmp_path),
+                0x0002,
+                0x00000001 | 0x00000002 | 0x00000004,
+                None,
+                3,
+                0x02000000,
+                None,
+            ),
+        ),
+        ("flush", (handle,)),
+        ("close", (handle,)),
+    ]
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only API contract")
+@pytest.mark.parametrize("failure_stage", ["open", "flush", "close"])
+def test_windows_directory_sync_propagates_win32_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    events: list[str] = []
+    handle = 123
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    def create_file(*args: object) -> int:
+        del args
+        events.append("create")
+        if failure_stage == "open":
+            ctypes.set_last_error(5)
+            assert invalid_handle is not None
+            return invalid_handle
+        return handle
+
+    def flush_file(*args: object) -> int:
+        del args
+        events.append("flush")
+        if failure_stage == "flush":
+            ctypes.set_last_error(5)
+            return 0
+        return 1
+
+    def close_handle(*args: object) -> int:
+        del args
+        events.append("close")
+        if failure_stage == "close":
+            ctypes.set_last_error(5)
+            return 0
+        return 1
+
+    class FakeKernel32:
+        CreateFileW = _FakeWindowsFunction(create_file)
+        FlushFileBuffers = _FakeWindowsFunction(flush_file)
+        CloseHandle = _FakeWindowsFunction(close_handle)
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: FakeKernel32())
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+
+    with pytest.raises(OSError, match="test-directory"):
+        service._sync_directory(tmp_path, "test-directory")
+
+    if failure_stage == "open":
+        assert events == ["create"]
+    else:
+        assert events == ["create", "flush", "close"]
 
 
 @pytest.mark.parametrize("window", ["before", "during"])

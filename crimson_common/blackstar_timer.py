@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import logging
@@ -957,6 +958,24 @@ class BlackstarTimerService:
             self._flush_file(backup_handle, operation)
             self._fsync_file(backup_handle, operation)
 
+    def _create_backup_root(self, game: Path, root: Path) -> None:
+        current = game
+        for part in root.relative_to(game).parts:
+            current = current / part
+            try:
+                current.mkdir()
+            except FileExistsError:
+                if not current.is_dir():
+                    raise NotADirectoryError(
+                        f"Backup path component is not a directory: {current}"
+                    )
+            else:
+                relative = current.relative_to(game).as_posix()
+                self._sync_directory(
+                    current.parent,
+                    f"backup-root-parent:{relative}",
+                )
+
     def _create_backup(
         self,
         game: Path,
@@ -966,7 +985,7 @@ class BlackstarTimerService:
         slot_payload: bytes,
     ) -> tuple[Path, _PazIdentity]:
         root = game / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
-        root.mkdir(parents=True, exist_ok=True)
+        self._create_backup_root(game, root)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         backup_dir = root / timestamp
         backup_dir.mkdir(exist_ok=False)
@@ -996,7 +1015,6 @@ class BlackstarTimerService:
                 backup_hash = self._hash_file(destination)
             if backup_hash != expected:
                 raise OSError(f"Backup verification failed: {relative_text}")
-        self._sync_directory(backup_dir, "backup-directory")
 
         manifest = {
             "format_version": 1,
@@ -1014,6 +1032,7 @@ class BlackstarTimerService:
             "restored": False,
         }
         self._write_manifest(backup_dir / "manifest.json", manifest)
+        self._sync_directory(backup_dir, "backup-directory")
         if expected_paz is None:
             raise OSError("Backup PAZ identity was not calculated")
         return backup_dir, expected_paz
@@ -1234,9 +1253,8 @@ class BlackstarTimerService:
 
     @staticmethod
     def _sync_directory(path: Path, operation: str) -> None:
-        del operation
         if os.name == "nt":
-            # Windows os.open cannot acquire a directory handle for fsync.
+            BlackstarTimerService._sync_windows_directory(path, operation)
             return
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         descriptor = os.open(path, flags)
@@ -1244,6 +1262,73 @@ class BlackstarTimerService:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _sync_windows_directory(path: Path, operation: str) -> None:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(path),
+            0x0002,  # FILE_WRITE_DATA
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        handle_value = (
+            handle
+            if isinstance(handle, int)
+            else ctypes.cast(handle, ctypes.c_void_p).value
+        )
+        if handle_value in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_last_error()
+            raise ctypes.WinError(
+                error,
+                f"Directory sync open failed ({operation}): {path}",
+            )
+
+        flush_error: OSError | None = None
+        if not flush_file_buffers(handle):
+            error = ctypes.get_last_error()
+            flush_error = ctypes.WinError(
+                error,
+                f"Directory sync flush failed ({operation}): {path}",
+            )
+
+        close_error: OSError | None = None
+        if not close_handle(handle):
+            error = ctypes.get_last_error()
+            close_error = ctypes.WinError(
+                error,
+                f"Directory sync close failed ({operation}): {path}",
+            )
+
+        if flush_error is not None:
+            if close_error is not None:
+                raise flush_error from close_error
+            raise flush_error
+        if close_error is not None:
+            raise close_error
 
     def _atomic_write(
         self,
