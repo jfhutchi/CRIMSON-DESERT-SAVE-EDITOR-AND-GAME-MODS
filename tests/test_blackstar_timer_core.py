@@ -1443,7 +1443,7 @@ def test_apply_rejects_timestamp_directory_swapped_to_junction(
 
 
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
-def test_apply_rechecks_containment_immediately_before_backup_copy(
+def test_backup_set_guard_blocks_swap_before_backup_copy(
     tmp_path: Path,
 ) -> None:
     archive = make_timer_archive(tmp_path)
@@ -1454,6 +1454,7 @@ def test_apply_rechecks_containment_immediately_before_backup_copy(
     outside.mkdir()
 
     class CopySwapService(BlackstarTimerService):
+        blocked = False
         swapped = False
 
         def _copy_backup_file(
@@ -1462,10 +1463,17 @@ def test_apply_rechecks_containment_immediately_before_backup_copy(
             source: Path,
             destination: Path,
             operation: str,
+            *,
+            held_backup_root: Path | None = None,
+            held_backup_root_fd: int | None = None,
         ) -> None:
             if not self.swapped:
                 backup_dir = destination.parents[1]
-                backup_dir.rmdir()
+                try:
+                    backup_dir.rmdir()
+                except PermissionError:
+                    self.blocked = True
+                    raise
                 _create_junction(backup_dir, outside)
                 self.swapped = True
             return super()._copy_backup_file(
@@ -1473,16 +1481,19 @@ def test_apply_rechecks_containment_immediately_before_backup_copy(
                 source,
                 destination,
                 operation,
+                held_backup_root=held_backup_root,
+                held_backup_root_fd=held_backup_root_fd,
             )
 
     service = CopySwapService(profile)
     preview = service.preview(archive.game_dir)
     assert preview.token is not None
 
-    with pytest.raises(BackupConflictError, match="reparse"):
+    with pytest.raises(PermissionError):
         service.apply(preview.token)
 
-    assert service.swapped is True
+    assert service.blocked is True
+    assert service.swapped is False
     assert _file_tree(outside) == {}
     assert _archive_contents(paths) == before
 
@@ -1536,6 +1547,72 @@ def test_backup_destination_chain_blocks_swap_before_native_open(
     assert service.swap_error.winerror == 32
     assert _file_tree(outside) == {}
     assert not list(archive.game_dir.rglob("*-moved"))
+
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only backup-set guard")
+@pytest.mark.parametrize(
+    "phase",
+    ["after-paz-verification", "before-manifest"],
+)
+def test_backup_set_guard_spans_all_files_manifest_and_final_check(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    class BackupSetSwapService(BlackstarTimerService):
+        attempted = False
+        release_checked = False
+        rename_error: OSError | None = None
+
+        def _before_backup_set_step(
+            self,
+            current_phase: str,
+            backup_dir: Path,
+        ) -> None:
+            if self.attempted or current_phase != phase:
+                return
+            self.attempted = True
+            moved = backup_dir.with_name(backup_dir.name + "-moved")
+            try:
+                backup_dir.rename(moved)
+            except OSError as exc:
+                self.rename_error = exc
+                return
+            backup_dir.mkdir()
+
+        def _before_backup_guard_release(
+            self,
+            backup_dir: Path,
+            source_hashes: dict[str, str],
+        ) -> None:
+            manifest_path = backup_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            assert manifest["source_hashes"] == source_hashes
+            for relative, expected in source_hashes.items():
+                backup_file = backup_dir / Path(relative)
+                assert backup_file.is_file()
+                assert self._hash_file(backup_file) == expected
+            self.release_checked = True
+
+    service = BackupSetSwapService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    report = service.apply(preview.token)
+
+    assert report.status is TimerStatus.APPLIED
+    assert service.attempted is True
+    assert service.release_checked is True
+    assert service.rename_error is not None
+    assert service.rename_error.winerror == 32
+    manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is True
+    for relative, expected in manifest["source_hashes"].items():
+        assert service._hash_file(manifest_path.parent / Path(relative)) == expected
+    assert not list(manifest_path.parent.parent.glob("*-moved"))
 
 
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
@@ -1796,6 +1873,179 @@ def test_metadata_guard_detects_path_replacement_before_native_replace(
     _assert_unfinalized_rollback_manifest(archive.game_dir)
 
 
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only exchange contract")
+@pytest.mark.parametrize("relative", ["0008/0.pamt", "meta/0.papgt"])
+def test_metadata_exchange_preserves_concurrent_replacement(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    target = archive.game_dir / Path(relative)
+    concurrent = b"concurrent-metadata-" + relative.encode("ascii")
+
+    class ConcurrentExchangeService(BlackstarTimerService):
+        exchanged = False
+
+        def _before_metadata_exchange(self, path: Path, operation: str) -> None:
+            if self.exchanged or path != target:
+                return
+            replacement = path.with_name(".concurrent-replacement")
+            replacement.write_bytes(concurrent)
+            self._replace_windows_file(
+                replacement,
+                path,
+                "concurrent-exchange-seam",
+            )
+            self.exchanged = True
+
+    service = ConcurrentExchangeService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="concurrent metadata"):
+        service.apply(preview.token)
+
+    assert service.exchanged is True
+    assert target.read_bytes() == concurrent
+    for path, expected in before.items():
+        if path != target:
+            assert path.read_bytes() == expected
+    _manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is False
+    assert not list(target.parent.glob(".*.displaced-*"))
+    assert not list(target.parent.glob(".*.timer-*"))
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only exchange contract")
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["backup_file", "replace", "verify", "restore", "cleanup"],
+)
+def test_metadata_exchange_faults_preserve_truthful_recovery_state(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    target = paths[1]
+    concurrent = b"concurrent-restore-failure"
+
+    class ExchangeFaultService(BlackstarTimerService):
+        faulted = False
+        exchanged = False
+
+        def _before_metadata_exchange(self, path: Path, operation: str) -> None:
+            if failure_stage != "restore" or self.exchanged or path != target:
+                return
+            replacement = path.with_name(".concurrent-fault")
+            replacement.write_bytes(concurrent)
+            self._replace_windows_file(
+                replacement,
+                path,
+                "concurrent-restore-fault",
+            )
+            self.exchanged = True
+
+        def _metadata_displaced_path(
+            self,
+            path: Path,
+            operation: str,
+        ) -> Path:
+            if failure_stage == "backup_file" and not self.faulted:
+                self.faulted = True
+                raise OSError("injected displaced backup-file creation failure")
+            return super()._metadata_displaced_path(path, operation)
+
+        def _replace_windows_file(
+            self,
+            source: Path,
+            destination: Path,
+            operation: str,
+            backup_path: Path | None = None,
+        ) -> None:
+            if (
+                failure_stage == "replace"
+                and backup_path is not None
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected metadata ReplaceFileW failure")
+            return super()._replace_windows_file(
+                source,
+                destination,
+                operation,
+                backup_path,
+            )
+
+        def _read_metadata_bytes(
+            self,
+            source: Path | BinaryIO,
+            operation: str,
+        ) -> bytes:
+            if (
+                failure_stage == "verify"
+                and operation.startswith("metadata-displaced-verification:")
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected displaced verification failure")
+            return super()._read_metadata_bytes(source, operation)
+
+        def _restore_displaced_metadata(
+            self,
+            displaced: Path,
+            destination: Path,
+            operation: str,
+        ) -> None:
+            if failure_stage == "restore" and not self.faulted:
+                self.faulted = True
+                raise OSError("injected displaced restore failure")
+            return super()._restore_displaced_metadata(
+                displaced,
+                destination,
+                operation,
+            )
+
+        def _remove_displaced_metadata(
+            self,
+            displaced: Path,
+            operation: str,
+        ) -> None:
+            if failure_stage == "cleanup" and not self.faulted:
+                self.faulted = True
+                raise OSError("injected displaced cleanup failure")
+            return super()._remove_displaced_metadata(displaced, operation)
+
+    service = ExchangeFaultService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError) as raised:
+        service.apply(preview.token)
+
+    assert service.faulted is True
+    assert raised.value.__cause__ is not None
+    _manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is False
+    if failure_stage == "restore":
+        assert manifest["rolled_back"] is False
+        displaced = list(target.parent.glob(".*.displaced-*"))
+        assert len(displaced) == 1
+        assert displaced[0].read_bytes() == concurrent
+    else:
+        assert manifest["rolled_back"] is True
+        assert _archive_contents(paths) == before
+        assert not list(target.parent.glob(".*.displaced-*"))
+    assert not list(target.parent.glob(".*.timer-*"))
+
+
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only sharing contract")
 def test_existing_metadata_writer_forces_apply_rollback(tmp_path: Path) -> None:
     archive = make_timer_archive(tmp_path)
@@ -1978,6 +2228,9 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
             source: Path,
             destination: Path,
             operation: str,
+            *,
+            held_backup_root: Path | None = None,
+            held_backup_root_fd: int | None = None,
         ) -> None:
             self.backup_copy_passes += 1
             counter = (
@@ -1991,6 +2244,8 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
                 source,
                 destination,
                 operation,
+                held_backup_root=held_backup_root,
+                held_backup_root_fd=held_backup_root_fd,
             )
 
         def _stream_paz_identity(
@@ -2109,6 +2364,8 @@ def test_apply_streams_paz_identity_without_full_file_buffers(
             "metadata-guard-after-paz:meta/0.papgt": 1,
             "metadata-guard-before-replace:0008/0.pamt": 1,
             "metadata-guard-before-replace:meta/0.papgt": 1,
+            "metadata-displaced-verification:pamt": 1,
+            "metadata-displaced-verification:papgt": 1,
             "post-write-verification:0008/0.pamt": 1,
             "post-write-verification:meta/0.papgt": 1,
         }

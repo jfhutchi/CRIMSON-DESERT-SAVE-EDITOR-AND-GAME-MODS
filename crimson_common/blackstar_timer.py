@@ -47,6 +47,41 @@ class GameRunningError(RuntimeError):
     """Raised when an archive write is requested while the game is open."""
 
 
+class _MetadataRecoveryRequired(RuntimeError):
+    """Defers restoration until the held metadata identity can be released."""
+
+    def __init__(
+        self,
+        path: Path,
+        displaced_path: Path,
+        original: Exception,
+        *,
+        concurrent_bytes: bytes | None = None,
+    ) -> None:
+        super().__init__(str(original))
+        self.path = path
+        self.displaced_path = displaced_path
+        self.original = original
+        self.concurrent_bytes = concurrent_bytes
+
+
+class _MetadataExchangeConflict(StalePreviewError):
+    """Carries the concurrent preimage preservation state into rollback."""
+
+    def __init__(
+        self,
+        path: Path,
+        displaced_path: Path | None,
+        *,
+        restored: bool,
+        detail: str,
+    ) -> None:
+        super().__init__(f"concurrent metadata replacement detected: {detail}")
+        self.path = path
+        self.displaced_path = displaced_path
+        self.restored = restored
+
+
 class _ArchiveSourceError(RuntimeError):
     """Wraps only source-inspection errors translated by legacy detection."""
 
@@ -718,6 +753,52 @@ class BlackstarTimerService:
         except Exception as exc:
             if not mutation_attempted:
                 raise
+            if isinstance(exc, _MetadataExchangeConflict):
+                preserved_paths: set[str] = set()
+                recovery_path = exc.displaced_path
+                if exc.restored:
+                    preserved_paths.add(
+                        exc.path.relative_to(game).as_posix()
+                    )
+                    recovery_path = exc.path
+                try:
+                    if recovery_path is None or not recovery_path.is_file():
+                        raise OSError(
+                            "Concurrent metadata recovery asset is missing"
+                        )
+                    recovery_bytes = self._read_metadata_bytes(
+                        recovery_path,
+                        "metadata-conflict-recovery-baseline",
+                    )
+                    self._restore_backup_files(
+                        game,
+                        backup_dir,
+                        source_hashes,
+                        preserve_paths=preserved_paths,
+                    )
+                    if self._read_metadata_bytes(
+                        recovery_path,
+                        "metadata-conflict-recovery-verification",
+                    ) != recovery_bytes:
+                        raise OSError(
+                            "Concurrent metadata changed during transaction rollback"
+                        )
+                except Exception as rollback_exc:
+                    raise TimerTransactionError(
+                        f"Apply failed: {exc}; rollback also failed: "
+                        f"{rollback_exc}"
+                    ) from exc
+                if exc.restored:
+                    raise TimerTransactionError(
+                        "Apply aborted after a concurrent metadata replacement; "
+                        "transaction changes were rolled back without overwriting "
+                        f"the concurrent file: {exc.path}"
+                    ) from exc
+                raise TimerTransactionError(
+                    "Apply aborted after a concurrent metadata replacement; "
+                    "transaction changes were rolled back and the concurrent file "
+                    f"was retained for recovery at: {exc.displaced_path}"
+                ) from exc
             try:
                 self._restore_backup_files(game, backup_dir, source_hashes)
                 self._verify_archive_set(
@@ -1028,6 +1109,22 @@ class BlackstarTimerService:
     def _before_metadata_replace(path: Path, operation: str) -> None:
         del path, operation
 
+    @staticmethod
+    def _before_metadata_exchange(path: Path, operation: str) -> None:
+        del path, operation
+
+    @staticmethod
+    def _metadata_displaced_path(path: Path, operation: str) -> Path:
+        del operation
+        return path.with_name(
+            f".{path.name}.displaced-{next(tempfile._get_candidate_names())}"
+        )
+
+    @staticmethod
+    def _remove_displaced_metadata(displaced: Path, operation: str) -> None:
+        del operation
+        displaced.unlink()
+
 
     @contextmanager
     def _hold_metadata_replace_guard(
@@ -1035,7 +1132,7 @@ class BlackstarTimerService:
         path: Path,
         expected: bytes,
         operation: str,
-    ) -> Iterator[None]:
+    ) -> Iterator[tuple[int, int]]:
         descriptor: int | None = None
         handle: BinaryIO | None = None
         raw_windows_handle: object | None = None
@@ -1156,7 +1253,7 @@ class BlackstarTimerService:
                 raise StalePreviewError(
                     f"Live metadata changed during apply: {path.name}"
                 ) from exc
-            yield
+            yield (held_after.st_dev, held_after.st_ino)
         finally:
             if handle is not None:
                 handle.close()
@@ -1343,6 +1440,8 @@ class BlackstarTimerService:
         operation: str,
         *,
         create_missing: bool,
+        root_is_held: bool = False,
+        root_fd: int | None = None,
     ) -> Iterator[int | None]:
         root = root.resolve(strict=True)
         try:
@@ -1362,7 +1461,8 @@ class BlackstarTimerService:
             try:
                 try:
                     current = root
-                    for part in (None, *relative.parts):
+                    parts = relative.parts if root_is_held else (None, *relative.parts)
+                    for part in parts:
                         if part is not None:
                             current = current / part
                         try:
@@ -1431,9 +1531,14 @@ class BlackstarTimerService:
             try:
                 import fcntl
 
-                parent_fd = os.open(root, flags)
-                descriptors.append(parent_fd)
-                fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if root_is_held:
+                    if root_fd is None:
+                        raise ValueError("Held POSIX directory root requires its descriptor")
+                    parent_fd = root_fd
+                else:
+                    parent_fd = os.open(root, flags)
+                    descriptors.append(parent_fd)
+                    fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 for part in relative.parts:
                     try:
                         child_fd = os.open(part, flags, dir_fd=parent_fd)
@@ -1473,12 +1578,18 @@ class BlackstarTimerService:
         source: Path,
         destination: Path,
         operation: str,
+        *,
+        held_backup_root: Path | None = None,
+        held_backup_root_fd: int | None = None,
     ) -> None:
+        guard_root = held_backup_root or game
         with self._hold_safe_archive_directory_chain(
-            game,
+            guard_root,
             destination.parent,
             f"{operation}:destination-chain",
             create_missing=True,
+            root_is_held=held_backup_root is not None,
+            root_fd=held_backup_root_fd,
         ) as parent_fd:
             self._assert_safe_archive_path(
                 game,
@@ -1549,6 +1660,56 @@ class BlackstarTimerService:
                     f"backup-root-parent:{relative}",
                 )
 
+
+    @staticmethod
+    def _before_backup_set_step(phase: str, backup_dir: Path) -> None:
+        del phase, backup_dir
+
+    @staticmethod
+    def _before_backup_guard_release(
+        backup_dir: Path,
+        source_hashes: dict[str, str],
+    ) -> None:
+        del backup_dir, source_hashes
+
+    def _assert_backup_set_complete(
+        self,
+        game: Path,
+        backup_dir: Path,
+        source_hashes: dict[str, str],
+        verified_hashes: dict[str, str],
+        verified_stats: dict[str, tuple[int, int, int, int, int]],
+    ) -> None:
+        if verified_hashes != source_hashes:
+            raise OSError("Backup verification set is incomplete")
+        manifest_path = backup_dir / "manifest.json"
+        self._assert_safe_archive_path(
+            game,
+            manifest_path,
+            "backup-set-final-manifest",
+            require_exists=True,
+        )
+        if not manifest_path.is_file():
+            raise OSError("Backup manifest disappeared before guard release")
+        for relative in source_hashes:
+            backup_file = backup_dir / self._archive_relative_path(relative)
+            self._assert_safe_archive_path(
+                game,
+                backup_file,
+                f"backup-set-final:{relative}",
+                require_exists=True,
+            )
+            current = backup_file.stat()
+            fingerprint = (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            if not backup_file.is_file() or fingerprint != verified_stats[relative]:
+                raise OSError(f"Backup changed before guard release: {relative}")
+
     def _create_backup(
         self,
         game: Path,
@@ -1576,52 +1737,92 @@ class BlackstarTimerService:
         self._sync_directory(root, "backup-root-directory")
 
         expected_paz: _PazIdentity | None = None
-        for path in paths:
-            relative = path.relative_to(game)
-            relative_text = relative.as_posix()
-            destination = backup_dir / relative
-            operation = f"backup:{relative_text}"
-            self._copy_backup_file(game, path, destination, operation)
-            expected = source_hashes[relative_text]
-            if path == paths[0]:
-                expected_paz = self._stream_paz_identity(
+        verified_hashes: dict[str, str] = {}
+        verified_stats: dict[str, tuple[int, int, int, int, int]] = {}
+        with self._hold_safe_archive_directory_chain(
+            game,
+            backup_dir,
+            "backup-set",
+            create_missing=False,
+        ) as backup_root_fd:
+            for path in paths:
+                relative = path.relative_to(game)
+                relative_text = relative.as_posix()
+                destination = backup_dir / relative
+                operation = f"backup:{relative_text}"
+                self._copy_backup_file(
+                    game,
+                    path,
                     destination,
-                    token.entry_offset,
-                    token.source_compressed_size,
-                    replacement=slot_payload,
-                    operation=f"backup-verification:{relative_text}",
+                    operation,
+                    held_backup_root=backup_dir,
+                    held_backup_root_fd=backup_root_fd,
                 )
-                backup_hash = expected_paz.source_sha256
-            else:
-                backup_hash = self._hash_file(
-                    destination,
-                    f"backup-verification:{relative_text}",
+                expected = source_hashes[relative_text]
+                if path == paths[0]:
+                    expected_paz = self._stream_paz_identity(
+                        destination,
+                        token.entry_offset,
+                        token.source_compressed_size,
+                        replacement=slot_payload,
+                        operation=f"backup-verification:{relative_text}",
+                    )
+                    backup_hash = expected_paz.source_sha256
+                else:
+                    backup_hash = self._hash_file(
+                        destination,
+                        f"backup-verification:{relative_text}",
+                    )
+                if backup_hash != expected:
+                    raise OSError(f"Backup verification failed: {relative_text}")
+                verified_hashes[relative_text] = backup_hash
+                current = destination.stat()
+                verified_stats[relative_text] = (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_ctime_ns,
                 )
-            if backup_hash != expected:
-                raise OSError(f"Backup verification failed: {relative_text}")
+                if path == paths[0]:
+                    self._before_backup_set_step(
+                        "after-paz-verification",
+                        backup_dir,
+                    )
 
-        manifest = {
-            "format_version": 1,
-            "profile_id": self.profile.profile_id,
-            "game_dir": str(game),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "source_hashes": source_hashes,
-            "post_apply_hashes": {},
-            "source_body_sha256": token.source_body_sha256,
-            "candidate_body_sha256": token.candidate_body_sha256,
-            "source_compressed_size": token.source_compressed_size,
-            "candidate_compressed_size": token.candidate_compressed_size,
-            "finalized": False,
-            "rolled_back": False,
-            "restored": False,
-        }
-        self._write_manifest(
-            backup_dir / "manifest.json",
-            manifest,
-            trusted_root=game,
-        )
-        if expected_paz is None:
-            raise OSError("Backup PAZ identity was not calculated")
+            self._before_backup_set_step("before-manifest", backup_dir)
+            manifest = {
+                "format_version": 1,
+                "profile_id": self.profile.profile_id,
+                "game_dir": str(game),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_hashes": source_hashes,
+                "post_apply_hashes": {},
+                "source_body_sha256": token.source_body_sha256,
+                "candidate_body_sha256": token.candidate_body_sha256,
+                "source_compressed_size": token.source_compressed_size,
+                "candidate_compressed_size": token.candidate_compressed_size,
+                "finalized": False,
+                "rolled_back": False,
+                "restored": False,
+            }
+            self._write_manifest(
+                backup_dir / "manifest.json",
+                manifest,
+                trusted_root=game,
+                held_directory_root=backup_dir,
+                held_directory_root_fd=backup_root_fd,
+            )
+            if expected_paz is None:
+                raise OSError("Backup PAZ identity was not calculated")
+            self._assert_backup_set_complete(
+                game,
+                backup_dir,
+                source_hashes,
+                verified_hashes,
+                verified_stats,
+            )
+            self._before_backup_guard_release(backup_dir, source_hashes)
         return backup_dir, expected_paz
 
     def _verify_archive_set(
@@ -1763,8 +1964,13 @@ class BlackstarTimerService:
         backup_dir: Path,
         source_hashes: dict[str, str],
         after_replace: Callable[[int, str], None] | None = None,
+        *,
+        preserve_paths: set[str] | None = None,
     ) -> None:
+        preserved = preserve_paths or set()
         for index, (relative, expected) in enumerate(source_hashes.items(), start=1):
+            if relative in preserved:
+                continue
             source = self._contained_path(backup_dir, relative)
             destination = self._contained_path(game, relative)
             if not source.is_file() or self._hash_file(source) != expected:
@@ -1842,6 +2048,12 @@ class BlackstarTimerService:
                 after_replace(index, relative)
 
         for relative, expected in source_hashes.items():
+            if relative in preserved:
+                if not self._contained_path(game, relative).is_file():
+                    raise OSError(
+                        f"Preserved concurrent file is missing: {relative}"
+                    )
+                continue
             if self._hash_file(self._contained_path(game, relative)) != expected:
                 raise OSError(f"Restored file hash mismatch: {relative}")
 
@@ -2050,6 +2262,7 @@ class BlackstarTimerService:
         source: Path,
         destination: Path,
         operation: str,
+        backup_path: Path | None = None,
     ) -> None:
         from ctypes import wintypes
 
@@ -2067,7 +2280,7 @@ class BlackstarTimerService:
         if not replace_file(
             str(destination),
             str(source),
-            None,
+            str(backup_path) if backup_path is not None else None,
             0,
             None,
             None,
@@ -2077,6 +2290,103 @@ class BlackstarTimerService:
                 error,
                 f"Atomic replace failed ({operation}): {destination}",
             )
+
+
+    def _restore_displaced_metadata(
+        self,
+        displaced: Path,
+        destination: Path,
+        operation: str,
+    ) -> None:
+        if os.name == "nt":
+            self._replace_windows_file(
+                displaced,
+                destination,
+                f"{operation}:restore",
+            )
+        else:
+            os.replace(displaced, destination)
+        with destination.open("rb+") as restored_handle:
+            self._fsync_file(
+                restored_handle,
+                f"{operation}:restored-file",
+            )
+        self._sync_directory(
+            destination.parent,
+            f"{operation}:restored-directory",
+        )
+
+    def _exchange_metadata_preimage(
+        self,
+        source: Path,
+        destination: Path,
+        expected: bytes,
+        expected_identity: tuple[int, int],
+        operation: str,
+        *,
+        directory_fd: int | None,
+    ) -> Path:
+        displaced = self._metadata_displaced_path(destination, operation)
+        if os.name == "nt":
+            self._replace_windows_file(
+                source,
+                destination,
+                operation,
+                displaced,
+            )
+        else:
+            # The hard link is an atomic named preimage under the held parent.
+            # POSIX locks remain advisory against in-place noncooperative writers.
+            if directory_fd is None:
+                os.link(destination, displaced, follow_symlinks=False)
+            else:
+                os.link(
+                    destination.name,
+                    displaced.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            self._replace_path(
+                source,
+                destination,
+                operation,
+                directory_fd=directory_fd,
+            )
+
+        verification_operation = (
+            f"metadata-displaced-verification:{operation}"
+        )
+        try:
+            displaced_bytes = self._read_metadata_bytes(
+                displaced,
+                verification_operation,
+            )
+            displaced_stat = displaced.stat()
+        except Exception as verification_exc:
+            raise _MetadataRecoveryRequired(
+                destination,
+                displaced,
+                verification_exc,
+            ) from verification_exc
+
+        displaced_identity = (
+            displaced_stat.st_dev,
+            displaced_stat.st_ino,
+        )
+        if (
+            displaced_bytes != expected
+            or displaced_identity != expected_identity
+        ):
+            raise _MetadataRecoveryRequired(
+                destination,
+                displaced,
+                StalePreviewError(
+                    f"Metadata changed before atomic exchange: {destination}"
+                ),
+                concurrent_bytes=displaced_bytes,
+            )
+        return displaced
 
     def _replace_path(
         self,
@@ -2213,6 +2523,8 @@ class BlackstarTimerService:
         trusted_root: Path | None = None,
         expected_current: bytes | None = None,
         metadata_guard_operation: str | None = None,
+        held_directory_root: Path | None = None,
+        held_directory_root_fd: int | None = None,
     ) -> None:
         operation = operation or f"atomic:{path.name}"
         if (expected_current is None) != (metadata_guard_operation is None):
@@ -2233,16 +2545,27 @@ class BlackstarTimerService:
                 require_exists=False,
             )
 
-        directory_guard = (
-            self._hold_safe_archive_directory_chain(
+        if held_directory_root is not None:
+            if path.parent == held_directory_root:
+                directory_guard = nullcontext(held_directory_root_fd)
+            else:
+                directory_guard = self._hold_safe_archive_directory_chain(
+                    held_directory_root,
+                    path.parent,
+                    f"{operation}:temp-parent-chain",
+                    create_missing=False,
+                    root_is_held=True,
+                    root_fd=held_directory_root_fd,
+                )
+        elif trusted_root is not None:
+            directory_guard = self._hold_safe_archive_directory_chain(
                 trusted_root,
                 path.parent,
                 f"{operation}:temp-parent-chain",
                 create_missing=False,
             )
-            if trusted_root is not None
-            else nullcontext(None)
-        )
+        else:
+            directory_guard = nullcontext(None)
         with directory_guard as parent_fd:
             if parent_fd is None:
                 descriptor, raw_path = tempfile.mkstemp(
@@ -2293,9 +2616,15 @@ class BlackstarTimerService:
                     )
                     if expected_current is not None
                     and metadata_guard_operation is not None
-                    else nullcontext()
+                    else nullcontext(None)
                 )
-                with metadata_guard:
+                directory_operation = (
+                    "manifest-directory"
+                    if operation == "manifest"
+                    else f"{operation}-directory"
+                )
+                recovery_required: _MetadataRecoveryRequired | None = None
+                with metadata_guard as expected_identity:
                     if trusted_root is not None:
                         self._assert_safe_archive_path(
                             trusted_root,
@@ -2312,35 +2641,138 @@ class BlackstarTimerService:
                             ),
                         )
 
-                    if parent_fd is None:
-                        self._replace_path(temp_path, path, operation)
+                    if expected_current is not None:
+                        if expected_identity is None:
+                            raise RuntimeError(
+                                "Metadata exchange guard did not retain an identity"
+                            )
+                        self._before_metadata_exchange(path, operation)
+                        try:
+                            displaced_path = self._exchange_metadata_preimage(
+                                temp_path,
+                                path,
+                                expected_current,
+                                expected_identity,
+                                operation,
+                                directory_fd=parent_fd,
+                            )
+                        except _MetadataRecoveryRequired as recovery_exc:
+                            recovery_required = recovery_exc
+                        else:
+                            try:
+                                if trusted_root is not None:
+                                    self._assert_safe_archive_path(
+                                        trusted_root,
+                                        path,
+                                        f"{operation}:replaced-target",
+                                        require_exists=True,
+                                    )
+                                with path.open("rb+") as replaced_handle:
+                                    self._fsync_file(
+                                        replaced_handle,
+                                        f"{operation}:replaced-file",
+                                    )
+                                if trusted_root is not None:
+                                    self._assert_safe_archive_path(
+                                        trusted_root,
+                                        path.parent,
+                                        directory_operation,
+                                        require_exists=True,
+                                    )
+                                self._sync_directory(
+                                    path.parent,
+                                    directory_operation,
+                                )
+                                self._remove_displaced_metadata(
+                                    displaced_path,
+                                    operation,
+                                )
+                                self._sync_directory(
+                                    path.parent,
+                                    f"{operation}-displaced-directory",
+                                )
+                            except Exception as exchange_completion_exc:
+                                if not displaced_path.exists():
+                                    raise
+                                recovery_required = _MetadataRecoveryRequired(
+                                    path,
+                                    displaced_path,
+                                    exchange_completion_exc,
+                                )
                     else:
-                        self._replace_path(
-                            temp_path,
-                            path,
+                        if parent_fd is None:
+                            self._replace_path(temp_path, path, operation)
+                        else:
+                            self._replace_path(
+                                temp_path,
+                                path,
+                                operation,
+                                directory_fd=parent_fd,
+                            )
+                        if trusted_root is not None:
+                            self._assert_safe_archive_path(
+                                trusted_root,
+                                path,
+                                f"{operation}:replaced-target",
+                                require_exists=True,
+                            )
+                            self._assert_safe_archive_path(
+                                trusted_root,
+                                path.parent,
+                                directory_operation,
+                                require_exists=True,
+                            )
+                        self._sync_directory(path.parent, directory_operation)
+
+                if recovery_required is not None:
+                    try:
+                        self._restore_displaced_metadata(
+                            recovery_required.displaced_path,
+                            recovery_required.path,
                             operation,
-                            directory_fd=parent_fd,
                         )
-                if trusted_root is not None:
-                    self._assert_safe_archive_path(
-                        trusted_root,
-                        path,
-                        f"{operation}:replaced-target",
-                        require_exists=True,
-                    )
-                directory_operation = (
-                    "manifest-directory"
-                    if operation == "manifest"
-                    else f"{operation}-directory"
-                )
-                if trusted_root is not None:
-                    self._assert_safe_archive_path(
-                        trusted_root,
-                        path.parent,
-                        directory_operation,
-                        require_exists=True,
-                    )
-                self._sync_directory(path.parent, directory_operation)
+                    except Exception as restore_exc:
+                        raise _MetadataExchangeConflict(
+                            recovery_required.path,
+                            recovery_required.displaced_path,
+                            restored=False,
+                            detail=(
+                                f"{path.name}; displaced restore failed: "
+                                f"{restore_exc}"
+                            ),
+                        ) from restore_exc
+
+                    concurrent_bytes = recovery_required.concurrent_bytes
+                    if concurrent_bytes is not None:
+                        try:
+                            restored_bytes = self._read_metadata_bytes(
+                                recovery_required.path,
+                                f"metadata-concurrent-restored:{operation}",
+                            )
+                        except Exception as restored_read_exc:
+                            raise _MetadataExchangeConflict(
+                                recovery_required.path,
+                                None,
+                                restored=True,
+                                detail=(
+                                    f"{path.name}; restored preimage could not "
+                                    f"be verified: {restored_read_exc}"
+                                ),
+                            ) from restored_read_exc
+                        if restored_bytes != concurrent_bytes:
+                            raise _MetadataExchangeConflict(
+                                recovery_required.path,
+                                None,
+                                restored=True,
+                                detail=f"{path.name}; restored preimage changed",
+                            )
+                        raise _MetadataExchangeConflict(
+                            recovery_required.path,
+                            None,
+                            restored=True,
+                            detail=f"{path.name}; concurrent preimage preserved",
+                        )
+                    raise recovery_required.original
             except Exception:
                 try:
                     os.close(descriptor)
@@ -2355,6 +2787,8 @@ class BlackstarTimerService:
         manifest: dict,
         *,
         trusted_root: Path | None = None,
+        held_directory_root: Path | None = None,
+        held_directory_root_fd: int | None = None,
     ) -> None:
         payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         self._atomic_write(
@@ -2362,6 +2796,8 @@ class BlackstarTimerService:
             payload,
             "manifest",
             trusted_root=trusted_root,
+            held_directory_root=held_directory_root,
+            held_directory_root_fd=held_directory_root_fd,
         )
 
     def _read_manifest(
