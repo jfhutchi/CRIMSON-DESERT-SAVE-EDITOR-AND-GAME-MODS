@@ -669,6 +669,206 @@ def _assert_unfinalized_rollback_manifest(game: Path) -> None:
     }
 
 
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["write", "flush", "fsync", "replace", "directory"],
+)
+def test_rollback_durability_failure_leaves_manifest_unmarked(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    target_operation = "rollback:0008/0.paz"
+
+    class RollbackDurabilityFailureService(BlackstarTimerService):
+        faulted = False
+        original_failure: RuntimeError | None = None
+
+        def _inject_fault(self, phase: str) -> None:
+            if phase == "after_paz_write":
+                self.original_failure = RuntimeError("injected apply failure")
+                raise self.original_failure
+            return super()._inject_fault(phase)
+
+        def _write_all(
+            self,
+            handle: BinaryIO,
+            data: bytes,
+            operation: str,
+        ) -> None:
+            if (
+                failure_stage == "write"
+                and operation == target_operation
+                and not self.faulted
+            ):
+                self.faulted = True
+                handle.write(data[:max(1, len(data) // 2)])
+                raise OSError("injected rollback temp write failure")
+            return super()._write_all(handle, data, operation)
+
+        def _flush_file(self, handle: BinaryIO, operation: str) -> None:
+            if (
+                failure_stage == "flush"
+                and operation == target_operation
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected rollback temp flush failure")
+            return super()._flush_file(handle, operation)
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            if (
+                failure_stage == "fsync"
+                and operation == target_operation
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected rollback temp fsync failure")
+            return super()._fsync_file(handle, operation)
+
+        def _replace_path(
+            self,
+            source: Path,
+            destination: Path,
+            operation: str,
+            *,
+            directory_fd: int | None = None,
+        ) -> None:
+            if (
+                failure_stage == "replace"
+                and operation == target_operation
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected rollback replace failure")
+
+            return super()._replace_path(
+                source,
+                destination,
+                operation,
+                directory_fd=directory_fd,
+            )
+
+        def _sync_directory(self, path: Path, operation: str) -> None:
+            if (
+                failure_stage == "directory"
+                and operation == "rollback-directory:0008/0.paz"
+                and not self.faulted
+            ):
+                self.faulted = True
+                raise OSError("injected rollback directory sync failure")
+            return super()._sync_directory(path, operation)
+
+    service = RollbackDurabilityFailureService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rollback also failed") as raised:
+        service.apply(preview.token)
+
+    assert service.faulted is True
+    assert raised.value.__cause__ is service.original_failure
+    manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["post_apply_hashes"] == {}
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is False
+    for relative, expected in manifest["source_hashes"].items():
+        backup_file = manifest_path.parent / Path(relative)
+        assert service._hash_file(backup_file) == expected
+    assert not list(archive.game_dir.rglob(".*.restore-*"))
+
+
+def test_rollback_is_durable_before_combined_verification_and_manifest(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    class RollbackDurabilityOrderService(BlackstarTimerService):
+        def __init__(self) -> None:
+            super().__init__(profile)
+            self.events: list[tuple[str, str]] = []
+
+        def _inject_fault(self, phase: str) -> None:
+            if phase == "after_papgt_write":
+                raise RuntimeError("injected apply failure")
+            return super()._inject_fault(phase)
+
+        def _write_all(
+            self,
+            handle: BinaryIO,
+            data: bytes,
+            operation: str,
+        ) -> None:
+            if operation.startswith("rollback:"):
+                self.events.append(("write", operation))
+            return super()._write_all(handle, data, operation)
+
+        def _flush_file(self, handle: BinaryIO, operation: str) -> None:
+            if operation.startswith("rollback:"):
+                self.events.append(("flush", operation))
+            return super()._flush_file(handle, operation)
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            if operation.startswith("rollback:"):
+                self.events.append(("fsync", operation))
+            return super()._fsync_file(handle, operation)
+
+        def _replace_path(
+            self,
+            source: Path,
+            destination: Path,
+            operation: str,
+            *,
+            directory_fd: int | None = None,
+        ) -> None:
+            if operation.startswith("rollback:"):
+                self.events.append(("replace", operation))
+
+            return super()._replace_path(
+                source,
+                destination,
+                operation,
+                directory_fd=directory_fd,
+            )
+
+        def _sync_directory(self, path: Path, operation: str) -> None:
+            if operation.startswith("rollback-directory:"):
+                self.events.append(("directory", operation))
+            return super()._sync_directory(path, operation)
+
+        def _verify_archive_set(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[DetectionReport, dict[str, str]]:
+            self.events.append(("verify", "combined"))
+            return super()._verify_archive_set(*args, **kwargs)
+
+    service = RollbackDurabilityOrderService()
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    verify_index = service.events.index(("verify", "combined"))
+    for relative in ("0008/0.paz", "0008/0.pamt", "meta/0.papgt"):
+        operation = f"rollback:{relative}"
+        positions = [
+            service.events.index((stage, operation))
+            for stage in ("write", "flush", "fsync", "replace")
+        ]
+        directory_position = service.events.index(
+            ("directory", f"rollback-directory:{relative}")
+        )
+        assert positions == sorted(positions)
+        assert positions[-1] < directory_position < verify_index
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
 @pytest.mark.parametrize("failure_stage", ["write", "flush", "fsync"])
 @pytest.mark.parametrize("failed_operation", ["paz-slot", "pamt", "papgt"])
 def test_apply_rolls_back_archive_io_failures(
@@ -1066,6 +1266,115 @@ def test_windows_directory_sync_propagates_win32_errors(
         assert events == ["create", "flush", "close"]
 
 
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only directory guard")
+def test_windows_directory_chain_guard_blocks_swaps_and_allows_child_creation(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    guarded = archive.game_dir / "guarded-parent"
+    guarded.mkdir()
+    outside = tmp_path / "outside-directory-guard"
+    outside.mkdir()
+    assert hasattr(service, "_hold_safe_archive_directory_chain")
+
+    rename_error: OSError | None = None
+    remove_error: OSError | None = None
+    renamed = guarded.with_name("guarded-parent-renamed")
+    with service._hold_safe_archive_directory_chain(
+        archive.game_dir,
+        guarded,
+        "directory-guard-probe",
+        create_missing=False,
+    ):
+        try:
+            guarded.rename(renamed)
+        except OSError as exc:
+            rename_error = exc
+        try:
+            guarded.rmdir()
+        except OSError as exc:
+            remove_error = exc
+        if not guarded.exists():
+            _create_junction(guarded, outside)
+        (guarded / "child.bin").write_bytes(b"held-chain-child")
+
+    assert rename_error is not None
+    assert rename_error.winerror == 32
+    assert remove_error is not None
+    assert remove_error.winerror == 32
+    assert not os.path.isjunction(guarded)
+    assert (guarded / "child.bin").read_bytes() == b"held-chain-child"
+    assert _file_tree(outside) == {}
+    assert not renamed.exists()
+    guarded.rename(renamed)
+    renamed.rename(guarded)
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only directory guard")
+def test_windows_directory_guard_rejects_incompatible_existing_handle(
+    tmp_path: Path,
+) -> None:
+    from ctypes import wintypes
+
+    archive = make_timer_archive(tmp_path)
+    service = BlackstarTimerService(TimerProfile(**archive.profile_kwargs()))
+    guarded = archive.game_dir / "incompatible-parent"
+    guarded.mkdir()
+    assert hasattr(service, "_hold_safe_archive_directory_chain")
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    existing = create_file(
+        str(guarded),
+        0x00010000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    existing_value = (
+        existing
+        if isinstance(existing, int)
+        else ctypes.cast(existing, ctypes.c_void_p).value
+    )
+    assert existing_value not in (None, invalid_handle)
+
+    try:
+        with pytest.raises(BackupConflictError) as raised:
+            with service._hold_safe_archive_directory_chain(
+                archive.game_dir,
+                guarded,
+                "incompatible-directory-guard",
+                create_missing=False,
+            ):
+                pass
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.__cause__.winerror == 32
+    finally:
+        assert close_handle(existing)
+
+    released = guarded.with_name("incompatible-parent-released")
+    guarded.rename(released)
+    released.rename(guarded)
+
+
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
 @pytest.mark.parametrize(
     "relative",
@@ -1176,6 +1485,57 @@ def test_apply_rechecks_containment_immediately_before_backup_copy(
     assert service.swapped is True
     assert _file_tree(outside) == {}
     assert _archive_contents(paths) == before
+
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only swap contract")
+@pytest.mark.parametrize("swap_level", ["timestamp", "file_parent"])
+def test_backup_destination_chain_blocks_swap_before_native_open(
+    tmp_path: Path,
+    swap_level: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    outside = tmp_path / f"outside-pre-open-{swap_level}"
+    outside.mkdir()
+
+    class DestinationSwapService(BlackstarTimerService):
+        attempted = False
+        swap_error: OSError | None = None
+
+        def _before_backup_destination_open(
+            self,
+            destination: Path,
+            operation: str,
+        ) -> None:
+            if self.attempted or operation != "backup:0008/0.paz":
+                return
+            self.attempted = True
+            swap_path = (
+                destination.parents[1]
+                if swap_level == "timestamp"
+                else destination.parent
+            )
+            moved = swap_path.with_name(swap_path.name + "-moved")
+            try:
+                swap_path.rename(moved)
+            except OSError as exc:
+                self.swap_error = exc
+                return
+            _create_junction(swap_path, outside)
+
+    service = DestinationSwapService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    report = service.apply(preview.token)
+
+    assert report.status is TimerStatus.APPLIED
+    assert service.attempted is True
+    assert service.swap_error is not None
+    assert service.swap_error.winerror == 32
+    assert _file_tree(outside) == {}
+    assert not list(archive.game_dir.rglob("*-moved"))
 
 
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
@@ -1331,6 +1691,127 @@ def test_apply_detects_live_metadata_tamper_and_restores_originals(
     assert manifest["finalized"] is False
     assert manifest["rolled_back"] is True
     assert "metadata" in manifest["rollback_reason"].lower()
+
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only sharing contract")
+@pytest.mark.parametrize("relative", ["0008/0.pamt", "meta/0.papgt"])
+def test_metadata_guard_blocks_writer_until_native_replace(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    target = archive.game_dir / Path(relative)
+
+    class GuardWindowService(BlackstarTimerService):
+        attempted = False
+        writer_error: int | None = None
+
+        def _before_metadata_replace(self, path: Path, operation: str) -> None:
+            if self.attempted or path != target:
+                return
+            from ctypes import wintypes
+
+            self.attempted = True
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            writer = create_file(
+                str(path),
+                0x40000000,
+                0x00000001 | 0x00000002 | 0x00000004,
+                None,
+                3,
+                0,
+                None,
+            )
+            writer_value = (
+                writer
+                if isinstance(writer, int)
+                else ctypes.cast(writer, ctypes.c_void_p).value
+            )
+            if writer_value in (None, ctypes.c_void_p(-1).value):
+                self.writer_error = ctypes.get_last_error()
+                return
+            service._close_windows_handle(writer, operation)
+
+    service = GuardWindowService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    report = service.apply(preview.token)
+
+    assert report.status is TimerStatus.APPLIED
+    assert service.attempted is True
+    assert service.writer_error is not None
+    assert service.writer_error == 32
+    _manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is True
+    assert manifest["rolled_back"] is False
+
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only identity contract")
+def test_metadata_guard_detects_path_replacement_before_native_replace(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    target = paths[1]
+
+    class IdentitySwapService(BlackstarTimerService):
+        swapped = False
+
+        def _before_metadata_replace(self, path: Path, operation: str) -> None:
+            if self.swapped or path != target:
+                return
+            replacement = path.with_name(".identity-swap.pamt")
+            payload = bytearray(path.read_bytes())
+            payload[-1] ^= 0x7F
+            replacement.write_bytes(payload)
+            self._replace_windows_file(replacement, path, "identity-swap")
+            self.swapped = True
+
+    service = IdentitySwapService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert service.swapped is True
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only sharing contract")
+def test_existing_metadata_writer_forces_apply_rollback(tmp_path: Path) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    service = BlackstarTimerService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with paths[1].open("r+b"):
+        with pytest.raises(TimerTransactionError, match="rolled back"):
+            service.apply(preview.token)
+
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
 
 
 def test_apply_rolls_back_appended_paz_bytes_after_write(

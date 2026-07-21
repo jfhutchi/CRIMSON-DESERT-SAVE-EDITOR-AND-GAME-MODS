@@ -6,14 +6,16 @@ import json
 import logging
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, Callable, Mapping
+from typing import BinaryIO, Callable, Iterator, Mapping
 
 import crimson_rs
 
@@ -990,9 +992,17 @@ class BlackstarTimerService:
             self._fsync_file(handle, "paz-slot")
 
     @staticmethod
-    def _read_metadata_bytes(path: Path, operation: str) -> bytes:
+    def _read_metadata_bytes(
+        source: Path | BinaryIO,
+        operation: str,
+    ) -> bytes:
         del operation
-        return path.read_bytes()
+        if isinstance(source, Path):
+            return source.read_bytes()
+        source.seek(0)
+        data = source.read()
+        source.seek(0)
+        return data
 
     @staticmethod
     def _parse_pamt_bytes(data: bytes, operation: str) -> dict:
@@ -1012,6 +1022,151 @@ class BlackstarTimerService:
     ) -> bytes:
         del operation
         return handle.read(size)
+
+
+    @staticmethod
+    def _before_metadata_replace(path: Path, operation: str) -> None:
+        del path, operation
+
+
+    @contextmanager
+    def _hold_metadata_replace_guard(
+        self,
+        path: Path,
+        expected: bytes,
+        operation: str,
+    ) -> Iterator[None]:
+        descriptor: int | None = None
+        handle: BinaryIO | None = None
+        raw_windows_handle: object | None = None
+        try:
+            try:
+                if os.name == "nt":
+                    from ctypes import wintypes
+                    import msvcrt
+
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    create_file = kernel32.CreateFileW
+                    create_file.argtypes = [
+                        wintypes.LPCWSTR,
+                        wintypes.DWORD,
+                        wintypes.DWORD,
+                        wintypes.LPVOID,
+                        wintypes.DWORD,
+                        wintypes.DWORD,
+                        wintypes.HANDLE,
+                    ]
+                    create_file.restype = wintypes.HANDLE
+                    raw_windows_handle = create_file(
+                        str(path),
+                        0x80000000,  # GENERIC_READ
+                        0x00000001 | 0x00000004,
+                        None,
+                        3,  # OPEN_EXISTING
+                        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+                        None,
+                    )
+                    handle_value = (
+                        raw_windows_handle
+                        if isinstance(raw_windows_handle, int)
+                        else ctypes.cast(
+                            raw_windows_handle,
+                            ctypes.c_void_p,
+                        ).value
+                    )
+                    if handle_value in (None, ctypes.c_void_p(-1).value):
+                        error = ctypes.get_last_error()
+                        raise ctypes.WinError(
+                            error,
+                            f"Metadata guard open failed ({operation}): {path}",
+                        )
+                    attributes = self._windows_path_attributes_no_follow(
+                        path,
+                        operation,
+                    )
+                    if attributes & 0x00000400:
+                        raise OSError(
+                            f"Metadata guard rejected a reparse point: {path}"
+                        )
+                    descriptor = msvcrt.open_osfhandle(
+                        int(handle_value),
+                        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+                    )
+                    raw_windows_handle = None
+                else:
+                    descriptor = os.open(
+                        path,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        import fcntl
+
+                        # flock is advisory. The identity/timestamp recheck catches
+                        # ordinary noncooperative writes, but a writer deliberately
+                        # preserving all stat fields remains a POSIX limitation.
+                        fcntl.flock(
+                            descriptor,
+                            fcntl.LOCK_SH | fcntl.LOCK_NB,
+                        )
+                    except ImportError:
+                        pass
+
+                handle = os.fdopen(descriptor, "rb")
+                descriptor = None
+                held_before = os.fstat(handle.fileno())
+                path_before = os.stat(path, follow_symlinks=False)
+                if (
+                    (held_before.st_dev, held_before.st_ino)
+                    != (path_before.st_dev, path_before.st_ino)
+                    or self._read_metadata_bytes(handle, operation) != expected
+                ):
+                    raise StalePreviewError(
+                        f"Live metadata changed during apply: {path.name}"
+                    )
+
+                self._before_metadata_replace(path, operation)
+
+                held_after = os.fstat(handle.fileno())
+                path_after = os.stat(path, follow_symlinks=False)
+                held_fingerprint = (
+                    held_after.st_dev,
+                    held_after.st_ino,
+                    held_after.st_size,
+                    held_after.st_mtime_ns,
+                    held_after.st_ctime_ns,
+                )
+                expected_fingerprint = (
+                    held_before.st_dev,
+                    held_before.st_ino,
+                    held_before.st_size,
+                    held_before.st_mtime_ns,
+                    held_before.st_ctime_ns,
+                )
+                if (
+                    held_fingerprint != expected_fingerprint
+                    or (held_after.st_dev, held_after.st_ino)
+                    != (path_after.st_dev, path_after.st_ino)
+                ):
+                    raise StalePreviewError(
+                        f"Live metadata changed during apply: {path.name}"
+                    )
+            except StalePreviewError:
+                raise
+            except OSError as exc:
+                raise StalePreviewError(
+                    f"Live metadata changed during apply: {path.name}"
+                ) from exc
+            yield
+        finally:
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            elif raw_windows_handle is not None:
+                self._close_windows_handle(
+                    raw_windows_handle,
+                    operation,
+                )
 
     def _assert_metadata_unchanged(
         self,
@@ -1126,6 +1281,192 @@ class BlackstarTimerService:
         )
         return True
 
+    @staticmethod
+    def _open_windows_directory_guard(path: Path, operation: str) -> object:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x00010000 | 0x0080,  # DELETE | FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002,  # Share reads/writes, never deletion.
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,
+            None,
+        )
+        handle_value = (
+            handle
+            if isinstance(handle, int)
+            else ctypes.cast(handle, ctypes.c_void_p).value
+        )
+        if handle_value in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_last_error()
+            raise ctypes.WinError(
+                error,
+                f"Directory guard open failed ({operation}): {path}",
+            )
+        return handle
+
+    @staticmethod
+    def _close_windows_handle(handle: object, operation: str) -> None:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        if not close_handle(handle):
+            error = ctypes.get_last_error()
+            raise ctypes.WinError(
+                error,
+                f"Windows handle close failed ({operation})",
+            )
+
+
+    @contextmanager
+    def _hold_safe_archive_directory_chain(
+        self,
+        root: Path,
+        directory: Path,
+        operation: str,
+        *,
+        create_missing: bool,
+    ) -> Iterator[int | None]:
+        root = root.resolve(strict=True)
+        try:
+            relative = directory.relative_to(root)
+        except ValueError as exc:
+            raise BackupConflictError(
+                f"Archive directory escapes trusted game root during {operation}: "
+                f"{directory}"
+            ) from exc
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise BackupConflictError(
+                f"Unsafe archive directory during {operation}: {directory}"
+            )
+
+        if os.name == "nt":
+            handles: list[object] = []
+            try:
+                try:
+                    current = root
+                    for part in (None, *relative.parts):
+                        if part is not None:
+                            current = current / part
+                        try:
+                            handle = self._open_windows_directory_guard(
+                                current,
+                                operation,
+                            )
+                        except FileNotFoundError:
+                            if not create_missing or part is None:
+                                raise
+                            self._mkdir_safe_archive_directory(
+                                root,
+                                current,
+                                f"{operation}:mkdir",
+                                exist_ok=True,
+                            )
+                            handle = self._open_windows_directory_guard(
+                                current,
+                                operation,
+                            )
+                        handles.append(handle)
+                        attributes = self._windows_path_attributes_no_follow(
+                            current,
+                            operation,
+                        )
+                        if attributes & 0x00000400:
+                            raise BackupConflictError(
+                                f"Archive descendant is a reparse point during "
+                                f"{operation}: {current}"
+                            )
+                        if not attributes & 0x00000010:
+                            raise BackupConflictError(
+                                f"Archive path component is not a directory during "
+                                f"{operation}: {current}"
+                            )
+                        self._assert_safe_archive_path(
+                            root,
+                            current,
+                            operation,
+                            require_exists=True,
+                        )
+                except OSError as exc:
+                    raise BackupConflictError(
+                        f"Archive directory guard failed during {operation}: {exc}"
+                    ) from exc
+                yield None
+            finally:
+                close_error: OSError | None = None
+                for handle in reversed(handles):
+                    try:
+                        self._close_windows_handle(handle, operation)
+                    except OSError as exc:
+                        if close_error is None:
+                            close_error = exc
+                if close_error is not None:
+                    raise close_error
+            return
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptors: list[int] = []
+        try:
+            try:
+                import fcntl
+
+                parent_fd = os.open(root, flags)
+                descriptors.append(parent_fd)
+                fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                for part in relative.parts:
+                    try:
+                        child_fd = os.open(part, flags, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        if not create_missing:
+                            raise
+                        os.mkdir(part, dir_fd=parent_fd)
+                        child_fd = os.open(part, flags, dir_fd=parent_fd)
+                    if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                        os.close(child_fd)
+                        raise NotADirectoryError(
+                            f"Archive path component is not a directory: {part}"
+                        )
+                    fcntl.flock(child_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    descriptors.append(child_fd)
+                    parent_fd = child_fd
+            except OSError as exc:
+                raise BackupConflictError(
+                    f"Archive directory guard failed during {operation}: {exc}"
+                ) from exc
+            yield parent_fd
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @staticmethod
+    def _before_backup_destination_open(
+        destination: Path,
+        operation: str,
+    ) -> None:
+        del destination, operation
+
+
     def _copy_backup_file(
         self,
         game: Path,
@@ -1133,43 +1474,57 @@ class BlackstarTimerService:
         destination: Path,
         operation: str,
     ) -> None:
-        current = game
-        for part in destination.parent.relative_to(game).parts:
-            current = current / part
-            self._mkdir_safe_archive_directory(
-                game,
-                current,
-                f"backup-parent:{current.relative_to(game).as_posix()}",
-                exist_ok=True,
-            )
-
-        self._assert_safe_archive_path(
+        with self._hold_safe_archive_directory_chain(
             game,
-            source,
-            f"{operation}:source-open",
-            require_exists=True,
-        )
-        with source.open("rb") as source_handle:
+            destination.parent,
+            f"{operation}:destination-chain",
+            create_missing=True,
+        ) as parent_fd:
+            self._assert_safe_archive_path(
+                game,
+                source,
+                f"{operation}:source-open",
+                require_exists=True,
+            )
             self._assert_safe_archive_path(
                 game,
                 destination,
                 f"{operation}:destination-open",
                 require_exists=False,
             )
-            with destination.open("xb") as backup_handle:
-                self._assert_safe_archive_path(
-                    game,
-                    destination,
-                    f"{operation}:destination-write",
-                    require_exists=True,
-                )
-                while True:
-                    block = source_handle.read(1024 * 1024)
-                    if not block:
-                        break
-                    self._write_all(backup_handle, block, operation)
-                self._flush_file(backup_handle, operation)
-                self._fsync_file(backup_handle, operation)
+            self._before_backup_destination_open(destination, operation)
+            with source.open("rb") as source_handle:
+                if parent_fd is None:
+                    destination_context = destination.open("xb")
+                else:
+                    descriptor = os.open(
+                        destination.name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o666,
+                        dir_fd=parent_fd,
+                    )
+                    destination_context = os.fdopen(descriptor, "wb")
+                with destination_context as backup_handle:
+                    self._assert_safe_archive_path(
+                        game,
+                        destination,
+                        f"{operation}:destination-write",
+                        require_exists=True,
+                    )
+                    while True:
+                        block = source_handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        self._write_all(backup_handle, block, operation)
+                    self._flush_file(backup_handle, operation)
+                    self._fsync_file(backup_handle, operation)
+            self._sync_directory(
+                destination.parent,
+                f"backup-directory:{operation.removeprefix('backup:')}",
+            )
 
     def _create_backup_root(self, game: Path, root: Path) -> None:
         current = game
@@ -1227,16 +1582,6 @@ class BlackstarTimerService:
             destination = backup_dir / relative
             operation = f"backup:{relative_text}"
             self._copy_backup_file(game, path, destination, operation)
-            self._assert_safe_archive_path(
-                game,
-                destination.parent,
-                f"backup-directory:{relative_text}",
-                require_exists=True,
-            )
-            self._sync_directory(
-                destination.parent,
-                f"backup-directory:{relative_text}",
-            )
             expected = source_hashes[relative_text]
             if path == paths[0]:
                 expected_paz = self._stream_paz_identity(
@@ -1424,10 +1769,78 @@ class BlackstarTimerService:
             destination = self._contained_path(game, relative)
             if not source.is_file() or self._hash_file(source) != expected:
                 raise OSError(f"Backup cannot be verified: {relative}")
-            temp_path = self._copy_to_temp(source, destination)
-            os.replace(temp_path, destination)
+            if destination.is_file() and self._hash_file(destination) == expected:
+                continue
+
+            operation = f"rollback:{relative}"
+            with self._hold_safe_archive_directory_chain(
+                game,
+                destination.parent,
+                f"{operation}:destination-chain",
+                create_missing=True,
+            ) as parent_fd:
+                if parent_fd is None:
+                    descriptor, raw_path = tempfile.mkstemp(
+                        prefix=f".{destination.name}.restore-",
+                        dir=destination.parent,
+                    )
+                else:
+                    candidate = (
+                        f".{destination.name}.restore-"
+                        + next(tempfile._get_candidate_names())
+                    )
+                    descriptor = os.open(
+                        candidate,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    raw_path = str(destination.parent / candidate)
+                temp_path = Path(raw_path)
+                try:
+                    with source.open("rb") as source_handle:
+                        with os.fdopen(descriptor, "wb") as temp_handle:
+                            while True:
+                                block = source_handle.read(1024 * 1024)
+                                if not block:
+                                    break
+                                self._write_all(temp_handle, block, operation)
+                            self._flush_file(temp_handle, operation)
+                            shutil.copystat(source, temp_path)
+                            self._fsync_file(temp_handle, operation)
+
+                    if parent_fd is None:
+                        self._replace_path(temp_path, destination, operation)
+                    else:
+                        self._replace_path(
+                            temp_path,
+                            destination,
+                            operation,
+                            directory_fd=parent_fd,
+                        )
+                    self._assert_safe_archive_path(
+                        game,
+                        destination,
+                        f"{operation}:replaced-target",
+                        require_exists=True,
+                    )
+                    self._sync_directory(
+                        destination.parent,
+                        f"rollback-directory:{relative}",
+                    )
+                except Exception:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    temp_path.unlink(missing_ok=True)
+                    raise
             if after_replace is not None:
                 after_replace(index, relative)
+
         for relative, expected in source_hashes.items():
             if self._hash_file(self._contained_path(game, relative)) != expected:
                 raise OSError(f"Restored file hash mismatch: {relative}")
@@ -1633,19 +2046,58 @@ class BlackstarTimerService:
         return candidate
 
     @staticmethod
-    def _copy_to_temp(source: Path, destination: Path) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix=f".{destination.name}.restore-", dir=destination.parent
-        )
-        os.close(descriptor)
-        temp_path = Path(raw_path)
-        try:
-            shutil.copy2(source, temp_path)
-        except Exception:
-            temp_path.unlink(missing_ok=True)
-            raise
-        return temp_path
+    def _replace_windows_file(
+        source: Path,
+        destination: Path,
+        operation: str,
+    ) -> None:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        replace_file = kernel32.ReplaceFileW
+        replace_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+        ]
+        replace_file.restype = wintypes.BOOL
+        if not replace_file(
+            str(destination),
+            str(source),
+            None,
+            0,
+            None,
+            None,
+        ):
+            error = ctypes.get_last_error()
+            raise ctypes.WinError(
+                error,
+                f"Atomic replace failed ({operation}): {destination}",
+            )
+
+    def _replace_path(
+        self,
+        source: Path,
+        destination: Path,
+        operation: str,
+        *,
+        directory_fd: int | None = None,
+    ) -> None:
+        if directory_fd is not None:
+            os.replace(
+                source.name,
+                destination.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            return
+        if os.name == "nt" and destination.exists():
+            self._replace_windows_file(source, destination, operation)
+            return
+        os.replace(source, destination)
 
     @staticmethod
     def _write_all(
@@ -1751,6 +2203,7 @@ class BlackstarTimerService:
         if close_error is not None:
             raise close_error
 
+
     def _atomic_write(
         self,
         path: Path,
@@ -1780,19 +2233,39 @@ class BlackstarTimerService:
                 require_exists=False,
             )
 
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix=f".{path.name}.timer-", dir=path.parent
+        directory_guard = (
+            self._hold_safe_archive_directory_chain(
+                trusted_root,
+                path.parent,
+                f"{operation}:temp-parent-chain",
+                create_missing=False,
+            )
+            if trusted_root is not None
+            else nullcontext(None)
         )
-        temp_path = Path(raw_path)
-        try:
-            if trusted_root is not None:
-                self._assert_safe_archive_path(
-                    trusted_root,
-                    temp_path,
-                    f"{operation}:temp-write",
-                    require_exists=True,
+        with directory_guard as parent_fd:
+            if parent_fd is None:
+                descriptor, raw_path = tempfile.mkstemp(
+                    prefix=f".{path.name}.timer-",
+                    dir=path.parent,
                 )
-            with os.fdopen(descriptor, "wb") as handle:
+            else:
+                candidate = (
+                    f".{path.name}.timer-"
+                    + next(tempfile._get_candidate_names())
+                )
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                raw_path = str(path.parent / candidate)
+            temp_path = Path(raw_path)
+            try:
                 if trusted_root is not None:
                     self._assert_safe_archive_path(
                         trusted_root,
@@ -1800,58 +2273,81 @@ class BlackstarTimerService:
                         f"{operation}:temp-write",
                         require_exists=True,
                     )
-                self._write_all(handle, data, operation)
-                self._flush_file(handle, operation)
-                self._fsync_file(handle, operation)
+                with os.fdopen(descriptor, "wb") as handle:
+                    if trusted_root is not None:
+                        self._assert_safe_archive_path(
+                            trusted_root,
+                            temp_path,
+                            f"{operation}:temp-write",
+                            require_exists=True,
+                        )
+                    self._write_all(handle, data, operation)
+                    self._flush_file(handle, operation)
+                    self._fsync_file(handle, operation)
 
-            if expected_current is not None:
-                assert metadata_guard_operation is not None
-                self._assert_metadata_unchanged(
-                    path,
-                    expected_current,
-                    metadata_guard_operation,
+                metadata_guard = (
+                    self._hold_metadata_replace_guard(
+                        path,
+                        expected_current,
+                        metadata_guard_operation,
+                    )
+                    if expected_current is not None
+                    and metadata_guard_operation is not None
+                    else nullcontext()
                 )
-            if trusted_root is not None:
-                self._assert_safe_archive_path(
-                    trusted_root,
-                    temp_path,
-                    f"{operation}:replace-source",
-                    require_exists=True,
+                with metadata_guard:
+                    if trusted_root is not None:
+                        self._assert_safe_archive_path(
+                            trusted_root,
+                            temp_path,
+                            f"{operation}:replace-source",
+                            require_exists=True,
+                        )
+                        self._assert_safe_archive_path(
+                            trusted_root,
+                            path,
+                            f"{operation}:replace-target",
+                            require_exists=(
+                                expected_current is not None or path.exists()
+                            ),
+                        )
+
+                    if parent_fd is None:
+                        self._replace_path(temp_path, path, operation)
+                    else:
+                        self._replace_path(
+                            temp_path,
+                            path,
+                            operation,
+                            directory_fd=parent_fd,
+                        )
+                if trusted_root is not None:
+                    self._assert_safe_archive_path(
+                        trusted_root,
+                        path,
+                        f"{operation}:replaced-target",
+                        require_exists=True,
+                    )
+                directory_operation = (
+                    "manifest-directory"
+                    if operation == "manifest"
+                    else f"{operation}-directory"
                 )
-                self._assert_safe_archive_path(
-                    trusted_root,
-                    path,
-                    f"{operation}:replace-target",
-                    require_exists=expected_current is not None or path.exists(),
-                )
-            os.replace(temp_path, path)
-            if trusted_root is not None:
-                self._assert_safe_archive_path(
-                    trusted_root,
-                    path,
-                    f"{operation}:replaced-target",
-                    require_exists=True,
-                )
-            directory_operation = (
-                "manifest-directory"
-                if operation == "manifest"
-                else f"{operation}-directory"
-            )
-            if trusted_root is not None:
-                self._assert_safe_archive_path(
-                    trusted_root,
-                    path.parent,
-                    directory_operation,
-                    require_exists=True,
-                )
-            self._sync_directory(path.parent, directory_operation)
-        except Exception:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            temp_path.unlink(missing_ok=True)
-            raise
+                if trusted_root is not None:
+                    self._assert_safe_archive_path(
+                        trusted_root,
+                        path.parent,
+                        directory_operation,
+                        require_exists=True,
+                    )
+                self._sync_directory(path.parent, directory_operation)
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                temp_path.unlink(missing_ok=True)
+                raise
 
     def _write_manifest(
         self,
