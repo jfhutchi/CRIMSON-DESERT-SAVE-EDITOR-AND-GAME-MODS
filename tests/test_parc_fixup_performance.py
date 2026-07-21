@@ -284,20 +284,200 @@ def test_native_fixup_matches_legacy_exactly(module: ModuleType, case) -> None:
     assert bytes(optimized_out) == bytes(legacy_out)
 
 
+def _function_ast(function) -> ast.FunctionDef:
+    source = textwrap.dedent(inspect.getsource(function))
+    parsed = ast.parse(source).body[0]
+    assert isinstance(parsed, ast.FunctionDef)
+    return parsed
+
+
 def _fixup_ast(module: ModuleType) -> str:
-    source = textwrap.dedent(
-        inspect.getsource(module._fixup_global_self_references)
+    return ast.dump(
+        _function_ast(module._fixup_global_self_references),
+        include_attributes=False,
     )
-    function = ast.parse(source).body[0]
-    return ast.dump(function, include_attributes=False)
+
+
+def _assert_bounded_find_ast(function) -> None:
+    find_calls = [
+        node
+        for node in ast.walk(_function_ast(function))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "find"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "out"
+        )
+    ]
+    assert find_calls, "expected an actual out.find call"
+    for call in find_calls:
+        assert len(call.args) == 3, (
+            "out.find must receive needle, start, and end"
+        )
+        assert not call.keywords, "out.find must use positional bounds"
+        needle, start, end = call.args
+        assert isinstance(needle, ast.Name) and needle.id == "sentinel"
+        assert isinstance(start, ast.Name) and start.id == "pos"
+        assert (
+            isinstance(end, ast.BinOp)
+            and isinstance(end.left, ast.Name)
+            and end.left.id == "block_end"
+            and isinstance(end.op, ast.Sub)
+            and isinstance(end.right, ast.Constant)
+            and end.right.value == 5
+        ), "out.find end must be block_end - 5"
+
+
+_MISSING_FIND_ARG = object()
+
+
+class _RecordingBytearray(bytearray):
+    def __init__(self, initial: bytes | bytearray):
+        super().__init__(initial)
+        self.find_calls = []
+
+    def find(
+        self,
+        needle,
+        start=_MISSING_FIND_ARG,
+        end=_MISSING_FIND_ARG,
+    ):
+        self.find_calls.append((needle, start, end))
+        if start is _MISSING_FIND_ARG:
+            return super().find(needle)
+        if end is _MISSING_FIND_ARG:
+            return super().find(needle, start)
+        return super().find(needle, start, end)
+
+
+def _assert_bounded_runtime_calls(
+    calls,
+    *,
+    expected_starts: tuple[int, ...],
+    expected_end: int,
+) -> None:
+    assert len(calls) == len(expected_starts)
+    for (needle, start, end), expected_start in zip(calls, expected_starts):
+        assert needle == SENTINEL
+        assert start is not _MISSING_FIND_ARG, (
+            "find must receive an explicit start"
+        )
+        assert end is not _MISSING_FIND_ARG, (
+            "find must receive an explicit end"
+        )
+        assert start == expected_start
+        assert end == expected_end
+
+
+def _unbounded_find_surrogate(out, sentinel, pos, block_end):
+    del pos, block_end
+    return out.find(sentinel)
 
 
 def test_fixup_implementations_keep_equivalent_ast_bodies() -> None:
     assert _fixup_ast(editor_serializer) == _fixup_ast(mods_serializer)
 
 
-def test_fixup_uses_native_bounded_sentinel_search() -> None:
+@pytest.mark.parametrize(
+    "module",
+    SERIALIZERS,
+    ids=("save-editor", "game-mods"),
+)
+def test_fixup_ast_requires_explicit_per_block_find_bounds(
+    module: ModuleType,
+) -> None:
+    _assert_bounded_find_ast(module._fixup_global_self_references)
+
+
+def test_ast_contract_rejects_unbounded_find_surrogate() -> None:
+    with pytest.raises(
+        AssertionError,
+        match="needle, start, and end",
+    ):
+        _assert_bounded_find_ast(_unbounded_find_surrogate)
+
+
+@pytest.mark.parametrize(
+    "module",
+    SERIALIZERS,
+    ids=("save-editor", "game-mods"),
+)
+def test_fixup_runtime_find_stays_within_shifted_block(
+    module: ModuleType,
+) -> None:
+    raw = bytearray([0xA5] * 140)
+    _put_reference(raw, 70, 77)
+    case = {
+        "old_blocks": ((20, 40),),
+        "new_blocks": ((25, 40),),
+    }
+    old_parc, new_entries = _build_inputs(module, case)
+    legacy_out = bytearray(raw)
+    recorded_out = _RecordingBytearray(raw)
+
+    _legacy_fixup(legacy_out, old_parc, new_entries)
+    module._fixup_global_self_references(
+        recorded_out,
+        old_parc,
+        new_entries,
+    )
+
+    assert bytes(recorded_out) == bytes(legacy_out)
+    assert struct.unpack_from("<I", recorded_out, 78)[0] == 77
+    _assert_bounded_runtime_calls(
+        recorded_out.find_calls,
+        expected_starts=(25,),
+        expected_end=60,
+    )
+
+
+@pytest.mark.parametrize(
+    "module",
+    SERIALIZERS,
+    ids=("save-editor", "game-mods"),
+)
+def test_fixup_runtime_reuses_bound_after_false_candidate(
+    module: ModuleType,
+) -> None:
+    raw = bytearray([0xA5] * 160)
+    _put_reference(raw, 40, 500)
+    _put_reference(raw, 110, 117)
+    case = {
+        "old_blocks": ((20, 80),),
+        "new_blocks": ((25, 80),),
+    }
+    old_parc, new_entries = _build_inputs(module, case)
+    legacy_out = bytearray(raw)
+    recorded_out = _RecordingBytearray(raw)
+
+    _legacy_fixup(legacy_out, old_parc, new_entries)
+    module._fixup_global_self_references(
+        recorded_out,
+        old_parc,
+        new_entries,
+    )
+
+    assert bytes(recorded_out) == bytes(legacy_out)
+    _assert_bounded_runtime_calls(
+        recorded_out.find_calls,
+        expected_starts=(25, 41),
+        expected_end=100,
+    )
+
+
+def test_runtime_contract_rejects_unbounded_find_surrogate() -> None:
+    recorded_out = _RecordingBytearray(b"\xA5" * 32 + SENTINEL)
+    _unbounded_find_surrogate(recorded_out, SENTINEL, 0, 32)
+    with pytest.raises(AssertionError, match="explicit start"):
+        _assert_bounded_runtime_calls(
+            recorded_out.find_calls,
+            expected_starts=(0,),
+            expected_end=27,
+        )
+
+
+def test_fixup_source_has_no_bytewise_sentinel_comparison() -> None:
     for module in SERIALIZERS:
         source = inspect.getsource(module._fixup_global_self_references)
-        assert "out.find(sentinel" in source
         assert "out[pos:pos + 8] != sentinel" not in source
