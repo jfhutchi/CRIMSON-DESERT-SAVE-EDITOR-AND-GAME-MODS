@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import BinaryIO, Callable, Mapping
 
 import crimson_rs
 
@@ -145,6 +145,104 @@ class _ArchiveEntry:
             compression=int(entry["compression"]),
             crypto=int(entry["crypto"]),
         )
+
+
+@dataclass(frozen=True)
+class _PazIdentity:
+    sha256: str
+    source_sha256: str
+    checksum: int
+    size: int
+    entry_bytes: bytes | None
+    source_entry_sha256: str
+
+
+class _JenkinsChecksum:
+    _mask = 0xFFFFFFFF
+    _triple = struct.Struct("<III")
+
+    def __init__(self, length: int) -> None:
+        self._length = length
+        self._seen = 0
+        self._processed = 0
+        self._tail = bytearray()
+        seed = (length + 0xDEBA1DCD) & self._mask
+        self._a = self._b = self._c = seed
+
+    @classmethod
+    def _rotate(cls, value: int, count: int) -> int:
+        return (
+            (value << count) | (value >> (32 - count))
+        ) & cls._mask
+
+    def _mix_block(self, block: bytes | memoryview) -> None:
+        word_a, word_b, word_c = self._triple.unpack(block)
+        a = (self._a + word_a) & self._mask
+        b = (self._b + word_b) & self._mask
+        c = (self._c + word_c) & self._mask
+        a = ((a - c) ^ self._rotate(c, 4)) & self._mask
+        c = (c + b) & self._mask
+        b = ((b - a) ^ self._rotate(a, 6)) & self._mask
+        a = (a + c) & self._mask
+        c = ((c - b) ^ self._rotate(b, 8)) & self._mask
+        b = (b + a) & self._mask
+        a = ((a - c) ^ self._rotate(c, 16)) & self._mask
+        c = (c + b) & self._mask
+        b = ((b - a) ^ self._rotate(a, 19)) & self._mask
+        a = (a + c) & self._mask
+        c = ((c - b) ^ self._rotate(b, 4)) & self._mask
+        b = (b + a) & self._mask
+        self._a, self._b, self._c = a, b, c
+
+    def update(self, data: bytes) -> None:
+        if self._seen + len(data) > self._length:
+            raise ValueError("Checksum stream exceeded its declared length")
+        self._seen += len(data)
+        view = memoryview(data)
+        offset = 0
+
+        if self._tail and self._processed + 12 < self._length:
+            needed = 12 - len(self._tail)
+            take = min(needed, len(view))
+            self._tail.extend(view[:take])
+            offset += take
+            if len(self._tail) == 12:
+                self._mix_block(self._tail)
+                self._processed += 12
+                self._tail.clear()
+
+        while (
+            offset + 12 <= len(view)
+            and self._processed + 12 < self._length
+        ):
+            self._mix_block(view[offset:offset + 12])
+            self._processed += 12
+            offset += 12
+
+        if offset < len(view):
+            self._tail.extend(view[offset:])
+
+    def digest(self) -> int:
+        if self._seen != self._length:
+            raise ValueError("Checksum stream ended before its declared length")
+        if not self._tail:
+            return self._c
+        if len(self._tail) > 12:
+            raise ValueError("Checksum tail exceeds one block")
+
+        padded = bytes(self._tail) + b"\x00" * (12 - len(self._tail))
+        word_a, word_b, word_c = self._triple.unpack(padded)
+        a = (self._a + word_a) & self._mask
+        b = (self._b + word_b) & self._mask
+        c = (self._c + word_c) & self._mask
+        c = ((c ^ b) - self._rotate(b, 14)) & self._mask
+        a = ((a ^ c) - self._rotate(c, 11)) & self._mask
+        b = ((b ^ a) - self._rotate(a, 25)) & self._mask
+        c = ((c ^ b) - self._rotate(b, 16)) & self._mask
+        a = ((a ^ c) - self._rotate(c, 4)) & self._mask
+        b = ((b ^ a) - self._rotate(a, 14)) & self._mask
+        c = ((c ^ b) - self._rotate(b, 24)) & self._mask
+        return c
 
 
 @dataclass(frozen=True)
@@ -490,47 +588,50 @@ class BlackstarTimerService:
             raise StalePreviewError("Candidate no longer matches the verified preview")
 
         paths = inspection.paths
-        backup_dir = self._create_backup(
+        padding = token.source_compressed_size - len(candidate_compressed)
+        if padding < 0:
+            raise ValueError("Candidate no longer fits the enrolled PAZ slot")
+        slot_payload = candidate_compressed + bytes(padding)
+
+        backup_dir, expected_paz = self._create_backup(
             game,
             paths,
             source_hashes,
             token,
+            slot_payload,
         )
         self._emit_progress(progress, "backup_verification", 30)
         manifest_path = backup_dir / "manifest.json"
-        wrote_source = False
+        paz_path, pamt_path, papgt_path = paths
+
+        mutation_attempted = False
         try:
-            paz_path, pamt_path, papgt_path = paths
-            padding = token.source_compressed_size - len(candidate_compressed)
-            if padding < 0:
-                raise ValueError("Candidate no longer fits the enrolled PAZ slot")
-            with paz_path.open("r+b") as handle:
-                handle.seek(token.entry_offset)
-                handle.write(candidate_compressed)
-                handle.write(b"\x00" * padding)
-                handle.flush()
-                os.fsync(handle.fileno())
-            wrote_source = True
+            mutation_attempted = True
+            self._patch_paz_slot(
+                paz_path,
+                token.entry_offset,
+                slot_payload,
+                expected_paz.source_entry_sha256,
+            )
             self._emit_progress(progress, "paz_write", 50)
             self._inject_fault("after_paz_write")
 
-            paz_bytes = paz_path.read_bytes()
             new_pamt, new_papgt = self._build_metadata_bytes(
-                game,
+                backup_dir,
                 entry,
                 len(candidate_compressed),
-                crimson_rs.calculate_checksum(paz_bytes),
-                len(paz_bytes),
+                expected_paz.checksum,
+                expected_paz.size,
             )
             expected_post_hashes = {
-                paz_path.relative_to(game).as_posix(): self._sha256_bytes(paz_bytes),
+                paz_path.relative_to(game).as_posix(): expected_paz.sha256,
                 pamt_path.relative_to(game).as_posix(): self._sha256_bytes(new_pamt),
                 papgt_path.relative_to(game).as_posix(): self._sha256_bytes(new_papgt),
             }
-            self._atomic_write(pamt_path, new_pamt)
+            self._atomic_write(pamt_path, new_pamt, "pamt")
             self._emit_progress(progress, "pamt_update", 65)
             self._inject_fault("after_pamt_write")
-            self._atomic_write(papgt_path, new_papgt)
+            self._atomic_write(papgt_path, new_papgt, "papgt")
             self._emit_progress(progress, "papgt_update", 80)
             self._inject_fault("after_papgt_write")
             verified, post_hashes = self._verify_archive_set(
@@ -547,7 +648,7 @@ class BlackstarTimerService:
             manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
             self._write_manifest(manifest_path, manifest)
         except Exception as exc:
-            if not wrote_source:
+            if not mutation_attempted:
                 raise
             try:
                 self._restore_backup_files(game, backup_dir, source_hashes)
@@ -559,6 +660,9 @@ class BlackstarTimerService:
                     token.source_body_sha256,
                 )
                 manifest = self._read_manifest(manifest_path)
+                manifest["post_apply_hashes"] = {}
+                manifest["finalized"] = False
+                manifest.pop("finalized_at", None)
                 manifest["rolled_back"] = True
                 manifest["rollback_reason"] = str(exc)
                 self._write_manifest(manifest_path, manifest)
@@ -688,6 +792,107 @@ class BlackstarTimerService:
             duration_seconds=detection.duration_seconds,
         )
 
+    def _stream_paz_identity(
+        self,
+        path: Path,
+        entry_offset: int,
+        entry_size: int,
+        replacement: bytes | None = None,
+    ) -> _PazIdentity:
+        size = path.stat().st_size
+        entry_end = entry_offset + entry_size
+        if entry_offset < 0 or entry_size < 0 or entry_end > size:
+            raise ValueError("PAZ entry range is outside the archive")
+        if replacement is not None and len(replacement) != entry_size:
+            raise ValueError("PAZ replacement must exactly fill the enrolled slot")
+
+        sha256 = hashlib.sha256()
+        source_sha256 = hashlib.sha256()
+        checksum = _JenkinsChecksum(size)
+        source_entry_sha256 = hashlib.sha256()
+
+        def update_identity(data: bytes) -> None:
+            sha256.update(data)
+            checksum.update(data)
+
+        with path.open("rb") as handle:
+            if replacement is not None:
+                remaining = entry_offset
+                while remaining:
+                    block = handle.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise ValueError("PAZ ended before the enrolled entry")
+                    update_identity(block)
+                    source_sha256.update(block)
+                    remaining -= len(block)
+
+                remaining = entry_size
+                while remaining:
+                    block = handle.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise ValueError("PAZ entry is truncated")
+                    source_entry_sha256.update(block)
+                    source_sha256.update(block)
+                    remaining -= len(block)
+                update_identity(replacement)
+
+                while True:
+                    block = handle.read(1024 * 1024)
+                    if not block:
+                        break
+                    update_identity(block)
+                    source_sha256.update(block)
+                entry_bytes = None
+            else:
+                position = 0
+                captured = bytearray()
+                while True:
+                    block = handle.read(1024 * 1024)
+                    if not block:
+                        break
+                    update_identity(block)
+                    source_sha256.update(block)
+                    block_end = position + len(block)
+                    overlap_start = max(position, entry_offset)
+                    overlap_end = min(block_end, entry_end)
+                    if overlap_start < overlap_end:
+                        relative_start = overlap_start - position
+                        relative_end = overlap_end - position
+                        entry_block = block[relative_start:relative_end]
+                        captured.extend(entry_block)
+                        source_entry_sha256.update(entry_block)
+                    position = block_end
+                entry_bytes = bytes(captured)
+
+        return _PazIdentity(
+            sha256=sha256.hexdigest(),
+            source_sha256=source_sha256.hexdigest(),
+            checksum=checksum.digest(),
+            size=size,
+            entry_bytes=entry_bytes,
+            source_entry_sha256=source_entry_sha256.hexdigest(),
+        )
+
+    def _patch_paz_slot(
+        self,
+        paz_path: Path,
+        entry_offset: int,
+        slot_payload: bytes,
+        source_entry_sha256: str,
+    ) -> None:
+        with paz_path.open("r+b") as handle:
+            handle.seek(entry_offset)
+            source_entry = handle.read(len(slot_payload))
+            if (
+                len(source_entry) != len(slot_payload)
+                or self._sha256_bytes(source_entry) != source_entry_sha256
+            ):
+                raise StalePreviewError("Source archive changed after preview")
+            handle.seek(entry_offset)
+            self._write_all(handle, slot_payload, "paz-slot")
+            self._flush_file(handle, "paz-slot")
+            self._fsync_file(handle, "paz-slot")
+
     def _build_metadata_bytes(
         self,
         game: Path,
@@ -733,25 +938,66 @@ class BlackstarTimerService:
         crimson_rs.parse_papgt_bytes(new_papgt)
         return new_pamt, new_papgt
 
+    def _copy_backup_file(
+        self,
+        source: Path,
+        destination: Path,
+        operation: str,
+    ) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            source.open("rb") as source_handle,
+            destination.open("xb") as backup_handle,
+        ):
+            while True:
+                block = source_handle.read(1024 * 1024)
+                if not block:
+                    break
+                self._write_all(backup_handle, block, operation)
+            self._flush_file(backup_handle, operation)
+            self._fsync_file(backup_handle, operation)
+
     def _create_backup(
         self,
         game: Path,
         paths: tuple[Path, Path, Path],
         source_hashes: dict[str, str],
         token: PreviewToken,
-    ) -> Path:
+        slot_payload: bytes,
+    ) -> tuple[Path, _PazIdentity]:
         root = game / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
+        root.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         backup_dir = root / timestamp
-        backup_dir.mkdir(parents=True, exist_ok=False)
+        backup_dir.mkdir(exist_ok=False)
+        self._sync_directory(root, "backup-root-directory")
+
+        expected_paz: _PazIdentity | None = None
         for path in paths:
             relative = path.relative_to(game)
+            relative_text = relative.as_posix()
             destination = backup_dir / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-            expected = source_hashes[relative.as_posix()]
-            if self._hash_file(destination) != expected:
-                raise OSError(f"Backup verification failed: {relative.as_posix()}")
+            operation = f"backup:{relative_text}"
+            self._copy_backup_file(path, destination, operation)
+            self._sync_directory(
+                destination.parent,
+                f"backup-directory:{relative_text}",
+            )
+            expected = source_hashes[relative_text]
+            if path == paths[0]:
+                expected_paz = self._stream_paz_identity(
+                    destination,
+                    token.entry_offset,
+                    token.source_compressed_size,
+                    replacement=slot_payload,
+                )
+                backup_hash = expected_paz.source_sha256
+            else:
+                backup_hash = self._hash_file(destination)
+            if backup_hash != expected:
+                raise OSError(f"Backup verification failed: {relative_text}")
+        self._sync_directory(backup_dir, "backup-directory")
+
         manifest = {
             "format_version": 1,
             "profile_id": self.profile.profile_id,
@@ -768,7 +1014,9 @@ class BlackstarTimerService:
             "restored": False,
         }
         self._write_manifest(backup_dir / "manifest.json", manifest)
-        return backup_dir
+        if expected_paz is None:
+            raise OSError("Backup PAZ identity was not calculated")
+        return backup_dir, expected_paz
 
     def _verify_archive_set(
         self,
@@ -783,13 +1031,28 @@ class BlackstarTimerService:
             relative = path.resolve().relative_to(game).as_posix()
             contained_paths.append((relative, self._contained_path(game, relative)))
 
-        paz_bytes, pamt_bytes, papgt_bytes = (
-            path.read_bytes() for _relative, path in contained_paths
+        paz_relative, paz_path = contained_paths[0]
+        pamt_relative, pamt_path = contained_paths[1]
+        papgt_relative, papgt_path = contained_paths[2]
+        pamt_bytes = pamt_path.read_bytes()
+        papgt_bytes = papgt_path.read_bytes()
+        entry_mapping, chunk_checksum, chunk_size = (
+            self._verify_integrity_bytes(pamt_bytes, papgt_bytes)
         )
-        archive_bytes = (paz_bytes, pamt_bytes, papgt_bytes)
+        entry = _ArchiveEntry.from_mapping(entry_mapping)
+        expected_paz_path = self._source_paths(game, entry)[0].resolve()
+        if paz_path.resolve() != expected_paz_path:
+            raise ValueError("PAMT entry references an unexpected PAZ chunk")
+
+        paz_identity = self._stream_paz_identity(
+            paz_path,
+            entry.chunk_offset,
+            entry.compressed_size,
+        )
         current_hashes = {
-            relative: self._sha256_bytes(data)
-            for (relative, _path), data in zip(contained_paths, archive_bytes)
+            paz_relative: paz_identity.sha256,
+            pamt_relative: self._sha256_bytes(pamt_bytes),
+            papgt_relative: self._sha256_bytes(papgt_bytes),
         }
         if current_hashes != expected_hashes:
             changed = sorted(
@@ -799,15 +1062,14 @@ class BlackstarTimerService:
             )
             relative = changed[0] if changed else "<archive set>"
             raise ValueError(f"Post-write hash mismatch: {relative}")
+        if chunk_checksum != paz_identity.checksum:
+            raise ValueError("PAZ chunk checksum mismatch")
+        if chunk_size != paz_identity.size:
+            raise ValueError("PAZ chunk size mismatch")
+        if paz_identity.entry_bytes is None:
+            raise ValueError("PAZ entry verification bytes are unavailable")
 
-        entry_mapping = self._verify_integrity_bytes(
-            paz_bytes, pamt_bytes, papgt_bytes
-        )
-        entry = _ArchiveEntry.from_mapping(entry_mapping)
-        expected_paz_path = self._source_paths(game, entry)[0].resolve()
-        if contained_paths[0][1].resolve() != expected_paz_path:
-            raise ValueError("PAMT entry references an unexpected PAZ chunk")
-        body = self._read_body_from_archive_bytes(paz_bytes, entry_mapping)
+        body = self._decompress_entry(paz_identity.entry_bytes, entry)
         inspection = self._classify_inspection(game, entry, body, paths)
         report = inspection.report
         expected_values = {
@@ -836,22 +1098,18 @@ class BlackstarTimerService:
 
     def _verify_integrity_bytes(
         self,
-        paz_bytes: bytes,
         pamt_bytes: bytes,
         papgt_bytes: bytes,
-    ) -> dict:
+    ) -> tuple[dict, int, int]:
         pamt = crimson_rs.parse_pamt_bytes(pamt_bytes)
         if int(pamt["checksum"]) != crimson_rs.calculate_checksum(pamt_bytes[12:]):
             raise ValueError("PAMT payload checksum mismatch")
         entry = self._find_entry_in_document(pamt)
+        self._validate_entry(entry)
         chunk_id = int(entry["chunk_id"])
         chunks = [chunk for chunk in pamt["chunks"] if int(chunk["id"]) == chunk_id]
         if len(chunks) != 1:
             raise ValueError("PAMT chunk identity is ambiguous")
-        if int(chunks[0]["checksum"]) != crimson_rs.calculate_checksum(paz_bytes):
-            raise ValueError("PAZ chunk checksum mismatch")
-        if int(chunks[0]["size"]) != len(paz_bytes):
-            raise ValueError("PAZ chunk size mismatch")
 
         papgt = crimson_rs.parse_papgt_bytes(papgt_bytes)
         if int(papgt["checksum"]) != crimson_rs.calculate_checksum(papgt_bytes[12:]):
@@ -865,7 +1123,7 @@ class BlackstarTimerService:
             pamt["checksum"]
         ):
             raise ValueError("PAPGT does not reference the current PAMT checksum")
-        return entry
+        return entry, int(chunks[0]["checksum"]), int(chunks[0]["size"])
 
     def _find_entry_in_document(self, pamt: dict) -> dict:
         matches = []
@@ -950,17 +1208,66 @@ class BlackstarTimerService:
         return temp_path
 
     @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
+    def _write_all(
+        handle: BinaryIO,
+        data: bytes,
+        operation: str,
+    ) -> None:
+        del operation
+        view = memoryview(data)
+        written_total = 0
+        while written_total < len(view):
+            written = handle.write(view[written_total:])
+            if written is None or written <= 0:
+                raise OSError("Archive write did not make progress")
+            written_total += written
+
+    @staticmethod
+    def _flush_file(handle: BinaryIO, operation: str) -> None:
+        del operation
+        handle.flush()
+
+    @staticmethod
+    def _fsync_file(handle: BinaryIO, operation: str) -> None:
+        del operation
+        os.fsync(handle.fileno())
+
+    @staticmethod
+    def _sync_directory(path: Path, operation: str) -> None:
+        del operation
+        if os.name == "nt":
+            # Windows os.open cannot acquire a directory handle for fsync.
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _atomic_write(
+        self,
+        path: Path,
+        data: bytes,
+        operation: str | None = None,
+    ) -> None:
+        operation = operation or f"atomic:{path.name}"
         descriptor, raw_path = tempfile.mkstemp(
             prefix=f".{path.name}.timer-", dir=path.parent
         )
         temp_path = Path(raw_path)
         try:
             with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+                self._write_all(handle, data, operation)
+                self._flush_file(handle, operation)
+                self._fsync_file(handle, operation)
             os.replace(temp_path, path)
+            directory_operation = (
+                "manifest-directory"
+                if operation == "manifest"
+                else f"{operation}-directory"
+            )
+            self._sync_directory(path.parent, directory_operation)
         except Exception:
             try:
                 os.close(descriptor)
@@ -969,10 +1276,9 @@ class BlackstarTimerService:
             temp_path.unlink(missing_ok=True)
             raise
 
-    @staticmethod
-    def _write_manifest(path: Path, manifest: dict) -> None:
+    def _write_manifest(self, path: Path, manifest: dict) -> None:
         payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-        BlackstarTimerService._atomic_write(path, payload)
+        self._atomic_write(path, payload, "manifest")
 
     @staticmethod
     def _read_manifest(path: Path) -> dict:
@@ -1225,21 +1531,6 @@ class BlackstarTimerService:
         with paz_path.open("rb") as handle:
             handle.seek(offset)
             compressed = handle.read(compressed_size)
-        return self._decompress_entry(compressed, archive_entry)
-
-    def _read_body_from_archive_bytes(
-        self,
-        paz_bytes: bytes,
-        entry: _ArchiveEntry | Mapping[str, object],
-    ) -> bytes:
-        archive_entry = (
-            entry
-            if isinstance(entry, _ArchiveEntry)
-            else _ArchiveEntry.from_mapping(entry)
-        )
-        start = archive_entry.chunk_offset
-        end = start + archive_entry.compressed_size
-        compressed = paz_bytes[start:end]
         return self._decompress_entry(compressed, archive_entry)
 
     def _decompress_entry(

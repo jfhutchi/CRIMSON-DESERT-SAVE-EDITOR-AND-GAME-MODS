@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Callable
 
 import crimson_rs
 import pytest
@@ -427,6 +427,557 @@ def _target_entry(pamt: dict) -> dict:
     ]
     assert len(matches) == 1
     return matches[0]
+
+
+def _timer_archive_paths(game: Path) -> tuple[Path, Path, Path]:
+    return (
+        game / "0008" / "0.paz",
+        game / "0008" / "0.pamt",
+        game / "meta" / "0.papgt",
+    )
+
+
+def _archive_contents(paths: tuple[Path, Path, Path]) -> dict[Path, bytes]:
+    return {path: path.read_bytes() for path in paths}
+
+
+def _only_backup_manifest(game: Path) -> tuple[Path, dict]:
+    backup_root = (
+        game / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
+    )
+    backups = [path for path in backup_root.iterdir() if path.is_dir()]
+    assert len(backups) == 1
+    manifest_path = backups[0] / "manifest.json"
+    return manifest_path, json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _assert_unfinalized_rollback_manifest(game: Path) -> None:
+    _manifest_path, manifest = _only_backup_manifest(game)
+    assert manifest["post_apply_hashes"] == {}
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is True
+    assert set(manifest["source_hashes"]) == {
+        "0008/0.paz",
+        "0008/0.pamt",
+        "meta/0.papgt",
+    }
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "flush", "fsync"])
+@pytest.mark.parametrize("failed_operation", ["paz-slot", "pamt", "papgt"])
+def test_apply_rolls_back_archive_io_failures(
+    tmp_path: Path,
+    failure_stage: str,
+    failed_operation: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    class PazIoFailureService(BlackstarTimerService):
+        failed = False
+
+        def _write_all(
+            self,
+            handle: BinaryIO,
+            data: bytes,
+            operation: str,
+        ) -> None:
+            if (
+                failure_stage == "write"
+                and operation == failed_operation
+                and not self.failed
+            ):
+                self.failed = True
+                handle.write(data[:max(1, len(data) // 2)])
+                raise OSError("injected paz write failure")
+            return super()._write_all(handle, data, operation)
+
+        def _flush_file(self, handle: BinaryIO, operation: str) -> None:
+            if (
+                failure_stage == "flush"
+                and operation == failed_operation
+                and not self.failed
+            ):
+                self.failed = True
+                raise OSError("injected paz flush failure")
+            return super()._flush_file(handle, operation)
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            if (
+                failure_stage == "fsync"
+                and operation == failed_operation
+                and not self.failed
+            ):
+                self.failed = True
+                raise OSError("injected paz fsync failure")
+            return super()._fsync_file(handle, operation)
+
+    service = PazIoFailureService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert service.failed is True
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+def test_apply_rolls_back_when_paz_open_for_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+    paz_path = paths[0]
+    native_open = Path.open
+    failed = False
+
+    def fail_paz_open(path: Path, mode: str = "r", *args: object, **kwargs: object):
+        nonlocal failed
+        if path == paz_path and mode == "r+b" and not failed:
+            failed = True
+            raise OSError("injected paz open-for-write failure")
+        return native_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_paz_open)
+    service = BlackstarTimerService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert failed is True
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "target_relative"),
+    [
+        (stage, relative)
+        for stage in (
+            "backup_write",
+            "backup_flush",
+            "backup_fsync",
+            "backup_directory",
+        )
+        for relative in (
+            "0008/0.paz",
+            "0008/0.pamt",
+            "meta/0.papgt",
+        )
+    ] + [
+        ("manifest_fsync", None),
+        ("manifest_directory", None),
+    ],
+)
+def test_backup_durability_failure_prevents_source_mutation(
+    tmp_path: Path,
+    failure_stage: str,
+    target_relative: str | None,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    class BackupDurabilityFailureService(BlackstarTimerService):
+        failed = False
+        mutation_attempted = False
+
+        def _write_all(
+            self,
+            handle: BinaryIO,
+            data: bytes,
+            operation: str,
+        ) -> None:
+            if (
+                failure_stage == "backup_write"
+                and operation == f"backup:{target_relative}"
+                and not self.failed
+            ):
+                self.failed = True
+                handle.write(data[:max(1, len(data) // 2)])
+                raise OSError("injected backup write failure")
+            return super()._write_all(handle, data, operation)
+
+        def _flush_file(self, handle: BinaryIO, operation: str) -> None:
+            if (
+                failure_stage == "backup_flush"
+                and operation.startswith("backup:")
+                and not self.failed
+            ):
+                self.failed = True
+                raise OSError("injected backup flush failure")
+            return super()._flush_file(handle, operation)
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            should_fail = (
+                failure_stage == "backup_fsync"
+                and operation.startswith("backup:")
+            ) or (
+                failure_stage == "manifest_fsync"
+                and operation == "manifest"
+            )
+            if should_fail and not self.failed:
+                self.failed = True
+                raise OSError(f"injected {failure_stage} failure")
+            return super()._fsync_file(handle, operation)
+
+        def _sync_directory(self, path: Path, operation: str) -> None:
+            should_fail = (
+                failure_stage == "backup_directory"
+                and operation == f"backup-directory:{target_relative}"
+            ) or (
+                failure_stage == "manifest_directory"
+                and operation == "manifest-directory"
+            )
+            if should_fail and not self.failed:
+                self.failed = True
+                raise OSError(f"injected {failure_stage} failure")
+            return super()._sync_directory(path, operation)
+
+        def _patch_paz_slot(self, *args: object, **kwargs: object) -> None:
+            self.mutation_attempted = True
+            return super()._patch_paz_slot(*args, **kwargs)
+
+    service = BackupDurabilityFailureService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(OSError, match="injected"):
+        service.apply(preview.token)
+
+    assert service.failed is True
+    assert service.mutation_attempted is False
+    assert _archive_contents(paths) == before
+
+
+def test_backup_and_manifest_are_durable_before_paz_mutation(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    class DurabilityOrderService(BlackstarTimerService):
+        def __init__(self) -> None:
+            super().__init__(profile)
+            self.synced_files: set[str] = set()
+            self.synced_directories: set[str] = set()
+            self.mutation_prerequisites: tuple[set[str], set[str]] | None = None
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            super()._fsync_file(handle, operation)
+            self.synced_files.add(operation)
+
+        def _sync_directory(self, path: Path, operation: str) -> None:
+            super()._sync_directory(path, operation)
+            self.synced_directories.add(operation)
+
+        def _patch_paz_slot(self, *args: object, **kwargs: object) -> None:
+            self.mutation_prerequisites = (
+                set(self.synced_files),
+                set(self.synced_directories),
+            )
+            return super()._patch_paz_slot(*args, **kwargs)
+
+    service = DurabilityOrderService()
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    service.apply(preview.token)
+
+    assert service.mutation_prerequisites is not None
+    synced_files, synced_directories = service.mutation_prerequisites
+    assert {
+        "backup:0008/0.paz",
+        "backup:0008/0.pamt",
+        "backup:meta/0.papgt",
+        "manifest",
+    } <= synced_files
+    assert {
+        "backup-directory:0008/0.paz",
+        "backup-directory:0008/0.pamt",
+        "backup-directory:meta/0.papgt",
+        "manifest-directory",
+    } <= synced_directories
+
+
+@pytest.mark.parametrize("window", ["before", "during"])
+@pytest.mark.parametrize("region", ["outside", "inside"])
+def test_apply_rejects_paz_tampering_against_backup_snapshot(
+    tmp_path: Path,
+    window: str,
+    region: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    paz_path = paths[0]
+    before = _archive_contents(paths)
+    tampered = False
+
+    def tamper_handle(handle: BinaryIO, offset: int) -> None:
+        position = handle.tell()
+        handle.seek(offset)
+        original = handle.read(1)
+        assert len(original) == 1
+        handle.seek(offset)
+        handle.write(bytes([original[0] ^ 0xFF]))
+        handle.flush()
+        handle.seek(position)
+
+    class TamperingService(BlackstarTimerService):
+        def _patch_paz_slot(self, *args: object, **kwargs: object) -> None:
+            nonlocal tampered
+            if window == "before":
+                offset = 0 if region == "outside" else self.profile.entry_offset
+                with paz_path.open("r+b") as handle:
+                    tamper_handle(handle, offset)
+                tampered = True
+            return super()._patch_paz_slot(*args, **kwargs)
+
+        def _fsync_file(self, handle: BinaryIO, operation: str) -> None:
+            nonlocal tampered
+            if window == "during" and operation == "paz-slot" and not tampered:
+                offset = 0 if region == "outside" else self.profile.entry_offset
+                tamper_handle(handle, offset)
+                tampered = True
+            return super()._fsync_file(handle, operation)
+
+    service = TamperingService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert tampered is True
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+def test_apply_rolls_back_appended_paz_bytes_after_write(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    def append_after_paz_write(phase: str) -> None:
+        if phase == "after_paz_write":
+            with paths[0].open("ab") as handle:
+                handle.write(b"out-of-band append")
+
+    service = BlackstarTimerService(
+        profile,
+        fault_injector=append_after_paz_write,
+    )
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match="rolled back"):
+        service.apply(preview.token)
+
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+def _rewrite_metadata_checksums(
+    pamt_bytes: bytes,
+    papgt_bytes: bytes,
+    mutate: Callable[[dict, dict], None],
+) -> tuple[bytes, bytes]:
+    pamt = crimson_rs.parse_pamt_bytes(pamt_bytes)
+    entry = _target_entry(pamt)
+    mutate(pamt, entry)
+    repaired_pamt = bytearray(crimson_rs.serialize_pamt(pamt))
+    repaired_pamt[:4] = crimson_rs.calculate_checksum(
+        bytes(repaired_pamt[12:])
+    ).to_bytes(4, "little")
+    verified_pamt = crimson_rs.parse_pamt_bytes(bytes(repaired_pamt))
+
+    papgt = crimson_rs.parse_papgt_bytes(papgt_bytes)
+    groups = [
+        item for item in papgt["entries"] if item["group_name"] == "0008"
+    ]
+    assert len(groups) == 1
+    groups[0]["pack_meta_checksum"] = verified_pamt["checksum"]
+    repaired_papgt = bytearray(crimson_rs.serialize_papgt(papgt))
+    repaired_papgt[4:8] = crimson_rs.calculate_checksum(
+        bytes(repaired_papgt[12:])
+    ).to_bytes(4, "little")
+    return bytes(repaired_pamt), bytes(repaired_papgt)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("entry_offset", "Unexpected entry offset"),
+        ("chunk_size", "PAZ chunk size mismatch"),
+        ("uncompressed_size", "Unexpected uncompressed size"),
+    ],
+)
+def test_apply_rejects_repaired_checksum_invalid_metadata(
+    tmp_path: Path,
+    mutation: str,
+    error: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    class InvalidMetadataService(BlackstarTimerService):
+        def _build_metadata_bytes(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[bytes, bytes]:
+            pamt_bytes, papgt_bytes = super()._build_metadata_bytes(
+                *args, **kwargs
+            )
+
+            def mutate(pamt: dict, entry: dict) -> None:
+                if mutation == "entry_offset":
+                    entry["chunk_offset"] = int(entry["chunk_offset"]) + 1
+                elif mutation == "chunk_size":
+                    pamt["chunks"][0]["size"] = (
+                        int(pamt["chunks"][0]["size"]) + 1
+                    )
+                else:
+                    entry["uncompressed_size"] = (
+                        int(entry["uncompressed_size"]) + 1
+                    )
+
+            return _rewrite_metadata_checksums(
+                pamt_bytes,
+                papgt_bytes,
+                mutate,
+            )
+
+    service = InvalidMetadataService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError, match=error):
+        service.apply(preview.token)
+
+    assert _archive_contents(paths) == before
+    _assert_unfinalized_rollback_manifest(archive.game_dir)
+
+
+def test_apply_streams_paz_identity_without_full_file_buffers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+
+    class StreamingIdentityService(_CountingInspectionService):
+        def __init__(self) -> None:
+            super().__init__(TimerProfile(**archive.profile_kwargs()))
+            self.identity_stream_calls = 0
+            self.active_identity_streams = 0
+            self.peak_identity_streams = 0
+            self.backup_copy_passes = 0
+
+        def _copy_backup_file(
+            self,
+            source: Path,
+            destination: Path,
+            operation: str,
+        ) -> None:
+            self.backup_copy_passes += 1
+            return super()._copy_backup_file(
+                source,
+                destination,
+                operation,
+            )
+
+        def _stream_paz_identity(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            self.identity_stream_calls += 1
+            self.active_identity_streams += 1
+            self.peak_identity_streams = max(
+                self.peak_identity_streams,
+                self.active_identity_streams,
+            )
+            try:
+                return super()._stream_paz_identity(*args, **kwargs)
+            finally:
+                self.active_identity_streams -= 1
+
+    service = StreamingIdentityService()
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+    service.reset_counts()
+    full_paz_reads: list[Path] = []
+    native_read_bytes = Path.read_bytes
+
+    def reject_full_paz_read(path: Path) -> bytes:
+        if path.suffix == ".paz":
+            full_paz_reads.append(path)
+            raise AssertionError("Apply must not materialize a full PAZ buffer")
+        return native_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_full_paz_read)
+
+    service.apply(preview.token)
+
+    assert full_paz_reads == []
+    assert service.identity_stream_calls == 2
+    assert service.peak_identity_streams == 1
+    assert service.backup_copy_passes == 3
+    assert service.hash_call_count == 5
+    assert (
+        service.hash_call_count
+        + service.identity_stream_calls
+        + service.backup_copy_passes
+    ) == 10
+    assert service.decompress_call_count == 2
+    assert not hasattr(service, "_build_transaction_bytes")
+
+
+def test_unfinalized_manifest_retains_hard_stop_recovery_inputs(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    class SimulatedHardStop(BaseException):
+        pass
+
+    def stop_after_paz_write(phase: str) -> None:
+        if phase == "after_paz_write":
+            raise SimulatedHardStop("simulated process termination")
+
+    service = BlackstarTimerService(profile, fault_injector=stop_after_paz_write)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(SimulatedHardStop):
+        service.apply(preview.token)
+
+    manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest_path.is_file()
+    assert manifest["post_apply_hashes"] == {}
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is False
+    for relative, expected in manifest["source_hashes"].items():
+        backup_file = manifest_path.parent / Path(relative)
+        assert backup_file.is_file()
+        assert service._hash_file(backup_file) == expected
 
 
 def test_apply_has_bounded_archive_work(tmp_path: Path) -> None:
