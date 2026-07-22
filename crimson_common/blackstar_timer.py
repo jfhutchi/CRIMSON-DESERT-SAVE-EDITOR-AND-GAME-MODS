@@ -10,7 +10,7 @@ import stat
 import struct
 import subprocess
 import tempfile
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -193,6 +193,25 @@ class _PazIdentity:
     size: int
     entry_bytes: bytes | None
     source_entry_sha256: str
+
+
+@dataclass(frozen=True)
+class _BackupFileIdentity:
+    relative_path: str
+    sha256: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class _HeldBackupSet:
+    path: Path
+    root_fd: int | None
+    directory_identity: tuple[int, int]
+    files: tuple[_BackupFileIdentity, ...]
 
 
 class _JenkinsChecksum:
@@ -653,12 +672,48 @@ class BlackstarTimerService:
             raise ValueError("Candidate no longer fits the enrolled PAZ slot")
         slot_payload = candidate_compressed + bytes(padding)
 
-        backup_dir, expected_paz = self._create_backup(
+        with ExitStack() as backup_guard:
+            backup, expected_paz = self._create_backup(
+                game,
+                paths,
+                source_hashes,
+                token,
+                slot_payload,
+                backup_guard,
+            )
+            return self._apply_with_backup_guard(
+                game,
+                token,
+                progress,
+                source_hashes,
+                paths,
+                entry,
+                len(candidate_compressed),
+                slot_payload,
+                backup,
+                expected_paz,
+            )
+
+    def _apply_with_backup_guard(
+        self,
+        game: Path,
+        token: PreviewToken,
+        progress: Callable[[str, int], None] | None,
+        source_hashes: dict[str, str],
+        paths: tuple[Path, Path, Path],
+        entry: _ArchiveEntry,
+        candidate_compressed_size: int,
+        slot_payload: bytes,
+        backup: _HeldBackupSet,
+        expected_paz: _PazIdentity,
+    ) -> TransactionReport:
+        backup_dir = backup.path
+        self._before_backup_apply_step("after-create", backup_dir)
+        self._assert_backup_set_complete(
             game,
-            paths,
+            backup,
             source_hashes,
-            token,
-            slot_payload,
+            "backup-post-create",
         )
         self._emit_progress(progress, "backup_verification", 30)
         manifest_path = backup_dir / "manifest.json"
@@ -690,7 +745,7 @@ class BlackstarTimerService:
             new_pamt, new_papgt = self._build_metadata_bytes(
                 backup_dir,
                 entry,
-                len(candidate_compressed),
+                candidate_compressed_size,
                 expected_paz.checksum,
                 expected_paz.size,
                 source_metadata=(source_pamt, source_papgt),
@@ -746,10 +801,26 @@ class BlackstarTimerService:
                 manifest_path,
                 "manifest-finalization",
             )
+            self._before_backup_apply_step(
+                "before-finalization",
+                backup_dir,
+            )
+            self._assert_backup_set_complete(
+                game,
+                backup,
+                source_hashes,
+                "backup-finalization",
+            )
             manifest["post_apply_hashes"] = post_hashes
             manifest["finalized"] = True
             manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
-            self._write_manifest(manifest_path, manifest, trusted_root=game)
+            self._write_manifest(
+                manifest_path,
+                manifest,
+                trusted_root=game,
+                held_directory_root=backup_dir,
+                held_directory_root_fd=backup.root_fd,
+            )
         except Exception as exc:
             if not mutation_attempted:
                 raise
@@ -769,6 +840,16 @@ class BlackstarTimerService:
                     recovery_bytes = self._read_metadata_bytes(
                         recovery_path,
                         "metadata-conflict-recovery-baseline",
+                    )
+                    self._before_backup_apply_step(
+                        "during-rollback",
+                        backup_dir,
+                    )
+                    self._assert_backup_set_complete(
+                        game,
+                        backup,
+                        source_hashes,
+                        "backup-conflict-rollback",
                     )
                     self._restore_backup_files(
                         game,
@@ -800,6 +881,16 @@ class BlackstarTimerService:
                     f"was retained for recovery at: {exc.displaced_path}"
                 ) from exc
             try:
+                self._before_backup_apply_step(
+                    "during-rollback",
+                    backup_dir,
+                )
+                self._assert_backup_set_complete(
+                    game,
+                    backup,
+                    source_hashes,
+                    "backup-rollback",
+                )
                 self._restore_backup_files(game, backup_dir, source_hashes)
                 self._verify_archive_set(
                     game,
@@ -817,7 +908,13 @@ class BlackstarTimerService:
                 manifest.pop("finalized_at", None)
                 manifest["rolled_back"] = True
                 manifest["rollback_reason"] = str(exc)
-                self._write_manifest(manifest_path, manifest, trusted_root=game)
+                self._write_manifest(
+                    manifest_path,
+                    manifest,
+                    trusted_root=game,
+                    held_directory_root=backup_dir,
+                    held_directory_root_fd=backup.root_fd,
+                )
             except Exception as rollback_exc:
                 raise TimerTransactionError(
                     f"Apply failed: {exc}; rollback also failed: {rollback_exc}"
@@ -1672,31 +1769,52 @@ class BlackstarTimerService:
     ) -> None:
         del backup_dir, source_hashes
 
+    @staticmethod
+    def _before_backup_apply_step(phase: str, backup_dir: Path) -> None:
+        del phase, backup_dir
+
     def _assert_backup_set_complete(
         self,
         game: Path,
-        backup_dir: Path,
+        backup: _HeldBackupSet,
         source_hashes: dict[str, str],
-        verified_hashes: dict[str, str],
-        verified_stats: dict[str, tuple[int, int, int, int, int]],
+        operation: str,
     ) -> None:
-        if verified_hashes != source_hashes:
+        directory_stat = backup.path.stat()
+        if (
+            directory_stat.st_dev,
+            directory_stat.st_ino,
+        ) != backup.directory_identity:
+            raise OSError(
+                f"Backup timestamp identity changed during {operation}: "
+                f"{backup.path}"
+            )
+
+        cached_hashes = {
+            identity.relative_path: identity.sha256
+            for identity in backup.files
+        }
+        if cached_hashes != source_hashes:
             raise OSError("Backup verification set is incomplete")
-        manifest_path = backup_dir / "manifest.json"
+
+        manifest_path = backup.path / "manifest.json"
         self._assert_safe_archive_path(
             game,
             manifest_path,
-            "backup-set-final-manifest",
+            f"{operation}:manifest",
             require_exists=True,
         )
         if not manifest_path.is_file():
-            raise OSError("Backup manifest disappeared before guard release")
-        for relative in source_hashes:
-            backup_file = backup_dir / self._archive_relative_path(relative)
+            raise OSError("Backup manifest disappeared while apply was active")
+
+        for identity in backup.files:
+            backup_file = backup.path / self._archive_relative_path(
+                identity.relative_path
+            )
             self._assert_safe_archive_path(
                 game,
                 backup_file,
-                f"backup-set-final:{relative}",
+                f"{operation}:{identity.relative_path}",
                 require_exists=True,
             )
             current = backup_file.stat()
@@ -1707,8 +1825,21 @@ class BlackstarTimerService:
                 current.st_mtime_ns,
                 current.st_ctime_ns,
             )
-            if not backup_file.is_file() or fingerprint != verified_stats[relative]:
-                raise OSError(f"Backup changed before guard release: {relative}")
+            expected_fingerprint = (
+                identity.device,
+                identity.inode,
+                identity.size,
+                identity.modified_ns,
+                identity.changed_ns,
+            )
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or fingerprint != expected_fingerprint
+            ):
+                raise OSError(
+                    "Backup changed while apply was active: "
+                    f"{identity.relative_path}"
+                )
 
     def _create_backup(
         self,
@@ -1717,7 +1848,8 @@ class BlackstarTimerService:
         source_hashes: dict[str, str],
         token: PreviewToken,
         slot_payload: bytes,
-    ) -> tuple[Path, _PazIdentity]:
+        guard_stack: ExitStack,
+    ) -> tuple[_HeldBackupSet, _PazIdentity]:
         root = game / "bin64" / "SEModLoad" / "Backups" / "BlackstarTimer"
         self._create_backup_root(game, root)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
@@ -1736,94 +1868,109 @@ class BlackstarTimerService:
         )
         self._sync_directory(root, "backup-root-directory")
 
-        expected_paz: _PazIdentity | None = None
-        verified_hashes: dict[str, str] = {}
-        verified_stats: dict[str, tuple[int, int, int, int, int]] = {}
-        with self._hold_safe_archive_directory_chain(
-            game,
-            backup_dir,
-            "backup-set",
-            create_missing=False,
-        ) as backup_root_fd:
-            for path in paths:
-                relative = path.relative_to(game)
-                relative_text = relative.as_posix()
-                destination = backup_dir / relative
-                operation = f"backup:{relative_text}"
-                self._copy_backup_file(
-                    game,
-                    path,
-                    destination,
-                    operation,
-                    held_backup_root=backup_dir,
-                    held_backup_root_fd=backup_root_fd,
-                )
-                expected = source_hashes[relative_text]
-                if path == paths[0]:
-                    expected_paz = self._stream_paz_identity(
-                        destination,
-                        token.entry_offset,
-                        token.source_compressed_size,
-                        replacement=slot_payload,
-                        operation=f"backup-verification:{relative_text}",
-                    )
-                    backup_hash = expected_paz.source_sha256
-                else:
-                    backup_hash = self._hash_file(
-                        destination,
-                        f"backup-verification:{relative_text}",
-                    )
-                if backup_hash != expected:
-                    raise OSError(f"Backup verification failed: {relative_text}")
-                verified_hashes[relative_text] = backup_hash
-                current = destination.stat()
-                verified_stats[relative_text] = (
-                    current.st_dev,
-                    current.st_ino,
-                    current.st_size,
-                    current.st_mtime_ns,
-                    current.st_ctime_ns,
-                )
-                if path == paths[0]:
-                    self._before_backup_set_step(
-                        "after-paz-verification",
-                        backup_dir,
-                    )
-
-            self._before_backup_set_step("before-manifest", backup_dir)
-            manifest = {
-                "format_version": 1,
-                "profile_id": self.profile.profile_id,
-                "game_dir": str(game),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "source_hashes": source_hashes,
-                "post_apply_hashes": {},
-                "source_body_sha256": token.source_body_sha256,
-                "candidate_body_sha256": token.candidate_body_sha256,
-                "source_compressed_size": token.source_compressed_size,
-                "candidate_compressed_size": token.candidate_compressed_size,
-                "finalized": False,
-                "rolled_back": False,
-                "restored": False,
-            }
-            self._write_manifest(
-                backup_dir / "manifest.json",
-                manifest,
-                trusted_root=game,
-                held_directory_root=backup_dir,
-                held_directory_root_fd=backup_root_fd,
-            )
-            if expected_paz is None:
-                raise OSError("Backup PAZ identity was not calculated")
-            self._assert_backup_set_complete(
-                game,
+        backup_root_fd = guard_stack.enter_context(
+            self._hold_safe_archive_directory_chain(
+                root,
                 backup_dir,
-                source_hashes,
-                verified_hashes,
-                verified_stats,
+                "backup-apply-lifetime",
+                create_missing=False,
             )
-            self._before_backup_guard_release(backup_dir, source_hashes)
-        return backup_dir, expected_paz
+        )
+        directory_stat = backup_dir.stat()
+        directory_identity = (
+            directory_stat.st_dev,
+            directory_stat.st_ino,
+        )
+        expected_paz: _PazIdentity | None = None
+        verified_files: list[_BackupFileIdentity] = []
+        for path in paths:
+            relative = path.relative_to(game)
+            relative_text = relative.as_posix()
+            destination = backup_dir / relative
+            operation = f"backup:{relative_text}"
+            self._copy_backup_file(
+                game,
+                path,
+                destination,
+                operation,
+                held_backup_root=backup_dir,
+                held_backup_root_fd=backup_root_fd,
+            )
+            expected = source_hashes[relative_text]
+            if path == paths[0]:
+                expected_paz = self._stream_paz_identity(
+                    destination,
+                    token.entry_offset,
+                    token.source_compressed_size,
+                    replacement=slot_payload,
+                    operation=f"backup-verification:{relative_text}",
+                )
+                backup_hash = expected_paz.source_sha256
+            else:
+                backup_hash = self._hash_file(
+                    destination,
+                    f"backup-verification:{relative_text}",
+                )
+            if backup_hash != expected:
+                raise OSError(f"Backup verification failed: {relative_text}")
+            current = destination.stat()
+            verified_files.append(
+                _BackupFileIdentity(
+                    relative_path=relative_text,
+                    sha256=backup_hash,
+                    device=current.st_dev,
+                    inode=current.st_ino,
+                    size=current.st_size,
+                    modified_ns=current.st_mtime_ns,
+                    changed_ns=current.st_ctime_ns,
+                )
+            )
+            if path == paths[0]:
+                self._before_backup_set_step(
+                    "after-paz-verification",
+                    backup_dir,
+                )
+
+        self._before_backup_set_step("before-manifest", backup_dir)
+        manifest = {
+            "format_version": 1,
+            "profile_id": self.profile.profile_id,
+            "game_dir": str(game),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_hashes": source_hashes,
+            "post_apply_hashes": {},
+            "source_body_sha256": token.source_body_sha256,
+            "candidate_body_sha256": token.candidate_body_sha256,
+            "source_compressed_size": token.source_compressed_size,
+            "candidate_compressed_size": token.candidate_compressed_size,
+            "finalized": False,
+            "rolled_back": False,
+            "restored": False,
+        }
+        self._write_manifest(
+            backup_dir / "manifest.json",
+            manifest,
+            trusted_root=game,
+            held_directory_root=backup_dir,
+            held_directory_root_fd=backup_root_fd,
+        )
+        if expected_paz is None:
+            raise OSError("Backup PAZ identity was not calculated")
+
+        backup = _HeldBackupSet(
+            path=backup_dir,
+            root_fd=backup_root_fd,
+            directory_identity=directory_identity,
+            files=tuple(verified_files),
+        )
+        self._assert_backup_set_complete(
+            game,
+            backup,
+            source_hashes,
+            "backup-set-created",
+        )
+        self._before_backup_guard_release(backup_dir, source_hashes)
+        return backup, expected_paz
 
     def _verify_archive_set(
         self,

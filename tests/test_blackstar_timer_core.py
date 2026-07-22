@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+from contextlib import contextmanager
 from collections import Counter
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -1614,6 +1615,180 @@ def test_backup_set_guard_spans_all_files_manifest_and_final_check(
         assert service._hash_file(manifest_path.parent / Path(relative)) == expected
     assert not list(manifest_path.parent.parent.glob("*-moved"))
 
+
+
+
+@pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only apply guard")
+@pytest.mark.parametrize(
+    ("phase", "fault_after_paz"),
+    [
+        ("after-create", False),
+        ("before-finalization", False),
+        ("during-rollback", True),
+    ],
+)
+def test_apply_holds_original_backup_directory_through_terminal_state(
+    tmp_path: Path,
+    phase: str,
+    fault_after_paz: bool,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    class LifetimeGuardService(BlackstarTimerService):
+        attempted = False
+        rename_error: OSError | None = None
+
+        def _before_backup_apply_step(
+            self,
+            current_phase: str,
+            backup_dir: Path,
+        ) -> None:
+            if self.attempted or current_phase != phase:
+                return
+            self.attempted = True
+            moved = backup_dir.with_name(backup_dir.name + "-moved")
+            try:
+                backup_dir.rename(moved)
+            except OSError as exc:
+                self.rename_error = exc
+                return
+            backup_dir.mkdir()
+            (backup_dir / "incomplete-replacement").write_bytes(b"incomplete")
+
+    def inject_failure(current_phase: str) -> None:
+        if fault_after_paz and current_phase == "after_paz_write":
+            raise RuntimeError("injected rollback lifetime failure")
+
+    service = LifetimeGuardService(profile, fault_injector=inject_failure)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    if fault_after_paz:
+        with pytest.raises(TimerTransactionError, match="rolled back"):
+            service.apply(preview.token)
+    else:
+        result = service.apply(preview.token)
+        assert result.status is TimerStatus.APPLIED
+
+    assert service.attempted is True
+    assert service.rename_error is not None
+    assert service.rename_error.winerror == 32
+    manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    if fault_after_paz:
+        assert _archive_contents(paths) == before
+        assert manifest["finalized"] is False
+        assert manifest["rolled_back"] is True
+    else:
+        assert manifest["finalized"] is True
+        for relative, expected in manifest["source_hashes"].items():
+            backup_file = manifest_path.parent / Path(relative)
+            assert backup_file.is_file()
+            assert service._hash_file(backup_file) == expected
+
+    moved_after_context = manifest_path.parent.with_name(
+        manifest_path.parent.name + "-after-context"
+    )
+    manifest_path.parent.rename(moved_after_context)
+    moved_after_context.rename(manifest_path.parent)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["0008/0.paz", "0008/0.pamt", "meta/0.papgt"],
+)
+def test_apply_revalidates_every_backup_file_before_finalization(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+
+    class IncompleteBackupService(BlackstarTimerService):
+        damaged = False
+
+        def _before_backup_apply_step(
+            self,
+            phase: str,
+            backup_dir: Path,
+        ) -> None:
+            if self.damaged or phase != "before-finalization":
+                return
+            damaged_path = backup_dir / Path(relative)
+            damaged_path.write_bytes(damaged_path.read_bytes() + b"damaged")
+            self.damaged = True
+
+    service = IncompleteBackupService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(TimerTransactionError):
+        service.apply(preview.token)
+
+    assert service.damaged is True
+    _manifest_path, manifest = _only_backup_manifest(archive.game_dir)
+    assert manifest["finalized"] is False
+    assert manifest["rolled_back"] is False
+
+
+def test_backup_guard_acquisition_failure_closes_handles_without_mutation(
+    tmp_path: Path,
+) -> None:
+    archive = make_timer_archive(tmp_path)
+    profile = TimerProfile(**archive.profile_kwargs())
+    paths = _timer_archive_paths(archive.game_dir)
+    before = _archive_contents(paths)
+
+    class GuardAcquisitionFailureService(BlackstarTimerService):
+        acquired = False
+
+        @contextmanager
+        def _hold_safe_archive_directory_chain(
+            self,
+            root: Path,
+            directory: Path,
+            operation: str,
+            *,
+            create_missing: bool,
+            root_is_held: bool = False,
+            root_fd: int | None = None,
+        ):
+            with super()._hold_safe_archive_directory_chain(
+                root,
+                directory,
+                operation,
+                create_missing=create_missing,
+                root_is_held=root_is_held,
+                root_fd=root_fd,
+            ) as held_fd:
+                if operation == "backup-apply-lifetime":
+                    self.acquired = True
+                    raise OSError("injected backup guard acquisition failure")
+                yield held_fd
+
+    service = GuardAcquisitionFailureService(profile)
+    preview = service.preview(archive.game_dir)
+    assert preview.token is not None
+
+    with pytest.raises(OSError, match="guard acquisition"):
+        service.apply(preview.token)
+
+    assert service.acquired is True
+    assert _archive_contents(paths) == before
+    backup_root = (
+        archive.game_dir
+        / "bin64"
+        / "SEModLoad"
+        / "Backups"
+        / "BlackstarTimer"
+    )
+    timestamps = [path for path in backup_root.iterdir() if path.is_dir()]
+    assert len(timestamps) == 1
+    moved = timestamps[0].with_name(timestamps[0].name + "-after-failure")
+    timestamps[0].rename(moved)
+    moved.rename(timestamps[0])
 
 @pytest.mark.skipif(timer_module.os.name != "nt", reason="Windows-only junction contract")
 def test_resolved_game_root_remains_valid_when_supplied_through_junction(
