@@ -421,7 +421,7 @@ class CrimsonApplicationShell(QWidget):
         button.setText(label.upper())
         button.setIcon(symbol_icon(icon_name))
         button.setIconSize(QSize(19, 19))
-        button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         button.setAutoRaise(True)
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(tooltip)

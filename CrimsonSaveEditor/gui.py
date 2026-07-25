@@ -2558,19 +2558,14 @@ class MainWindow(QMainWindow):
             self._start_icon_warm()
             QTimer.singleShot(1500, self._maybe_offer_icon_download)
         self._refresh_sidebar()
-        last_path = self._config.get("last_save_path", "")
-        if last_path and os.path.isfile(last_path):
-            self._load_save(last_path)
-            self._update_status(
-                f"Loaded last save: {os.path.basename(last_path)}  |  "
-                f"Item DB: {len(self._name_db.items)} items"
-            )
-        else:
-            self._update_status(
-                f"Ready. Item DB: {len(self._name_db.items)} items"
-                + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
-                + "  |  Select a save with SAVES or Menu > File > Open"
-            )
+        # Never auto-load the previous save: the user opens a save explicitly
+        # each session so a stale save can never be edited by accident. The
+        # sidebar still highlights the last-used slot for one-click access.
+        self._update_status(
+            f"Ready. Item DB: {len(self._name_db.items)} items"
+            + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
+            + "  |  Select a save with SAVES or Menu > File > Open"
+        )
 
 
     def _get_config_path(self) -> str:
@@ -7075,7 +7070,10 @@ QCheckBox::indicator {{
 
             swatch = QTableWidgetItem()
             swatch.setBackground(QBrush(QColor(e['r'], e['g'], e['b'])))
-            swatch.setText(f"#{e['r']:02X}{e['g']:02X}{e['b']:02X}")
+            swatch.setToolTip(
+                f"#{e['r']:02X}{e['g']:02X}{e['b']:02X}  "
+                f"rgb({e['r']}, {e['g']}, {e['b']})"
+            )
             self._dye_parts_table.setItem(i, 1, swatch)
 
             self._dye_parts_table.setItem(i, 2, QTableWidgetItem(str(e['r'])))
@@ -32031,6 +32029,7 @@ QCheckBox::indicator {{
         if schedule_enrichment:
             self._status_parc_label.setText("Loading... (PARC enriching in background)")
             self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
+            self._set_inv_subtabs_loading()
         if not incremental:
             self._populate_inventory()
             self._populate_equipment()
@@ -32556,8 +32555,14 @@ QCheckBox::indicator {{
     def _on_inv_subtab_changed(self, index: int) -> None:
         self._populate_inventory()
 
+    def _set_inv_subtabs_loading(self) -> None:
+        if not hasattr(self, '_inv_subtabs'):
+            return
+        for idx, (label, _filter_type, _filter_val) in enumerate(self._inv_subtab_filters):
+            self._inv_subtabs.setTabText(idx, f"{label} (loading…)")
+
     def _update_inv_subtab_counts(self) -> None:
-        if not hasattr(self, '_inv_subtabs') or not self._items:
+        if not hasattr(self, '_inv_subtabs'):
             return
         known_sources = {"Equipment", "Inventory", "Mercenary"}
         for idx, (label, filter_type, filter_val) in enumerate(self._inv_subtab_filters):
