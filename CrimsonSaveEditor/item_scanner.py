@@ -942,16 +942,27 @@ def _extract_bag_ranges(data: bytes | bytearray) -> List[Tuple[int, int, str]]:
 def enrich_items_with_parc(
     data: bytes | bytearray,
     items: List[SaveItem],
+    progress_cb=None,
 ) -> Tuple[int, str]:
+    TOTAL_STEPS = 4
+
+    def _report(step: int) -> None:
+        if progress_cb:
+            progress_cb(step, TOTAL_STEPS)
+
     parc_items, status = scan_items_parc(data)
+    _report(1)
     if not parc_items:
+        _report(TOTAL_STEPS)
         return 0, status
 
     parc_by_no: Dict[int, SaveItem] = {}
     for pi in parc_items:
         parc_by_no[pi.item_no] = pi
+    _report(2)
 
     bag_ranges = _extract_bag_ranges(data)
+    _report(3)
 
     enriched = 0
     for item in items:
@@ -966,6 +977,7 @@ def enrich_items_with_parc(
                 item.bag = bname
                 break
 
+    _report(TOTAL_STEPS)
     return enriched, f"PARC mode: {enriched}/{len(items)} items enriched with exact field offsets"
 
 
