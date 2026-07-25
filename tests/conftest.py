@@ -19,6 +19,7 @@ EARLY_114_SHA256 = "57060a7707340f20410e04fad3127f2d6a1fdbd515cd163a196d841c6892
 LEGIT_IDLE_114_SHA256 = "3b9d2bdc63a892b1e513344c9121d0606b1c474db3823cfd7ada0ae7e234f724"
 LEGIT_ACTIVE_114_SHA256 = "6315b31b9847b585552788e9feeb11966ebf8b09b65f6518002f9624d51623c7"
 LEGACY_FAILED_SHA256 = "e8e1f084c392f35da4f30658c9d829890e3fe29f230ef07a8afd6fcf534b362c"
+CURRENT_PATCH_SHA256 = "048251cd215a5f0c428f9a3cd72eaf1a32d08a2349c7dbc8bc13f15fdcf5e2d4"
 
 
 def sha256_file(path: Path) -> str:
@@ -64,3 +65,8 @@ def legit_active_114_save_path() -> Path:
 @pytest.fixture(scope="session")
 def legacy_failed_save_path() -> Path:
     return _reference_save("slot102_legacy", LEGACY_FAILED_SHA256)
+
+
+@pytest.fixture(scope="session")
+def current_patch_save_path() -> Path:
+    return _reference_save("slot104", CURRENT_PATCH_SHA256)
