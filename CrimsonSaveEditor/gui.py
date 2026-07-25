@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -10,9 +11,9 @@ import sys
 import traceback
 
 log = logging.getLogger(__name__)
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QBrush, QShortcut,
 )
@@ -24,13 +25,18 @@ from PySide6.QtWidgets import (
     QGroupBox, QSplitter, QFrame, QAbstractItemView,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QProgressBar, QTextEdit, QCheckBox, QApplication, QDockWidget,
-    QSlider,
+    QSlider, QProgressDialog,
 )
 
 from models import SaveItem, SaveData, UndoEntry
-from save_crypto import load_save_file, load_raw_stream, write_save_file
+from save_crypto import (
+    HEADER_SIZE,
+    load_save_file,
+    load_raw_stream,
+    transactional_write_save,
+)
 from item_scanner import (
-    scan_items, apply_stack_edit, apply_enchant_edit,
+    scan_items, scan_items_smart, apply_stack_edit, apply_enchant_edit,
     apply_endurance_edit, apply_sharpness_edit, apply_item_swap, apply_item_swap_all,
     enrich_items_with_parc, smart_item_swap,
     apply_itemno_edit, get_max_itemno,
@@ -281,6 +287,27 @@ QCheckBox::indicator {{
     height: 16px;
 }}
 """
+
+from crimson_theme import (
+    CRIMSON_DARK_TOKENS,
+    apply_crimson_theme,
+    build_stylesheet,
+    install_crimson_shell,
+    legacy_colors,
+)
+from crimson_common.crimson_shell import (
+    ShellCommand,
+    ShellDestination,
+    ShellRoute,
+    install_crimson_application_shell,
+)
+
+COLORS.clear()
+COLORS.update(legacy_colors(CRIMSON_DARK_TOKENS))
+_TAB_SELECTED_BG = CRIMSON_DARK_TOKENS["selection"]
+_TAB_SELECTED_COLOR = CRIMSON_DARK_TOKENS["parchment"]
+_TAB_SELECTED_BORDER = CRIMSON_DARK_TOKENS["bronze_bright"]
+DARK_STYLESHEET = build_stylesheet(CRIMSON_DARK_TOKENS)
 
 
 def find_save_files() -> List[dict]:
@@ -1475,24 +1502,57 @@ class QuestEditorWindow(QDialog):
             QMessageBox.critical(self, "Insert Error", str(e))
 
     def _save_file(self) -> None:
+        if not self._save_data.is_schema_supported:
+            QMessageBox.critical(
+                self,
+                "Unsupported Save Schema",
+                "Quest changes cannot be written because this save schema is unknown.",
+            )
+            return
         reply = QMessageBox.question(
             self, "Save Quest Changes",
-            "PLEASE MAKE SURE YOU HAVE A BACKUP OF YOUR SAVE.\n"
-            "Quest state changes are experimental.\n\n"
+            "Quest state changes are experimental. A verified backup is mandatory "
+            "and will be created automatically before writing.\n\n"
             f"Save to: {self._save_path}\n\n"
             "Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
+        from app_logging import new_operation_id
+
+        operation_id = new_operation_id("quest-save")
         try:
-            from save_crypto import write_save_file
-            write_save_file(self._save_path, bytes(self._save_data.decompressed_blob),
-                           self._save_data.raw_header)
+            result = transactional_write_save(
+                destination=self._save_path,
+                edited_blob=bytes(self._save_data.decompressed_blob),
+                original_header=self._save_data.raw_header,
+                backup_source=self._save_path,
+                expected_identity=self._save_data.schema_identity,
+                operation_id=operation_id,
+            )
+            with open(self._save_path, "rb") as stream:
+                self._save_data.raw_header = stream.read(HEADER_SIZE)
+            self._save_data.source_file_sha256 = result.output_sha256
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_blackstar_preview_token"):
+                parent._blackstar_preview_token = None
             self._status.setText(f"Saved to {os.path.basename(self._save_path)}")
-            QMessageBox.information(self, "Saved", f"Quest changes saved to:\n{self._save_path}")
+            QMessageBox.information(
+                self,
+                "Saved",
+                f"Quest changes saved to:\n{self._save_path}\n\n"
+                f"Verified backup:\n{result.backup_path}\n\n"
+                f"Operation ID: {operation_id}",
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
+            log.exception("operation=%s quest_save_failed", operation_id)
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"{e}\n\nNo destination replacement was accepted.\n"
+                f"Operation ID: {operation_id}",
+            )
 
 
 class DescriptionSearchDialog(QDialog):
@@ -2406,6 +2466,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("crimsonWindow")
+        apply_crimson_theme(QApplication.instance(), "dark")
         self._splash("Initializing main window...")
         self.setWindowTitle("Crimson Desert - Offline Save Editor")
         self._ui_scale = 1.0
@@ -2418,6 +2480,11 @@ class MainWindow(QMainWindow):
         self._pack_mgr = PackManager()
         self._set_mgr = SetManager()
         self._icon_cache = IconCache()
+        self._icon_seed_pending = self._icon_cache.ensure_seeded(
+            completed=self._on_icons_seeded
+        )
+        from parse_reuse import ParsedResultCache
+        self._parse_cache = ParsedResultCache()
 
         self._max_enchant_map: dict = {}
         try:
@@ -2439,6 +2506,23 @@ class MainWindow(QMainWindow):
         self._undo_stack: List[UndoEntry] = []
         self._loaded_path: str = ""
         self._dirty: bool = False
+        self._document_generation_counter = 0
+        self._blackstar_thread = None
+        self._blackstar_worker = None
+        self._blackstar_progress = None
+        self._blackstar_input_hash = ""
+        self._blackstar_preview_token = None
+        self._blackstar_dry_run_active = True
+        self._load_thread = None
+        self._load_worker = None
+        self._load_handle = None
+        self._load_progress = None
+        self._load_population_pending = False
+        self._inventory_population_job = None
+        self._equipment_population_job = None
+        self._parc_thread = None
+        self._parc_worker = None
+        self._parc_handle = None
         self._parc_status: str = ""
         self._config: dict = self._load_config()
 
@@ -2468,20 +2552,20 @@ class MainWindow(QMainWindow):
         if saved_widget_scale and saved_widget_scale != 1.0:
             self._set_widget_scale(saved_widget_scale)
 
+        self._apply_icon_display_metrics()
+        self._apply_icon_button_labels()
+        if not self._icon_seed_pending:
+            self._start_icon_warm()
+            QTimer.singleShot(1500, self._maybe_offer_icon_download)
         self._refresh_sidebar()
-        last_path = self._config.get("last_save_path", "")
-        if last_path and os.path.isfile(last_path):
-            self._load_save(last_path)
-            self._update_status(
-                f"Loaded last save: {os.path.basename(last_path)}  |  "
-                f"Item DB: {len(self._name_db.items)} items"
-            )
-        else:
-            self._update_status(
-                f"Ready. Item DB: {len(self._name_db.items)} items"
-                + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
-                + "  |  Select a save from the sidebar or File > Open"
-            )
+        # Never auto-load the previous save: the user opens a save explicitly
+        # each session so a stale save can never be edited by accident. The
+        # sidebar still highlights the last-used slot for one-click access.
+        self._update_status(
+            f"Ready. Item DB: {len(self._name_db.items)} items"
+            + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
+            + "  |  Select a save with SAVES or Menu > File > Open"
+        )
 
 
     def _get_config_path(self) -> str:
@@ -2512,7 +2596,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
 
         sidebar = QFrame()
-        sidebar.setMinimumWidth(40)
+        sidebar.setObjectName("saveBrowser")
+        sidebar.setMinimumWidth(210)
         sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-right: 1px solid {COLORS['border']};")
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(8, 8, 8, 8)
@@ -2530,23 +2615,25 @@ class MainWindow(QMainWindow):
         self._sb_collapse_btn.clicked.connect(self._toggle_save_sidebar)
         hdr_row.addWidget(self._sb_collapse_btn)
         hdr = QLabel("Save Browser")
+        hdr.setProperty("heading", True)
         hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 4px 0;")
         hdr_row.addWidget(hdr)
         hdr_row.addStretch()
+        sb_layout.addLayout(hdr_row)
 
+        nav_row = QHBoxLayout()
         home_btn = QPushButton("Home")
         home_btn.setFixedHeight(22)
         home_btn.setToolTip("Go to Inventory tab (Tab 1)")
         home_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(0))
-        hdr_row.addWidget(home_btn)
+        nav_row.addWidget(home_btn)
 
         backup_nav_btn = QPushButton("Backup")
         backup_nav_btn.setFixedHeight(22)
         backup_nav_btn.setToolTip("Go to Backup/Restore tab")
         backup_nav_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(self._tabs.count() - 1))
-        hdr_row.addWidget(backup_nav_btn)
-
-        sb_layout.addLayout(hdr_row)
+        nav_row.addWidget(backup_nav_btn)
+        sb_layout.addLayout(nav_row)
 
         path_row = QHBoxLayout()
         self._save_root_label = QLabel("(auto-detect)")
@@ -2557,7 +2644,7 @@ class MainWindow(QMainWindow):
         browse_btn.setToolTip("Set save folder path")
         browse_btn.clicked.connect(self._browse_save_root)
         path_row.addWidget(browse_btn)
-        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
+        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
         self._global_icons_btn.setFixedHeight(22)
         self._global_icons_btn.setToolTip("Toggle item icons on all tabs")
         self._global_icons_btn.clicked.connect(self._toggle_icons)
@@ -2583,6 +2670,7 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(ref_btn)
 
         self._quick_save_btn = QPushButton("SAVE EDIT TO SELECTED FILE")
+        self._quick_save_btn.setProperty("primaryAction", True)
         self._quick_save_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLORS['accent']}; color: white; font-weight: bold; "
             f"padding: 8px; border-radius: 4px; font-size: 11px; }}"
@@ -2600,8 +2688,8 @@ class MainWindow(QMainWindow):
 
         settings_btn = QPushButton("Settings")
         settings_btn.setStyleSheet(
-            f"font-size: 12px; font-weight: bold; color: #4FC3F7; "
-            f"border: 1px solid #4FC3F7; border-radius: 4px; padding: 4px 8px;"
+            f"font-size: 10px; font-weight: bold; color: {COLORS['text_dim']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: 0; padding: 4px 8px;"
         )
         settings_btn.clicked.connect(self._open_settings)
         sb_layout.addWidget(settings_btn)
@@ -2613,16 +2701,13 @@ class MainWindow(QMainWindow):
 
         self._save_sidebar = sidebar
         self._save_dock = QDockWidget("Save Browser", self)
+        self._save_dock.setMinimumWidth(218)
         self._save_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._save_dock.setFeatures(
             QDockWidget.DockWidgetMovable |
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._save_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._save_dock.setWidget(sidebar)
         self._save_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_sb_collapsed': not v})
@@ -2634,19 +2719,20 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
+        self._center_status = QLabel("Ready — Select a save with SAVES or Menu > File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
-            f"background-color: {COLORS['panel']}; "
-            f"color: {COLORS['accent']}; "
-            f"font-size: 13px; font-weight: bold; "
-            f"padding: 8px; "
+            "background: transparent; "
+            f"color: {COLORS['text_dim']}; "
+            "font-size: 10px; font-weight: normal; "
+            "padding: 4px; "
             f"border-bottom: 1px solid {COLORS['border']};"
         )
-        self._center_status.setFixedHeight(36)
+        self._center_status.setFixedHeight(28)
         right_layout.addWidget(self._center_status)
 
         self._global_info_widget = QWidget()
+        self._global_info_widget.setObjectName("contextStrip")
         info_layout = QHBoxLayout(self._global_info_widget)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
@@ -2656,9 +2742,9 @@ class MainWindow(QMainWindow):
 
         self._global_game_path = QLabel("Not set — click Browse")
         self._global_game_path.setStyleSheet(
-            f"color: {COLORS['accent']}; padding: 2px 6px; "
-            f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
-            f"background-color: {COLORS['input_bg']};"
+            f"color: {COLORS['text_dim']}; padding: 2px 6px; "
+            f"border: 0; border-bottom: 1px solid {COLORS['border']}; "
+            "background: transparent;"
         )
         self._global_game_path.setToolTip("Game installation path used by Game Data, ItemBuffs, and Stores")
         info_layout.addWidget(self._global_game_path, 1)
@@ -2669,7 +2755,7 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(gp_browse)
 
         gp_detect = QPushButton("Detect")
-        gp_detect.setFixedWidth(55)
+        gp_detect.setFixedWidth(80)
         gp_detect.setToolTip("Auto-detect game installation")
         gp_detect.clicked.connect(self._global_auto_detect_path)
         info_layout.addWidget(gp_detect)
@@ -2679,9 +2765,9 @@ class MainWindow(QMainWindow):
         self._global_hide_btn.setCheckable(True)
         self._global_hide_btn.setToolTip("Hide/Show game path bar")
         self._global_hide_btn.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['accent']}; color: white; "
-            f"font-weight: bold; border-radius: 12px; font-size: 12px; }}"
-            f"QPushButton:checked {{ background: #4CAF50; }}")
+            f"QPushButton {{ background: transparent; color: {COLORS['text_dim']}; "
+            f"font-weight: bold; border: 1px solid {COLORS['border']}; "
+            "border-radius: 0; font-size: 11px; }}")
         self._global_hide_btn.clicked.connect(self._toggle_global_info)
         info_layout.addWidget(self._global_hide_btn)
 
@@ -2699,12 +2785,17 @@ class MainWindow(QMainWindow):
             self._global_game_path.setToolTip(saved_gp)
 
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("primaryNav")
+        self._tabs.tabBar().setObjectName("primaryTabBar")
+        self._tabs.setTabPosition(QTabWidget.North)
+        install_crimson_shell(self._tabs, product="SAVE EDITOR")
         right_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(right_panel)
 
         from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
         pack_sidebar = QFrame()
-        pack_sidebar.setMinimumWidth(40)
+        pack_sidebar.setObjectName("packBrowser")
+        pack_sidebar.setMinimumWidth(210)
         pack_sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-left: 1px solid {COLORS['border']};")
         ps_layout = QVBoxLayout(pack_sidebar)
         ps_layout.setContentsMargins(6, 6, 6, 6)
@@ -2712,6 +2803,7 @@ class MainWindow(QMainWindow):
 
         ps_hdr_row = QHBoxLayout()
         ps_hdr = QLabel("Pack Browser")
+        ps_hdr.setProperty("heading", True)
         ps_hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 2px 0;")
         ps_hdr_row.addWidget(ps_hdr)
         ps_hdr_row.addStretch()
@@ -2796,16 +2888,13 @@ class MainWindow(QMainWindow):
 
         self._pack_sidebar = pack_sidebar
         self._pack_dock = QDockWidget("Pack Browser", self)
+        self._pack_dock.setMinimumWidth(218)
         self._pack_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._pack_dock.setFeatures(
             QDockWidget.DockWidgetMovable |
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._pack_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._pack_dock.setWidget(pack_sidebar)
         self._pack_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_ps_collapsed': not v})
@@ -2825,18 +2914,26 @@ class MainWindow(QMainWindow):
         self._buff_rust_items: list = []
 
         self._save_tabs = QTabWidget()
-        self._save_tabs.setTabPosition(QTabWidget.South)
+        self._save_tabs.setObjectName("sectionNav")
+        self._save_tabs.tabBar().setObjectName("sectionTabBar")
+        self._save_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._save_tabs, tr("tab.save_editor"))
 
         self._mods_tabs = QTabWidget()
-        self._mods_tabs.setTabPosition(QTabWidget.South)
+        self._mods_tabs.setObjectName("sectionNav")
+        self._mods_tabs.tabBar().setObjectName("sectionTabBar")
+        self._mods_tabs.setTabPosition(QTabWidget.North)
 
         self._items_tabs = QTabWidget()
-        self._items_tabs.setTabPosition(QTabWidget.South)
+        self._items_tabs.setObjectName("sectionNav")
+        self._items_tabs.tabBar().setObjectName("sectionTabBar")
+        self._items_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._items_tabs, tr("tab.items"))
 
         self._world_tabs = QTabWidget()
-        self._world_tabs.setTabPosition(QTabWidget.South)
+        self._world_tabs.setObjectName("sectionNav")
+        self._world_tabs.tabBar().setObjectName("sectionTabBar")
+        self._world_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._world_tabs, tr("tab.world"))
 
         _real_tabs = self._tabs
@@ -2884,6 +2981,112 @@ class MainWindow(QMainWindow):
 
         if self._config.get("ui_scale", 100) != 100 or self._config.get("compact_mode", False):
             self._apply_ui_settings()
+
+        self._shell = install_crimson_application_shell(
+            self,
+            product="SAVE EDITOR",
+            router_tabs=self._real_tabs,
+            destinations=self._shell_destinations(),
+            context_widget=self._global_info_widget,
+            commands=(
+                ShellCommand("SAVES", self._toggle_save_sidebar, "Open the save browser"),
+                ShellCommand("PACKS", self._toggle_pack_sidebar, "Open the item pack browser"),
+            ),
+            docks=(self._save_dock, self._pack_dock),
+            preserve_widgets=(self._center_status,),
+        )
+
+    def _shell_destinations(self) -> tuple[ShellDestination, ...]:
+        outer = self._real_tabs
+
+        def section_route(
+            label: str,
+            section: QTabWidget,
+            index: int,
+            description: str = "",
+            *,
+            icon_name: str = "",
+            game_art_id: int | None = None,
+            badge: str = "",
+            immersive: bool = False,
+        ) -> ShellRoute:
+            return ShellRoute(
+                label,
+                outer.indexOf(section),
+                section,
+                index,
+                description,
+                icon_name,
+                game_art_id,
+                badge,
+                immersive,
+            )
+
+        inventory = section_route(
+            "Save Overview",
+            self._save_tabs,
+            0,
+            "Loaded character, inventory, and save state.",
+        )
+        backup = ShellRoute(
+            "Backup & Restore",
+            self._backup_tab_index,
+            description="Local snapshots and recovery.",
+        )
+        return (
+            ShellDestination(
+                "SAVE",
+                (inventory, backup),
+                "Current save",
+            ),
+            ShellDestination(
+                "MOUNTS",
+                (
+                    section_route(
+                        "Blackstar",
+                        self._save_tabs,
+                        5,
+                        "Blackstar ownership, companions, and mount records.",
+                        icon_name="mounts",
+                        game_art_id=1000799,
+                        badge="DRAGON",
+                        immersive=True,
+                    ),
+                ),
+                "Mount registry",
+            ),
+            ShellDestination(
+                "INVENTORY",
+                (
+                    section_route("Inventory", self._save_tabs, 0),
+                    section_route("Item Swap", self._save_tabs, 1),
+                    section_route("Repurchase", self._save_tabs, 2),
+                    section_route("Equipment", self._save_tabs, 3),
+                    section_route("Sockets", self._save_tabs, 4),
+                    section_route("Dye", self._save_tabs, 6),
+                    section_route("Item Database", self._items_tabs, 0),
+                    section_route("Item Packs", self._items_tabs, 1),
+                ),
+                "Character loadout",
+            ),
+            ShellDestination(
+                "WORLD",
+                tuple(
+                    section_route(self._world_tabs.tabText(index), self._world_tabs, index)
+                    for index in range(self._world_tabs.count())
+                ),
+                "World state",
+            ),
+            ShellDestination(
+                "TOOLS",
+                (
+                    backup,
+                    section_route("Item Database", self._items_tabs, 0),
+                    section_route("Item Packs", self._items_tabs, 1),
+                ),
+                "Archive utilities",
+            ),
+        )
 
     def _toggle_save_sidebar(self) -> None:
         if self._save_dock.isVisible():
@@ -3510,14 +3713,17 @@ class MainWindow(QMainWindow):
         open_save.setShortcut(QKeySequence("Ctrl+O"))
         open_save.triggered.connect(self._open_save_file)
         file_menu.addAction(open_save)
+        self._open_save_action = open_save
 
         open_raw = QAction("Open Raw Stream (.bin)...", self)
         open_raw.triggered.connect(self._open_raw_stream)
         file_menu.addAction(open_raw)
+        self._open_raw_action = open_raw
 
         auto_find = QAction("Auto-Find Save Files...", self)
         auto_find.triggered.connect(self._auto_find_save)
         file_menu.addAction(auto_find)
+        self._auto_find_action = auto_find
 
         file_menu.addSeparator()
 
@@ -3525,11 +3731,13 @@ class MainWindow(QMainWindow):
         save_act.setShortcut(QKeySequence("Ctrl+S"))
         save_act.triggered.connect(self._save_file)
         file_menu.addAction(save_act)
+        self._save_action = save_act
 
         save_as = QAction("Save As...", self)
         save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_as.triggered.connect(self._save_file_as)
         file_menu.addAction(save_as)
+        self._save_as_action = save_as
 
         file_menu.addSeparator()
 
@@ -3544,6 +3752,7 @@ class MainWindow(QMainWindow):
         undo_act.setShortcut(QKeySequence("Ctrl+Z"))
         undo_act.triggered.connect(self._undo)
         edit_menu.addAction(undo_act)
+        self._undo_action = undo_act
 
         edit_menu.addSeparator()
         font_menu = edit_menu.addMenu("Font Size")
@@ -3725,6 +3934,11 @@ class MainWindow(QMainWindow):
     def _apply_ui_settings(self) -> None:
         scale = self._config.get("ui_scale", 100) / 100.0
         compact = self._config.get("compact_mode", False)
+        sheet = apply_crimson_theme(
+            QApplication.instance(), "dark", scale=scale, compact=compact
+        )
+        self.setStyleSheet(sheet)
+        return
 
         if compact:
             font_main = 11
@@ -4186,11 +4400,11 @@ QCheckBox::indicator {{
         top.addWidget(self._inv_group)
         self._inv_group.setVisible(False)
 
-        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
+        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
         self._show_icons_btn.setToolTip("Download and display item icons (requires internet first time)")
         self._show_icons_btn.clicked.connect(self._toggle_icons)
         top.addWidget(self._show_icons_btn)
-        self._icons_enabled = self._config.get("show_icons", False)
+        self._icons_enabled = self._config.get("show_icons", True)
 
         layout.addLayout(top)
 
@@ -5778,9 +5992,8 @@ QCheckBox::indicator {{
         try:
             from item_template_db import extract_items_from_parse_tree, save_db, load_db, _get_parser
             from template_sync import load_local_master, find_new_templates
-            sp = _get_parser()
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             templates = extract_items_from_parse_tree(result, raw, 'loaded_save')
             db = load_db()
             new_count = 0
@@ -5837,10 +6050,9 @@ QCheckBox::indicator {{
         if not self._save_data:
             return
         try:
-            from item_template_db import extract_items_from_parse_tree, save_db, load_db, _get_parser
-            sp = _get_parser()
+            from item_template_db import extract_items_from_parse_tree, save_db, load_db
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             templates = extract_items_from_parse_tree(result, raw, 'auto_scan')
             db = load_db()
             new_count = 0
@@ -6858,7 +7070,10 @@ QCheckBox::indicator {{
 
             swatch = QTableWidgetItem()
             swatch.setBackground(QBrush(QColor(e['r'], e['g'], e['b'])))
-            swatch.setText(f"#{e['r']:02X}{e['g']:02X}{e['b']:02X}")
+            swatch.setToolTip(
+                f"#{e['r']:02X}{e['g']:02X}{e['b']:02X}  "
+                f"rgb({e['r']}, {e['g']}, {e['b']})"
+            )
             self._dye_parts_table.setItem(i, 1, swatch)
 
             self._dye_parts_table.setItem(i, 2, QTableWidgetItem(str(e['r'])))
@@ -7454,10 +7669,17 @@ QCheckBox::indicator {{
     }
 
     def _build_mercenary_tab(self) -> None:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+        from PySide6.QtWidgets import QScrollArea
+
+        tab = QScrollArea()
+        tab.setObjectName("mercenaryScroll")
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
+        tab.setWidget(content)
 
         info = QLabel(
             "Mercenary/Pets — View, rename, and unlock mounts/companions.\n"
@@ -7465,9 +7687,9 @@ QCheckBox::indicator {{
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['text']}; padding: 6px; "
-            f"border: 1px solid {COLORS['accent']}; border-radius: 4px; "
-            f"background-color: rgba(79,195,247,0.08);"
+            f"color: {COLORS['text_dim']}; padding: 5px 10px; "
+            f"border: 0; border-left: 2px solid {COLORS['accent']}; "
+            "background: transparent;"
         )
         layout.addWidget(info)
 
@@ -7552,13 +7774,35 @@ QCheckBox::indicator {{
         dragon_334_btn.clicked.connect(self._unlock_dragon_mount)
         btn_row2.addWidget(dragon_334_btn)
 
-        dragon_nq_btn = QPushButton("Unlock Dragon (No Quest)")
-        dragon_nq_btn.setToolTip("Insert Dragon mount + filtered knowledge keys — no quest changes")
-        dragon_nq_btn.clicked.connect(self._unlock_dragon_mount_no_quests)
-        btn_row2.addWidget(dragon_nq_btn)
+        self._blackstar_dry_run = QCheckBox("Dry run (no changes)")
+        self._blackstar_dry_run.setChecked(True)
+        self._blackstar_dry_run.stateChanged.connect(self._update_blackstar_mode_label)
+        btn_row2.addWidget(self._blackstar_dry_run)
+
+        self._blackstar_btn = QPushButton("Unlock Blackstar (No Quest Changes)")
+        self._blackstar_btn.setToolTip(
+            "Preview or atomically apply legitimate Blackstar ownership. "
+            "Quest and knowledge data are never changed."
+        )
+        self._blackstar_btn.clicked.connect(self._start_blackstar_unlock)
+        btn_row2.addWidget(self._blackstar_btn)
+        self._update_blackstar_mode_label()
 
         btn_row2.addStretch()
         layout.addLayout(btn_row2)
+
+        from crimson_common.blackstar_timer_ui import BlackstarTimerPanel
+        self._blackstar_timer_panel = BlackstarTimerPanel(
+            title="Blackstar Game Settings", parent=self
+        )
+        self._blackstar_timer_panel.status_message.connect(self._update_status)
+        self._blackstar_timer_panel.set_game_path(
+            self._config.get("game_install_path", "")
+        )
+        # Lead the mount workspace with the focused Blackstar surface from the
+        # approved mockup; the legacy roster and experimental tools remain
+        # available below in the scrollable page.
+        layout.insertWidget(0, self._blackstar_timer_panel)
 
         mount_grp = QGroupBox("Unlock Mounts (Experimental)")
         mount_grid = QGridLayout(mount_grp)
@@ -8094,9 +8338,8 @@ QCheckBox::indicator {{
             _ensure = 'Communitydump/desktopeditor'
             if _ensure not in __import__('sys').path:
                 __import__('sys').path.insert(0, _ensure)
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             max_no = 0
             for obj in result['objects']:
                 if 'MercenaryClan' not in obj.class_name:
@@ -8124,12 +8367,8 @@ QCheckBox::indicator {{
             QMessageBox.warning(self, "Entitlements", "Load a save file first.")
             return
         try:
-            sys_path = __import__('sys').path
-            if 'Communitydump/desktopeditor' not in sys_path:
-                sys_path.insert(0, 'Communitydump/desktopeditor')
-            import save_parser as sp
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             lines = []
             found = False
             for obj in result['objects']:
@@ -9518,200 +9757,239 @@ QCheckBox::indicator {{
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Dragon Mount Error", str(e))
 
-    def _unlock_dragon_mount_no_quests(self) -> None:
-        if not self._save_data:
-            QMessageBox.warning(self, "Dragon Mount", "Load a save file first.")
+    def _start_blackstar_unlock(self) -> None:
+        if not self._save_data or not self._loaded_path:
+            QMessageBox.warning(self, "Blackstar", "Load a save file first.")
+            return
+        if self._blackstar_thread is not None:
+            QMessageBox.information(self, "Blackstar", "A Blackstar operation is already running.")
+            return
+        if self._save_data.is_raw_stream or self._save_data.schema_identity is None:
+            QMessageBox.critical(self, "Blackstar", "Blackstar requires an encrypted save file.")
             return
 
-        reply = QMessageBox.warning(
-            self, "Unlock Dragon Mount (No Quests)",
-            "This will:\n"
-            "1. Add Dragon mercenary entry (charKey=1000799)\n"
-            "2. Inject ~150 filtered knowledge entries:\n"
-            "   - Riding, dragon, skills, UI, dyes, tools, minigames\n"
-            "   - No quests/abyss/nodes/factions/regions/NPCs/animals/bosses\n\n"
-            "NO quest changes.\n\n"
-            "Requirements:\n"
-            "- A save with at least one mercenary/horse\n\n"
-            "Continue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        from app_logging import new_operation_id
+        from blackstar_worker import BlackstarWorker
+        dry_run = self._blackstar_dry_run.isChecked()
+        if not dry_run and self._blackstar_preview_token is None:
+            QMessageBox.warning(
+                self, "Blackstar Preview Required",
+                "Run Dry run first. Apply is enabled only for that exact unchanged save.",
+            )
+            return
+
+        current = bytes(self._save_data.decompressed_blob)
+        self._blackstar_input_hash = hashlib.sha256(current).hexdigest()
+        self._blackstar_dry_run_active = dry_run
+        operation_id = new_operation_id("blackstar")
+        thread = QThread(self)
+        worker = BlackstarWorker(
+            blob=current,
+            identity=self._save_data.schema_identity,
+            dry_run=self._blackstar_dry_run_active,
+            operation_id=operation_id,
+            generation=self._save_data.document_generation,
+            loaded_path=self._loaded_path,
+            original_header=self._save_data.raw_header,
+            apply_token=None if dry_run else self._blackstar_preview_token,
         )
-        if reply != QMessageBox.Yes:
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Preparing Blackstar analysis...", "Cancel", 0, 7, self
+        )
+        progress.setWindowTitle("Blackstar Unlock")
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.setValue(0)
+
+        self._blackstar_thread = thread
+        self._blackstar_worker = worker
+        self._blackstar_progress = progress
+        self._set_blackstar_busy(True)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_blackstar_progress)
+        worker.completed.connect(self._finish_blackstar_unlock)
+        worker.failed.connect(self._fail_blackstar_unlock)
+        worker.cancelled.connect(self._cancel_blackstar_unlock)
+        worker.cancellation_changed.connect(self._on_blackstar_cancellation_changed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._cleanup_blackstar_unlock)
+        progress.canceled.connect(worker.request_cancel, Qt.DirectConnection)
+        log.info(
+            "operation=%s blackstar_worker_start dry_run=%s generation=%s "
+            "input_sha256=%s path=%s",
+            operation_id,
+            self._blackstar_dry_run_active,
+            worker.generation,
+            self._blackstar_input_hash,
+            self._loaded_path,
+        )
+        progress.show()
+        thread.start()
+
+    def _update_blackstar_mode_label(self) -> None:
+        if not hasattr(self, "_blackstar_btn") or not hasattr(self, "_blackstar_dry_run"):
             return
+        self._blackstar_btn.setText(
+            "Preview Blackstar" if self._blackstar_dry_run.isChecked()
+            else "Apply & Save Blackstar"
+        )
 
-        self._update_status("Unlocking Dragon mount (no quests)...")
-        QApplication.processEvents()
+    def _set_blackstar_busy(self, busy: bool) -> None:
+        for action_name in (
+            "_open_save_action",
+            "_open_raw_action",
+            "_auto_find_action",
+            "_save_action",
+            "_save_as_action",
+            "_undo_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and self._save_data is not None)
+        if hasattr(self, "_tabs"):
+            self._tabs.setEnabled(not busy)
+        if hasattr(self, "_blackstar_btn"):
+            self._blackstar_btn.setEnabled(not busy)
+        if hasattr(self, "_blackstar_dry_run"):
+            self._blackstar_dry_run.setEnabled(not busy)
 
-        try:
-            import struct
-            import parc_inserter3 as pi
-            sys_path = __import__('sys').path
-            if 'Communitydump/desktopeditor' not in sys_path:
-                sys_path.insert(0, 'Communitydump/desktopeditor')
-            import save_parser as sp
-            import parc_serializer as ps
+    def _update_blackstar_progress(self, event) -> None:
+        if self._blackstar_progress is None:
+            return
+        self._blackstar_progress.setMaximum(event.total)
+        self._blackstar_progress.setValue(event.completed)
+        self._blackstar_progress.setLabelText(event.message)
+        self._update_status(f"Blackstar: {event.message}")
 
-            raw = bytes(self._save_data.decompressed_blob)
-            parc = ps.parse_parc_blob(raw)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            for obj in result['objects']:
-                if 'MercenaryClan' in obj.class_name:
-                    for f in obj.fields:
-                        if f.name == '_mercenaryDataList' and f.list_elements:
-                            for elem in f.list_elements:
-                                if hasattr(elem, 'child_fields') and elem.child_fields:
-                                    for cf in elem.child_fields:
-                                        if cf.name == '_characterKey' and cf.present:
-                                            if struct.unpack_from('<I', raw, cf.start_offset)[0] == 1000799:
-                                                QMessageBox.information(self, "Dragon Mount",
-                                                    "Dragon is already in your mercenary list!")
-                                                return
-
-            name_to_idx = {parc.types[i].name: i for i in range(len(parc.types))}
-            if 'MercenarySaveData' not in name_to_idx:
-                QMessageBox.critical(self, "Dragon Mount",
-                    "This save doesn't have the MercenarySaveData schema type.\n"
-                    "You need a save with mercenaries (at least one horse).")
-                return
-
-            DRAGON_HEX = (
-                "06000519801f0003380000ffffffffffffffff"
-                "591e1200000000005f450f00f90300000000000001"
-                "001c3a0000ffffffffffffffff7b1e120000000000"
-                "0100002e0000ffffffffffffffff911e12000000000004000000"
-                "0100002e0000ffffffffffffffffab1e12000000000004000000"
-                "0100002e0000ffffffffffffffffc51e12000000000004000000"
-                "520000001cdd8dc3000000001cdd8dc30000000001eb7b45c6"
-                "90098144e2862dc59e9c673f0100000001010101010101"
-                "c40900000000000000000000000000b4000000"
-            )
-            dragon_bytes = bytearray(bytes.fromhex(DRAGON_HEX))
-
-            SOURCE_TYPES = {56: 'MercenarySaveData', 58: 'ExperienceLevelSaveData', 46: 'FriendlyDailyCountSaveData'}
-            mbc = struct.unpack_from('<H', dragon_bytes, 0)[0]
-            old_ti = struct.unpack_from('<H', dragon_bytes, 2 + mbc)[0]
-            new_ti = name_to_idx.get(SOURCE_TYPES.get(old_ti, ''), old_ti)
-            struct.pack_into('<H', dragon_bytes, 2 + mbc, new_ti)
-
-            sentinel = b'\xff\xff\xff\xff\xff\xff\xff\xff'
-            for pos in range(23, len(dragon_bytes) - 8):
-                if dragon_bytes[pos:pos+8] == sentinel and pos >= 3:
-                    nested_ti = struct.unpack_from('<H', dragon_bytes, pos - 3)[0]
-                    if nested_ti in SOURCE_TYPES:
-                        target_name = SOURCE_TYPES[nested_ti]
-                        if target_name in name_to_idx:
-                            struct.pack_into('<H', dragon_bytes, pos - 3, name_to_idx[target_name])
-
-            insert_pos = None
-            list_start = None
-            orig_count = 0
-            for obj in result['objects']:
-                if 'MercenaryClan' in obj.class_name:
-                    for f in obj.fields:
-                        if f.name == '_mercenaryDataList' and f.list_elements:
-                            insert_pos = f.list_elements[-1].end_offset
-                            list_start = f.start_offset
-                            orig_count = len(f.list_elements)
-                            break
-                    break
-
-            if insert_pos is None:
-                QMessageBox.critical(self, "Dragon Mount",
-                    "Could not find _mercenaryDataList in your save.")
-                return
-
-            for pos in range(len(dragon_bytes) - 12):
-                if dragon_bytes[pos:pos+8] == sentinel:
-                    po_pos = pos + 8
-                    struct.pack_into('<I', dragon_bytes, po_pos, insert_pos + po_pos + 4)
-
-            blob = bytearray(raw)
-            blob[insert_pos:insert_pos] = dragon_bytes
-            growth = len(dragon_bytes)
-
-            pi._fixup_trailing_sizes(blob, raw, insert_pos, growth, 'MercenaryClanSaveData')
-
-            prefix = blob[list_start]
-            if prefix == 1:
-                old_c = (blob[list_start+1] << 8) | blob[list_start+2]
-                blob[list_start+1] = ((old_c+1) >> 8) & 0xFF
-                blob[list_start+2] = (old_c+1) & 0xFF
-            elif prefix == 0:
-                old_c = blob[list_start+1] | (blob[list_start+2] << 8) | (blob[list_start+3] << 16)
-                blob[list_start+1] = (old_c+1) & 0xFF
-                blob[list_start+2] = ((old_c+1) >> 8) & 0xFF
-
-            merc_toc = None
-            for i, e in enumerate(parc.toc_entries):
-                td = parc.type_by_index.get(e.class_index)
-                if td and 'MercenaryClan' in td.name:
-                    merc_toc = i
-                    break
-
-            po_fixed = pi._fixup_external(blob, raw, parc, merc_toc, insert_pos, growth)
-
-            dragon_knowledge_keys = [
-                40038, 1000174, 1000175, 1000187, 1000189, 1000697, 1000720,
-                1000948, 1001892, 1003893, 1004138, 1004154, 1004176, 1004177,
-                1004178, 2147483119, 2147483121, 2147483122, 2147483123,
-                2147483124, 2147483125, 2147483126, 2147483127, 2147483128,
-                2147483130, 2147483131, 2147483132, 2147483133, 2147483134,
-                2147483135, 2601, 2602, 2603, 2617, 2618,
-                1000560, 1001083, 1003311,
-                40001, 40002, 40003, 40012, 40013, 40014, 40018, 40024, 40028,
-                40030, 40034, 40036, 40039, 40048, 40063, 40064, 40065, 40068,
-                40069, 40071, 40072, 40082, 40086, 40089, 40090, 40091, 40114,
-                1000000, 1000001, 1000013, 1000014, 1000024, 1000034, 1000037,
-                1000100, 1000101, 1000109, 1000134, 1000137, 1000138, 1000210,
-                1000230, 1000490, 1000493, 1000908, 1000929, 1001116, 1001117,
-                1001710, 1001744, 1001756, 1001760, 1001789, 1002348, 1002349,
-                1002351, 1002352, 1002710, 1002741, 1002743, 1003088, 1003090,
-                1003108, 1003245, 1003269, 1003273, 1003274, 1003279, 1003346,
-                1003359, 1003482, 1003505, 1003508, 1003512, 1003513, 1003518,
-                1003519, 1003521, 1003522, 1003523, 1003524, 1003525, 1003571,
-                1000372, 1000375, 1000738, 1001290, 1001297, 1001298, 1001434,
-                1001435, 1001436, 1001453, 1001463, 1001464, 1001465, 1001541,
-                1001542, 1001550, 1001553, 1001704, 1002592, 1003325, 1003334,
-                1003341, 1003467, 1003468, 1003470, 1003472, 1003473, 1003474,
-                1003475, 1003476, 1003477, 1003480, 1003481, 1003492, 1003494,
-                1003495, 1003500, 1003501, 1003502, 1003503, 1003504, 1003507,
-                1003510,
-                1000070, 1000574, 1001100, 1001422,
-                1000297, 1000464, 1000776, 1001287, 1001511, 1001516,
-                2147483447, 2147483454,
-                1001304, 1001664, 1001692, 1001695, 1001700, 1001895, 1001897,
-                1001651, 1002833, 1003658, 1003790,
-            ]
-            ok, new_blob, msg = pi.inject_all_knowledge(blob, keys_filter=dragon_knowledge_keys)
-            if ok:
-                blob = bytearray(new_blob)
-
-            self._save_data.decompressed_blob = bytearray(blob)
-            self._dirty = True
-
-            self._undo_stack.append(UndoEntry(
-                description="Dragon Mount unlock (no quests)",
-                patches=[],
-            ))
-
-            self._populate_equipment()
-            self._populate_inventory()
-            self._update_status(
-                f"Dragon unlocked (no quests)! {orig_count}→{orig_count+1} mercs, "
-                f"{po_fixed} POs fixed. Save with Ctrl+S."
+    def _on_blackstar_cancellation_changed(self, enabled: bool) -> None:
+        if self._blackstar_progress is not None and not enabled:
+            self._blackstar_progress.setCancelButton(None)
+            self._blackstar_progress.setLabelText(
+                "Backing up, writing, and verifying the save; cancellation is disabled..."
             )
 
-            QMessageBox.information(self, "Dragon Mount Unlocked (No Quests)",
-                f"Dragon (Blackstar) added to your mercenary list!\n\n"
-                f"Mercenaries: {orig_count} → {orig_count + 1}\n"
-                f"Quests: NOT modified\n"
-                f"Knowledge: ~150 filtered entries injected\n\n"
-                f"Save (Ctrl+S) and reload in-game.")
+    def _finish_blackstar_unlock(self, worker_result) -> None:
+        worker = self._blackstar_worker
+        if not worker or not self._save_data:
+            return
+        result = worker_result.result
+        current = bytes(self._save_data.decompressed_blob)
+        if self._save_data.document_generation != worker.generation:
+            return self._discard_stale_blackstar_result()
+        if hashlib.sha256(current).hexdigest() != self._blackstar_input_hash:
+            return self._discard_stale_blackstar_result()
+        if self._loaded_path != worker.loaded_path:
+            return self._discard_stale_blackstar_result()
 
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "Dragon Mount Error", str(e))
+        if self._blackstar_dry_run_active:
+            from blackstar_compat import make_blackstar_apply_token
+            self._blackstar_preview_token = make_blackstar_apply_token(
+                self._loaded_path, current, self._save_data.schema_identity,
+                result.candidate_sha256, self._save_data.document_generation,
+                source_file_sha256=self._save_data.source_file_sha256,
+            )
+
+        report = result.report
+        mode = "Dry run" if self._blackstar_dry_run_active else "Apply"
+        details = (
+            f"Mode: {mode}\n"
+            f"Compatibility family: {result.profile_id}\n"
+            f"State: {report.classification_before}\n"
+            f"Action: {report.action}\n"
+            f"Mounts: {report.mount_before} -> {report.mount_after}\n"
+            f"Mercenary number: {report.mercenary_no}\n"
+            f"Equipment item number: {report.item_no}\n"
+            f"Knowledge changes: {report.knowledge_changes}\n"
+            f"Quest completion changes: {report.quest_changes}\n"
+            f"Byte growth: {report.byte_growth}\n"
+            f"Candidate SHA-256: {result.candidate_sha256}"
+        )
+        self._update_status(
+            "Blackstar dry run complete; no bytes changed."
+            if self._blackstar_dry_run_active
+            else (
+                "Blackstar was backed up and written atomically."
+                if worker_result.write_result
+                else "Blackstar unlock was already complete."
+            )
+        )
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.information(self, "Blackstar Unlock Report", details)
+        if str(report.classification_before).startswith("legitimate"):
+            reply = QMessageBox.question(
+                self, "Blackstar Already Unlocked",
+                "Blackstar is already unlocked on this save.\n\n"
+                "Want the reduced summon cooldown too? That is the Blackstar\n"
+                "Game Settings panel at the top of this page (Preview, then\n"
+                "Apply) — it patches the game folder, not the save.\n\n"
+                "Jump to it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._focus_blackstar_timer_panel()
+        if not self._blackstar_dry_run_active and worker_result.write_result:
+            path = self._loaded_path
+            self._blackstar_preview_token = None
+            self._load_save(path)
+
+    def _focus_blackstar_timer_panel(self) -> None:
+        panel = getattr(self, '_blackstar_timer_panel', None)
+        if panel is None:
+            return
+        from PySide6.QtWidgets import QScrollArea
+        parent = panel.parent()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parent()
+        if isinstance(parent, QScrollArea):
+            parent.ensureWidgetVisible(panel)
+        panel.setFocus(Qt.OtherFocusReason)
+
+    def _discard_stale_blackstar_result(self) -> None:
+        log.warning("Discarded stale Blackstar worker result")
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.warning(
+            self,
+            "Blackstar Result Discarded",
+            "The loaded save changed while the operation was running. "
+            "No Blackstar result was applied.",
+        )
+
+    def _fail_blackstar_unlock(self, message: str, traceback_text: str) -> None:
+        log.error("Blackstar worker failed: %s\n%s", message, traceback_text)
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        QMessageBox.critical(
+            self,
+            "Blackstar Unlock Failed",
+            f"{message}\n\nThe save was not changed. See the application log for details.",
+        )
+
+    def _cancel_blackstar_unlock(self) -> None:
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        self._update_status("Blackstar operation cancelled; no result applied.")
+
+    def _cleanup_blackstar_unlock(self) -> None:
+        thread = self._blackstar_thread
+        if self._blackstar_progress is not None:
+            self._blackstar_progress.close()
+        self._blackstar_progress = None
+        self._blackstar_worker = None
+        self._blackstar_thread = None
+        self._set_blackstar_busy(False)
+        self._update_schema_write_controls()
+        if thread is not None:
+            thread.deleteLater()
 
     def _build_quest_placeholder(self) -> None:
         pass
@@ -9840,7 +10118,7 @@ QCheckBox::indicator {{
             import save_parser as sp
 
             raw = self._save_data.decompressed_blob
-            result = sp.build_result_from_raw(bytes(raw), {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
 
             mission_names = {}
             try:
@@ -10409,7 +10687,7 @@ QCheckBox::indicator {{
                 from quest_deep_parser import parse_quest_deep
 
                 raw = bytes(self._save_data.decompressed_blob)
-                _result = _sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+                _result = self._get_parse_result()
 
                 _base = getattr(_sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
                 _qn = {}
@@ -11398,13 +11676,7 @@ QCheckBox::indicator {{
         raw = bytes(blob)
 
         try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
         except Exception as e:
             QMessageBox.critical(self, "Diagnose", f"Parse error: {e}")
             return
@@ -11504,9 +11776,9 @@ QCheckBox::indicator {{
             QMessageBox.warning(self, "Scan Slots", "Load a save file first.")
             return
         save_dir = os.path.dirname(os.path.dirname(self._loaded_path))
+        loaded_path = os.path.abspath(self._loaded_path)
 
         self._qe_status.setText(f"Scanning all slots for quest {quest_key}...")
-        QApplication.processEvents()
 
         STATE_NAMES = {
             0x01: "Locked", 0x02: "Available", 0x03: "Available+",
@@ -11516,92 +11788,105 @@ QCheckBox::indicator {{
             0x1105: "Completed", 0x1502: "Side Content", 0x1905: "Fully Completed",
         }
 
-        lines = [f"Cross-Slot Scan: {quest_name} (key={quest_key})", "=" * 50, ""]
+        def _task(report):
+            lines = [f"Cross-Slot Scan: {quest_name} (key={quest_key})", "=" * 50, ""]
+            try:
+                _mydir = os.path.dirname(os.path.abspath(__file__))
+                for d in ['Communitydump/desktopeditor', 'desktopeditor']:
+                    p = os.path.join(_mydir, d)
+                    if os.path.isdir(p) and p not in sys.path:
+                        sys.path.insert(0, p)
+                from save_parser import build_result_from_raw
 
-        try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
+                slot_names = {"slot0": "Auto 1", "slot1": "Auto 2", "slot2": "Auto 3"}
+                for i in range(100, 110):
+                    slot_names[f"slot{i}"] = f"Manual {i-99}"
 
-            slot_names = {"slot0": "Auto 1", "slot1": "Auto 2", "slot2": "Auto 3"}
-            for i in range(100, 110):
-                slot_names[f"slot{i}"] = f"Manual {i-99}"
+                slot_paths = sorted(glob.glob(os.path.join(save_dir, 'slot*', 'save.save')))
+                for index, slot_path in enumerate(slot_paths):
+                    slot_id = os.path.basename(os.path.dirname(slot_path))
+                    slot_label = slot_names.get(slot_id, slot_id)
+                    report(
+                        f"Decoding {slot_label} ({index + 1}/{len(slot_paths)})...",
+                        int(index / max(1, len(slot_paths)) * 95),
+                    )
+                    is_loaded = os.path.abspath(slot_path) == loaded_path
 
-            for slot_path in sorted(glob.glob(os.path.join(save_dir, 'slot*', 'save.save'))):
-                slot_id = os.path.basename(os.path.dirname(slot_path))
-                slot_label = slot_names.get(slot_id, slot_id)
-                is_loaded = os.path.abspath(slot_path) == os.path.abspath(self._loaded_path)
+                    try:
+                        sd = load_save_file(slot_path)
+                        raw = bytes(sd.decompressed_blob)
+                        result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
 
-                try:
-                    sd = load_save_file(slot_path)
-                    raw = bytes(sd.decompressed_blob)
-                    result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-                    found = []
-                    for obj in result['objects']:
-                        if obj.class_name not in ('QuestSaveData', 'MissionSaveData'):
-                            continue
-                        for f in obj.fields:
-                            if not f.list_elements:
+                        found = []
+                        for obj in result['objects']:
+                            if obj.class_name not in ('QuestSaveData', 'MissionSaveData'):
                                 continue
-                            for elem in f.list_elements:
-                                if not elem.child_fields:
+                            for f in obj.fields:
+                                if not f.list_elements:
                                     continue
-                                qk = None
-                                state = None
-                                has_ct = False
-                                has_bt = False
-                                for cf in elem.child_fields:
-                                    if cf.name in ('_key', '_questKey') and cf.present:
-                                        qk = _s.unpack_from('<I', raw, cf.start_offset)[0]
-                                    if cf.name == '_state' and cf.present:
-                                        sz = cf.end_offset - cf.start_offset
-                                        state = raw[cf.start_offset] if sz == 1 else _s.unpack_from('<I', raw, cf.start_offset)[0]
-                                    if cf.name == '_completedTime' and cf.present:
-                                        has_ct = True
-                                    if cf.name == '_branchedTime' and cf.present:
-                                        has_bt = True
-                                if qk == quest_key:
-                                    sn = STATE_NAMES.get(state, f"0x{state:X}")
-                                    flags = []
-                                    if has_ct:
-                                        flags.append("completedTime")
-                                    if has_bt:
-                                        flags.append("branchedTime")
-                                    flag_str = f" [{', '.join(flags)}]" if flags else " [no timestamps]"
-                                    found.append(f"state=0x{state:X} ({sn}){flag_str}")
+                                for elem in f.list_elements:
+                                    if not elem.child_fields:
+                                        continue
+                                    qk = None
+                                    state = None
+                                    has_ct = False
+                                    has_bt = False
+                                    for cf in elem.child_fields:
+                                        if cf.name in ('_key', '_questKey') and cf.present:
+                                            qk = _s.unpack_from('<I', raw, cf.start_offset)[0]
+                                        if cf.name == '_state' and cf.present:
+                                            sz = cf.end_offset - cf.start_offset
+                                            state = raw[cf.start_offset] if sz == 1 else _s.unpack_from('<I', raw, cf.start_offset)[0]
+                                        if cf.name == '_completedTime' and cf.present:
+                                            has_ct = True
+                                        if cf.name == '_branchedTime' and cf.present:
+                                            has_bt = True
+                                    if qk == quest_key:
+                                        sn = STATE_NAMES.get(state, f"0x{state:X}")
+                                        flags = []
+                                        if has_ct:
+                                            flags.append("completedTime")
+                                        if has_bt:
+                                            flags.append("branchedTime")
+                                        flag_str = f" [{', '.join(flags)}]" if flags else " [no timestamps]"
+                                        found.append(f"state=0x{state:X} ({sn}){flag_str}")
 
-                    marker = " <<< LOADED" if is_loaded else ""
-                    if found:
-                        for f in found:
-                            lines.append(f"  {slot_id} ({slot_label}): {f}{marker}")
-                    else:
-                        lines.append(f"  {slot_id} ({slot_label}): NOT FOUND{marker}")
-                except Exception as e:
-                    lines.append(f"  {slot_id}: error ({e})")
+                        marker = " <<< LOADED" if is_loaded else ""
+                        if found:
+                            for f in found:
+                                lines.append(f"  {slot_id} ({slot_label}): {f}{marker}")
+                        else:
+                            lines.append(f"  {slot_id} ({slot_label}): NOT FOUND{marker}")
+                    except Exception as e:
+                        lines.append(f"  {slot_id}: error ({e})")
 
-        except Exception as e:
-            lines.append(f"Error: {e}")
+            except Exception as e:
+                lines.append(f"Error: {e}")
+            return lines
 
-        self._qe_status.setText(f"Scan complete")
+        def _completed(lines) -> None:
+            self._qe_status.setText("Scan complete")
+            report_text = "\n".join(lines)
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Cross-Slot Scan: {quest_name}")
+            dlg.resize(650, 450)
+            dl = QVBoxLayout(dlg)
+            txt = QTextEdit()
+            txt.setReadOnly(True)
+            txt.setFont(QFont("Consolas", 10))
+            txt.setPlainText(report_text)
+            dl.addWidget(txt)
+            copy_btn = QPushButton("Copy to Clipboard")
+            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(report_text))
+            dl.addWidget(copy_btn)
+            dlg.exec()
 
-        report = "\n".join(lines)
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Cross-Slot Scan: {quest_name}")
-        dlg.resize(650, 450)
-        dl = QVBoxLayout(dlg)
-        txt = QTextEdit()
-        txt.setReadOnly(True)
-        txt.setFont(QFont("Consolas", 10))
-        txt.setPlainText(report)
-        dl.addWidget(txt)
-        copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(report))
-        dl.addWidget(copy_btn)
-        dlg.exec()
+        self._run_blocking_task(
+            title="Cross-Slot Scan",
+            message=f"Scanning save slots for quest {quest_key}...",
+            task=_task,
+            completed=_completed,
+        )
 
     def _qe_health_check(self) -> None:
         if not self._save_data:
@@ -11616,13 +11901,7 @@ QCheckBox::indicator {{
         raw = bytes(blob)
 
         try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
         except Exception as e:
             QMessageBox.critical(self, "Health Check", f"Parse error: {e}")
             return
@@ -14248,16 +14527,72 @@ QCheckBox::indicator {{
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Pack Error", str(e))
 
+    def _run_blocking_task(
+        self,
+        *,
+        title: str,
+        message: str,
+        task,
+        completed,
+        failed=None,
+    ) -> None:
+        """Run a long task off the GUI thread behind a modal busy dialog.
+
+        The WindowModal dialog blocks interaction, so save state cannot be
+        edited while the worker runs; ``task(report)`` executes on a worker
+        thread and ``completed``/``failed`` run on the GUI thread after the
+        dialog closes. Use for every operation that can take more than a
+        moment: injections, scans, exports.
+        """
+        from crimson_common.gui_task_worker import start_gui_task
+
+        progress = QProgressDialog(message, "", 0, 100, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        def _on_progress(text: str, value: int) -> None:
+            progress.setLabelText(text)
+            progress.setValue(max(0, min(99, int(value))))
+
+        def _on_completed(result) -> None:
+            progress.setValue(100)
+            progress.close()
+            completed(result)
+
+        def _on_failed(message_text: str, details: str) -> None:
+            progress.close()
+            if failed is not None:
+                failed(message_text, details)
+            else:
+                log.error("%s failed: %s\n%s", title, message_text, details)
+                QMessageBox.critical(self, title, f"{message_text}\n\n{details}")
+
+        start_gui_task(
+            self,
+            task=task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+        )
+
     def _know_inject_keys(self, keys: list) -> None:
         self._know_status.setText(f"Injecting {len(keys)} entries...")
-        QApplication.processEvents()
+        save_data = self._save_data
+        blob = bytearray(save_data.decompressed_blob)
 
-        try:
+        def _task(report):
+            report(f"Injecting {len(keys)} knowledge entries...", 30)
             from parc_inserter3 import inject_all_knowledge
+            return inject_all_knowledge(blob, keys_filter=keys)
 
-            blob = bytearray(self._save_data.decompressed_blob)
-            ok, new_blob, msg = inject_all_knowledge(blob, keys_filter=keys)
-
+        def _completed(result) -> None:
+            if self._save_data is not save_data:
+                return
+            ok, new_blob, msg = result
             if ok:
                 self._save_data.decompressed_blob = bytearray(new_blob)
                 self._dirty = True
@@ -14278,10 +14613,18 @@ QCheckBox::indicator {{
                 self._know_status.setText(f"Failed: {msg}")
                 QMessageBox.critical(self, "Injection Failed", msg)
 
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._know_status.setText(f"Error: {e}")
-            QMessageBox.critical(self, "Error", str(e))
+        def _failed(message: str, details: str) -> None:
+            log.error("Knowledge injection failed: %s\n%s", message, details)
+            self._know_status.setText(f"Error: {message}")
+            QMessageBox.critical(self, "Error", message)
+
+        self._run_blocking_task(
+            title="Injecting Knowledge",
+            message=f"Injecting {len(keys)} knowledge entries...",
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+        )
 
 
     def _build_player_tab(self) -> None:
@@ -15099,11 +15442,151 @@ QCheckBox::indicator {{
 
         return best or []
 
-    def _populate_faction_tab(self) -> None:
+    @staticmethod
+    def _load_game_map_names() -> dict:
+        from parse_reuse import load_game_map_names
+        return load_game_map_names()
+
+    def _get_parse_result(self):
+        """Full parse of the current save, reused until the blob is replaced.
+
+        In-place byte edits keep every cached offset valid; structural edits
+        replace decompressed_blob, which bumps SaveData.parse_epoch and makes
+        the next call re-parse.
+        """
+        if not self._save_data:
+            return None
+        cached = self._parse_cache.get(self._save_data)
+        if cached is not None:
+            return cached
+        import sys as _sys
+        _sys.path.insert(0, 'Communitydump/desktopeditor')
+        from save_parser import build_result_from_raw
+        result = build_result_from_raw(
+            bytes(self._save_data.decompressed_blob), {'input_kind': 'raw_blob'}
+        )
+        self._parse_cache.store(self._save_data, result)
+        return result
+
+    @staticmethod
+    def _extract_faction_entries(raw: bytes, result) -> tuple:
+        elem_entries = []
+        node_entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'FactionSaveData':
+                continue
+            for f in obj.fields:
+                if f.name == '_factionElementSaveDataList' and f.list_elements:
+                    for elem in f.list_elements:
+                        if not elem.child_fields:
+                            continue
+                        entry = {}
+                        for cf in elem.child_fields:
+                            if cf.present:
+                                sz = cf.end_offset - cf.start_offset
+                                if sz <= 4:
+                                    entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                                elif sz == 1:
+                                    entry[cf.name] = raw[cf.start_offset]
+                        elem_entries.append(entry)
+
+                elif f.name == '_factionNodeElementSaveDataList' and f.list_elements:
+                    for elem in f.list_elements:
+                        if not elem.child_fields:
+                            continue
+                        entry = {}
+                        offsets = {}
+                        for cf in elem.child_fields:
+                            if cf.present:
+                                sz = cf.end_offset - cf.start_offset
+                                offsets[cf.name] = (cf.start_offset, sz)
+                                if sz == 1:
+                                    entry[cf.name] = raw[cf.start_offset]
+                                elif sz == 2:
+                                    entry[cf.name] = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                                elif sz == 4:
+                                    entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                        entry['_offsets'] = offsets
+                        node_entries.append(entry)
+        return elem_entries, node_entries
+
+    def _apply_faction_tables(self, names: dict, elem_entries: list, node_entries: list) -> None:
+        faction_names = names['factions']
+        node_names = names['factionnodes']
+        char_names = names['characters']
+
+        table = self._faction_elem_table
+        table.setRowCount(len(elem_entries))
+        for r, entry in enumerate(elem_entries):
+            owner = entry.get('_ownerFactionKey', 0)
+            fname = faction_names.get(owner, '')
+            display = f"{fname} ({owner})" if fname else str(owner)
+            table.setItem(r, 0, QTableWidgetItem(display))
+
+            leader = entry.get('_leaderCharacterKey', 0)
+            lname = char_names.get(leader, '')
+            table.setItem(r, 1, QTableWidgetItem(f"{lname} ({leader})" if lname and leader else str(leader) if leader else "—"))
+
+            parent = entry.get('_parentFactionKey', 0)
+            pname = faction_names.get(parent, '')
+            table.setItem(r, 2, QTableWidgetItem(f"{pname} ({parent})" if pname else str(parent) if parent else "—"))
+
+            rg = entry.get('_relationGroupKey', 0)
+            table.setItem(r, 3, QTableWidgetItem(str(rg) if rg else "—"))
+
+        STATE_LABELS = {0: "Undiscovered", 1: "Discovered", 2: "Active", 3: "Conquered", 4: "Lost"}
+        self._faction_node_entries = node_entries
+
+        table2 = self._faction_node_table
+        table2.setRowCount(len(node_entries))
+        for r, entry in enumerate(node_entries):
+            owner = entry.get('_ownerFactionKey', 0)
+            nname = node_names.get(owner, faction_names.get(owner, ''))
+            display = f"{nname} ({owner})" if nname else str(owner)
+            owner_w = QTableWidgetItem(display)
+            owner_w.setData(Qt.UserRole, r)
+            table2.setItem(r, 0, owner_w)
+
+            state = entry.get('_factionState', 0)
+            state_w = QTableWidgetItem(STATE_LABELS.get(state, str(state)))
+            if state == 2:
+                state_w.setForeground(QBrush(QColor(COLORS['success'])))
+            elif state == 3:
+                state_w.setForeground(QBrush(QColor(COLORS['accent'])))
+            table2.setItem(r, 1, state_w)
+
+            conq = entry.get('_conquerorFactionKey', 0)
+            cname = faction_names.get(conq, '')
+            table2.setItem(r, 2, QTableWidgetItem(f"{cname} ({conq})" if cname else str(conq) if conq else "—"))
+
+            is_cap = entry.get('_isCapital', 0)
+            cap_w = QTableWidgetItem("Yes" if is_cap else "")
+            if is_cap:
+                cap_w.setForeground(QBrush(QColor(COLORS['accent'])))
+            table2.setItem(r, 3, cap_w)
+
+            extras = {k: v for k, v in entry.items()
+                      if k not in ('_ownerFactionKey', '_factionState', '_conquerorFactionKey', '_isCapital')
+                      and v and v != 0}
+            table2.setItem(r, 4, QTableWidgetItem(", ".join(f"{k}={v}" for k, v in extras.items())))
+
+        self._faction_count.setText(
+            f"{len(elem_entries)} factions, {len(node_entries)} nodes"
+        )
+
+    def _populate_faction_tab(self, done_message: str | None = None) -> None:
         if not hasattr(self, '_faction_elem_table'):
             return
         self._faction_elem_table.setRowCount(0)
         self._faction_node_table.setRowCount(0)
+        if hasattr(self, '_bond_table'):
+            self._bond_table.setRowCount(0)
+        if hasattr(self, '_sublevel_table'):
+            self._sublevel_table.setRowCount(0)
         self._faction_reward_spin.setValue(0)
         self._faction_reward_offset = -1
         self._faction_count.setText("")
@@ -15111,285 +15594,215 @@ QCheckBox::indicator {{
         if not self._save_data:
             return
 
-        faction_names = {}
-        node_names = {}
-        char_names = {}
-        try:
-            _base = getattr(__import__('sys'), '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-            gm_path = os.path.join(_base, 'game_map.json')
-            if os.path.isfile(gm_path):
-                with open(gm_path, 'r', encoding='utf-8') as f:
-                    gm = json.load(f)
-                for k, v in gm.get('factions', {}).items():
-                    if isinstance(v, dict):
-                        faction_names[int(k)] = v.get('name', '')
-                for k, v in gm.get('factionnodes', {}).items():
-                    if isinstance(v, dict):
-                        node_names[int(k)] = v.get('name', '')
-                for k, v in gm.get('characters', {}).items():
-                    if isinstance(v, dict):
-                        char_names[int(k)] = v.get('name', '')
-                    elif isinstance(v, str):
-                        char_names[int(k)] = v
-        except Exception:
-            pass
+        if getattr(self, '_faction_populate_handle', None) is not None:
+            self._faction_populate_rerun = True
+            self._faction_populate_rerun_message = done_message
+            return
 
-        try:
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
-            raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+        from crimson_common.gui_task_worker import start_gui_task
 
-            elem_entries = []
-            node_entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'FactionSaveData':
+        save_data = self._save_data
+        raw = bytes(save_data.decompressed_blob)
+        epoch_at_start = getattr(save_data, 'parse_epoch', 0)
+        cached_result = self._parse_cache.get(save_data)
+        if hasattr(self, '_name_db'):
+            name_lookup = self._name_db.get_name
+        else:
+            def name_lookup(key):
+                return f"Char_{key}"
+
+        self._faction_count.setText("Parsing faction data...")
+
+        def _task(report):
+            report("Parsing faction data...", 15)
+            if cached_result is not None:
+                result = cached_result
+            else:
+                import sys as _sys
+                _sys.path.insert(0, 'Communitydump/desktopeditor')
+                from save_parser import build_result_from_raw
+                result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            report("Extracting faction entries...", 80)
+            names = MainWindow._load_game_map_names()
+            elem_entries, node_entries = MainWindow._extract_faction_entries(raw, result)
+            bond_entries = MainWindow._extract_bond_entries(raw, result, name_lookup)
+            sublevel_entries = MainWindow._extract_sublevel_entries(raw, result, names['sublevels'])
+            return result, names, elem_entries, node_entries, bond_entries, sublevel_entries
+
+        def _completed(payload) -> None:
+            if self._save_data is not save_data:
+                return
+            parsed, names, elem_entries, node_entries, bond_entries, sublevel_entries = payload
+            if getattr(save_data, 'parse_epoch', 0) == epoch_at_start:
+                self._parse_cache.store(save_data, parsed)
+            try:
+                self._apply_faction_tables(names, elem_entries, node_entries)
+                self._apply_bond_entries(bond_entries)
+                self._apply_sublevel_entries(sublevel_entries)
+                if done_message:
+                    self._faction_count.setText(done_message)
+            except Exception as exc:
+                log.warning("Faction tab populate failed: %s", exc)
+                self._faction_count.setText(f"Parse error: {exc}")
+
+        def _failed(message: str, details: str) -> None:
+            log.warning("Faction tab populate failed: %s\n%s", message, details)
+            if self._save_data is save_data:
+                self._faction_count.setText(f"Parse error: {message}")
+
+        def _finished() -> None:
+            self._faction_populate_handle = None
+            rerun = getattr(self, '_faction_populate_rerun', False)
+            message = getattr(self, '_faction_populate_rerun_message', None)
+            self._faction_populate_rerun = False
+            self._faction_populate_rerun_message = None
+            if rerun:
+                self._populate_faction_tab(done_message=message)
+
+        self._faction_populate_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            finished=_finished,
+        )
+
+    @staticmethod
+    def _extract_bond_entries(raw: bytes, result, name_lookup) -> list:
+        CHAR_NAMES = {
+            1: "Kliff", 4: "Damiane", 6: "Oongka",
+            1003918: "Silver Fang (Wolf)", 1003917: "White Bear",
+            1001173: "Damiane's Horse", 1001172: "Oongka's Horse",
+            1003120: "Kliff's Horse", 1000799: "Dragon",
+        }
+
+        entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'FriendlySaveData':
+                continue
+            for f in obj.fields:
+                if f.name != '_friendlyDataList' or not f.list_elements:
                     continue
-                for f in obj.fields:
-                    if f.name == '_factionElementSaveDataList' and f.list_elements:
-                        for elem in f.list_elements:
-                            if not elem.child_fields:
-                                continue
-                            entry = {}
-                            for cf in elem.child_fields:
-                                if cf.present:
-                                    sz = cf.end_offset - cf.start_offset
-                                    if sz <= 4:
-                                        entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                                    elif sz == 1:
-                                        entry[cf.name] = raw[cf.start_offset]
-                            elem_entries.append(entry)
+                for elem in f.list_elements:
+                    if not elem.child_fields:
+                        continue
+                    char_key = 0
+                    level = 0
+                    exp = 0
+                    for cf in elem.child_fields:
+                        if cf.name == '_characterKey' and cf.present:
+                            char_key = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                        elif cf.name == '_levelData' and cf.child_fields:
+                            for lcf in cf.child_fields:
+                                if not lcf.present:
+                                    continue
+                                sz = lcf.end_offset - lcf.start_offset
+                                if lcf.name == '_level':
+                                    level = struct.unpack_from('<I', raw, lcf.start_offset)[0] if sz == 4 else raw[lcf.start_offset]
+                                elif lcf.name == '_exp':
+                                    exp = struct.unpack_from('<Q', raw, lcf.start_offset)[0] if sz == 8 else struct.unpack_from('<I', raw, lcf.start_offset)[0]
+                    exp_offset = 0
+                    level_offset = 0
+                    for cf in elem.child_fields:
+                        if cf.name == '_levelData' and cf.child_fields:
+                            for lcf in cf.child_fields:
+                                if lcf.present:
+                                    if lcf.name == '_exp':
+                                        exp_offset = lcf.start_offset
+                                    elif lcf.name == '_level':
+                                        level_offset = lcf.start_offset
+                    name = CHAR_NAMES.get(char_key, name_lookup(char_key))
+                    entries.append((name, char_key, level, exp, exp_offset, level_offset))
+        return entries
 
-                    elif f.name == '_factionNodeElementSaveDataList' and f.list_elements:
-                        for elem in f.list_elements:
-                            if not elem.child_fields:
-                                continue
-                            entry = {}
-                            offsets = {}
-                            for cf in elem.child_fields:
-                                if cf.present:
-                                    sz = cf.end_offset - cf.start_offset
-                                    offsets[cf.name] = (cf.start_offset, sz)
-                                    if sz == 1:
-                                        entry[cf.name] = raw[cf.start_offset]
-                                    elif sz == 2:
-                                        entry[cf.name] = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                                    elif sz == 4:
-                                        entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                            entry['_offsets'] = offsets
-                            node_entries.append(entry)
-
-            table = self._faction_elem_table
-            table.setRowCount(len(elem_entries))
-            for r, entry in enumerate(elem_entries):
-                owner = entry.get('_ownerFactionKey', 0)
-                fname = faction_names.get(owner, '')
-                display = f"{fname} ({owner})" if fname else str(owner)
-                table.setItem(r, 0, QTableWidgetItem(display))
-
-                leader = entry.get('_leaderCharacterKey', 0)
-                lname = char_names.get(leader, '')
-                table.setItem(r, 1, QTableWidgetItem(f"{lname} ({leader})" if lname and leader else str(leader) if leader else "—"))
-
-                parent = entry.get('_parentFactionKey', 0)
-                pname = faction_names.get(parent, '')
-                table.setItem(r, 2, QTableWidgetItem(f"{pname} ({parent})" if pname else str(parent) if parent else "—"))
-
-                rg = entry.get('_relationGroupKey', 0)
-                table.setItem(r, 3, QTableWidgetItem(str(rg) if rg else "—"))
-
-            STATE_LABELS = {0: "Undiscovered", 1: "Discovered", 2: "Active", 3: "Conquered", 4: "Lost"}
-            self._faction_node_entries = node_entries
-
-            table2 = self._faction_node_table
-            table2.setRowCount(len(node_entries))
-            for r, entry in enumerate(node_entries):
-                owner = entry.get('_ownerFactionKey', 0)
-                nname = node_names.get(owner, faction_names.get(owner, ''))
-                display = f"{nname} ({owner})" if nname else str(owner)
-                owner_w = QTableWidgetItem(display)
-                owner_w.setData(Qt.UserRole, r)
-                table2.setItem(r, 0, owner_w)
-
-                state = entry.get('_factionState', 0)
-                state_w = QTableWidgetItem(STATE_LABELS.get(state, str(state)))
-                if state == 2:
-                    state_w.setForeground(QBrush(QColor(COLORS['success'])))
-                elif state == 3:
-                    state_w.setForeground(QBrush(QColor(COLORS['accent'])))
-                table2.setItem(r, 1, state_w)
-
-                conq = entry.get('_conquerorFactionKey', 0)
-                cname = faction_names.get(conq, '')
-                table2.setItem(r, 2, QTableWidgetItem(f"{cname} ({conq})" if cname else str(conq) if conq else "—"))
-
-                is_cap = entry.get('_isCapital', 0)
-                cap_w = QTableWidgetItem("Yes" if is_cap else "")
-                if is_cap:
-                    cap_w.setForeground(QBrush(QColor(COLORS['accent'])))
-                table2.setItem(r, 3, cap_w)
-
-                extras = {k: v for k, v in entry.items()
-                          if k not in ('_ownerFactionKey', '_factionState', '_conquerorFactionKey', '_isCapital')
-                          and v and v != 0}
-                table2.setItem(r, 4, QTableWidgetItem(", ".join(f"{k}={v}" for k, v in extras.items())))
-
-            self._faction_count.setText(
-                f"{len(elem_entries)} factions, {len(node_entries)} nodes"
-            )
-
-        except Exception as exc:
-            import traceback; traceback.print_exc()
-            log.warning("Faction tab populate failed: %s", exc)
-            self._faction_count.setText(f"Parse error: {exc}")
-
-        self._populate_bonds()
-        self._populate_sublevels()
+    def _apply_bond_entries(self, entries: list) -> None:
+        self._bond_entries = entries
+        self._bond_table.setRowCount(len(entries))
+        for r, (name, key, level, exp, exp_off, lvl_off) in enumerate(entries):
+            self._bond_table.setItem(r, 0, QTableWidgetItem(name))
+            self._bond_table.setItem(r, 1, QTableWidgetItem(str(key)))
+            lvl_w = QTableWidgetItem(f"Lv {level}, XP {exp}")
+            lvl_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'level_offset': lvl_off, 'exp': exp, 'level': level})
+            if level > 0:
+                lvl_w.setForeground(QBrush(QColor(COLORS['success'])))
+            self._bond_table.setItem(r, 2, lvl_w)
 
     def _populate_bonds(self) -> None:
         if not hasattr(self, '_bond_table') or not self._save_data:
             return
         self._bond_table.setRowCount(0)
         try:
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            CHAR_NAMES = {
-                1: "Kliff", 4: "Damiane", 6: "Oongka",
-                1003918: "Silver Fang (Wolf)", 1003917: "White Bear",
-                1001173: "Damiane's Horse", 1001172: "Oongka's Horse",
-                1003120: "Kliff's Horse", 1000799: "Dragon",
-            }
-
-            entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'FriendlySaveData':
-                    continue
-                for f in obj.fields:
-                    if f.name != '_friendlyDataList' or not f.list_elements:
-                        continue
-                    for elem in f.list_elements:
-                        if not elem.child_fields:
-                            continue
-                        char_key = 0
-                        level = 0
-                        exp = 0
-                        for cf in elem.child_fields:
-                            if cf.name == '_characterKey' and cf.present:
-                                char_key = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                            elif cf.name == '_levelData' and cf.child_fields:
-                                for lcf in cf.child_fields:
-                                    if not lcf.present:
-                                        continue
-                                    sz = lcf.end_offset - lcf.start_offset
-                                    if lcf.name == '_level':
-                                        level = struct.unpack_from('<I', raw, lcf.start_offset)[0] if sz == 4 else raw[lcf.start_offset]
-                                    elif lcf.name == '_exp':
-                                        exp = struct.unpack_from('<Q', raw, lcf.start_offset)[0] if sz == 8 else struct.unpack_from('<I', raw, lcf.start_offset)[0]
-                        exp_offset = 0
-                        level_offset = 0
-                        for cf in elem.child_fields:
-                            if cf.name == '_levelData' and cf.child_fields:
-                                for lcf in cf.child_fields:
-                                    if lcf.present:
-                                        if lcf.name == '_exp':
-                                            exp_offset = lcf.start_offset
-                                        elif lcf.name == '_level':
-                                            level_offset = lcf.start_offset
-                        name = CHAR_NAMES.get(char_key, self._name_db.get_name(char_key) if hasattr(self, '_name_db') else f"Char_{char_key}")
-                        entries.append((name, char_key, level, exp, exp_offset, level_offset))
-
-            self._bond_entries = entries
-            self._bond_table.setRowCount(len(entries))
-            for r, (name, key, level, exp, exp_off, lvl_off) in enumerate(entries):
-                self._bond_table.setItem(r, 0, QTableWidgetItem(name))
-                self._bond_table.setItem(r, 1, QTableWidgetItem(str(key)))
-                lvl_w = QTableWidgetItem(f"Lv {level}, XP {exp}")
-                lvl_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'level_offset': lvl_off, 'exp': exp, 'level': level})
-                if level > 0:
-                    lvl_w.setForeground(QBrush(QColor(COLORS['success'])))
-                self._bond_table.setItem(r, 2, lvl_w)
+            result = self._get_parse_result()
+            if hasattr(self, '_name_db'):
+                name_lookup = self._name_db.get_name
+            else:
+                def name_lookup(key):
+                    return f"Char_{key}"
+            self._apply_bond_entries(self._extract_bond_entries(raw, result, name_lookup))
         except Exception as e:
             log.warning("Bond populate failed: %s", e)
+
+    @staticmethod
+    def _extract_sublevel_entries(raw: bytes, result, sublevel_names: dict) -> list:
+        entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'SubLevelSaveData':
+                continue
+            for f in obj.fields:
+                if not f.list_elements:
+                    continue
+                for elem in f.list_elements:
+                    if not elem.child_fields:
+                        continue
+                    key = 0
+                    exp = 0
+                    for cf in elem.child_fields:
+                        if cf.present:
+                            sz = cf.end_offset - cf.start_offset
+                            if cf.name == '_key':
+                                if sz == 4:
+                                    key = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 2:
+                                    key = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                            elif cf.name in ('_experience', '_currentExp'):
+                                if sz == 4:
+                                    exp = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    exp = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                                elif sz == 2:
+                                    exp = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                    exp_offset = 0
+                    for cf in elem.child_fields:
+                        if cf.present and cf.name in ('_experience', '_currentExp'):
+                            exp_offset = cf.start_offset
+                    name = sublevel_names.get(key, f"SubLevel_{key}")
+                    entries.append((key, name, exp, exp_offset))
+        return entries
+
+    def _apply_sublevel_entries(self, entries: list) -> None:
+        self._sublevel_entries = entries
+        self._sublevel_table.setRowCount(len(entries))
+        for r, (key, name, exp, exp_off) in enumerate(entries):
+            self._sublevel_table.setItem(r, 0, QTableWidgetItem(str(key)))
+            self._sublevel_table.setItem(r, 1, QTableWidgetItem(name))
+            exp_w = QTableWidgetItem(str(exp))
+            exp_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'exp': exp})
+            if exp > 0:
+                exp_w.setForeground(QBrush(QColor(COLORS['success'])))
+            self._sublevel_table.setItem(r, 2, exp_w)
 
     def _populate_sublevels(self) -> None:
         if not hasattr(self, '_sublevel_table') or not self._save_data:
             return
         self._sublevel_table.setRowCount(0)
         try:
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            sublevel_names = {}
-            try:
-                _base = getattr(_sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-                gm_path = os.path.join(_base, 'game_map.json')
-                if os.path.isfile(gm_path):
-                    with open(gm_path, 'r', encoding='utf-8') as f:
-                        gm = json.load(f)
-                    for k, v in gm.get('sublevels', {}).items():
-                        if isinstance(v, dict):
-                            sublevel_names[int(k)] = v.get('name', f'SubLevel_{k}')
-                        else:
-                            sublevel_names[int(k)] = str(v)
-            except Exception:
-                pass
-
-            entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'SubLevelSaveData':
-                    continue
-                for f in obj.fields:
-                    if not f.list_elements:
-                        continue
-                    for elem in f.list_elements:
-                        if not elem.child_fields:
-                            continue
-                        key = 0
-                        exp = 0
-                        for cf in elem.child_fields:
-                            if cf.present:
-                                sz = cf.end_offset - cf.start_offset
-                                if cf.name == '_key':
-                                    if sz == 4:
-                                        key = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 2:
-                                        key = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                                elif cf.name in ('_experience', '_currentExp'):
-                                    if sz == 4:
-                                        exp = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        exp = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                                    elif sz == 2:
-                                        exp = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                        exp_offset = 0
-                        for cf in elem.child_fields:
-                            if cf.present and cf.name in ('_experience', '_currentExp'):
-                                exp_offset = cf.start_offset
-                        name = sublevel_names.get(key, f"SubLevel_{key}")
-                        entries.append((key, name, exp, exp_offset))
-
-            self._sublevel_entries = entries
-            self._sublevel_table.setRowCount(len(entries))
-            for r, (key, name, exp, exp_off) in enumerate(entries):
-                self._sublevel_table.setItem(r, 0, QTableWidgetItem(str(key)))
-                self._sublevel_table.setItem(r, 1, QTableWidgetItem(name))
-                exp_w = QTableWidgetItem(str(exp))
-                exp_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'exp': exp})
-                if exp > 0:
-                    exp_w.setForeground(QBrush(QColor(COLORS['success'])))
-                self._sublevel_table.setItem(r, 2, exp_w)
+            result = self._get_parse_result()
+            sublevel_names = self._load_game_map_names()['sublevels']
+            self._apply_sublevel_entries(
+                self._extract_sublevel_entries(raw, result, sublevel_names)
+            )
         except Exception as e:
             log.warning("SubLevel populate failed: %s", e)
 
@@ -15478,8 +15891,9 @@ QCheckBox::indicator {{
                 count += 1
         if count:
             self._dirty = True
-            self._populate_faction_tab()
-            self._faction_count.setText(f"Discovered {count} nodes. Ctrl+S to save.")
+            self._populate_faction_tab(
+                done_message=f"Discovered {count} nodes. Ctrl+S to save."
+            )
         else:
             self._faction_count.setText("All nodes already discovered.")
 
@@ -15569,9 +15983,9 @@ QCheckBox::indicator {{
         )
         warning.setWordWrap(True)
         warning.setStyleSheet(
-            f"color: {COLORS['error']}; font-weight: bold; padding: 8px; "
-            f"border: 1px solid {COLORS['error']}; border-radius: 4px; "
-            f"background-color: rgba(255,80,80,0.10);"
+            f"color: {COLORS['text_dim']}; padding: 5px 10px; "
+            f"border: 0; border-left: 2px solid {COLORS['error']}; "
+            "background: transparent;"
         )
         help_row = QHBoxLayout()
         help_row.addWidget(warning, 1)
@@ -15710,108 +16124,179 @@ QCheckBox::indicator {{
         return export_dir
 
     def _export_mod_json(self) -> None:
-        try:
+        from crimson_common.gui_task_worker import start_gui_task
+
+        active = getattr(self, "_mod_export_handle", None)
+        if active is not None and active.is_running:
+            self._update_status("A game-mod export is already running")
+            return
+
+        export_dir = self._get_export_dir()
+        path = os.path.join(export_dir, "crimson_save_editor_patch.json")
+
+        def _task(report):
             from mod_export import ModExporter
             from paz_patcher import PazPatchManager
+
+            report("Locating the game installation...", 5)
             game_path = PazPatchManager.find_game_path()
             if not game_path:
-                QMessageBox.warning(self, "Export", "Game installation not found.")
-                return
-
+                raise RuntimeError("Game installation not found.")
             exporter = ModExporter(game_path)
             summary = exporter.get_summary()
             if "No modifications" in summary:
-                QMessageBox.information(self, "Export", summary)
-                return
+                return "empty", summary, path, ""
+            report("Exporting Nexus JSON...", 15)
+            ok, message = exporter.export_nexus_json(
+                path,
+                lambda value: report(str(value), 55),
+            )
+            if not ok:
+                return "failed", message, path, ""
+            report("Verifying exported JSON...", 90)
+            verified, verification = exporter.verify_nexus_json(path)
+            if not verified:
+                return "failed", message, path, verification
+            return "complete", message, path, verification
 
-            export_dir = self._get_export_dir()
-            path = os.path.join(export_dir, "crimson_save_editor_patch.json")
+        def _progress(message: str, _value: int) -> None:
+            if hasattr(self, "_export_status"):
+                self._export_status.setText(message)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
 
-            self._export_status.setText("EXPORTING JSON — DO NOT CLOSE. This may take a few minutes...")
-            self._export_status.setStyleSheet(f"color: {COLORS['error']}; font-weight: bold; font-size: 13px; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("EXPORTING JSON — DO NOT CLOSE")
-            QApplication.processEvents()
-
-            ok, msg = exporter.export_nexus_json(path, lambda s: (
-                self._export_status.setText(s), QApplication.processEvents()
-            ))
-
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("Export complete")
-            if ok:
-                ok_v, msg_v = exporter.verify_nexus_json(path)
-                self._export_status.setText(msg)
-                QMessageBox.information(self, "Export Complete",
-                    f"{msg}\n\nVerification: {msg_v}\n\nSaved to:\n{path}")
+        def _completed(result) -> None:
+            state, message, output_path, verification = result
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText(message)
+            if state == "empty":
+                QMessageBox.information(self, "Export", message)
+            elif state == "complete":
+                if hasattr(self, "_center_status"):
+                    self._center_status.setText("Export complete")
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"{message}\n\nVerification: {verification}\n\nSaved to:\n{output_path}",
+                )
             else:
-                self._export_status.setText(msg)
-                QMessageBox.warning(self, "Export Failed", msg)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            QMessageBox.critical(self, "Export Error", str(e))
+                QMessageBox.warning(
+                    self,
+                    "Export Failed",
+                    f"{message}\n\nVerification: {verification}" if verification else message,
+                )
+
+        def _failed(message: str, details: str) -> None:
+            log.error("Nexus JSON export failed: %s\n%s", message, details)
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText("Export failed")
+            QMessageBox.critical(self, "Export Error", message)
+
+        def _finished() -> None:
+            self._mod_export_handle = None
+
+        _progress("Preparing JSON export...", 0)
+        self._mod_export_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            progress=_progress,
+            finished=_finished,
+        )
 
     def _export_mod_zip(self) -> None:
-        try:
+        from crimson_common.gui_task_worker import start_gui_task
+
+        active = getattr(self, "_mod_export_handle", None)
+        if active is not None and active.is_running:
+            self._update_status("A game-mod export is already running")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Export CDUMM ZIP",
+            "This exports your game-file modifications as a ZIP compatible with "
+            "CrimsonDesert Ultimate Mods Manager.\n\n"
+            "Packaging the PAZ archive can take 5-10 minutes. The export now runs "
+            "in the background, so the interface remains responsive. Do not close "
+            "the application until it reports completion.\n\n"
+            "The ZIP will be saved to the Exports folder next to the executable.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        export_dir = self._get_export_dir()
+        path = os.path.join(export_dir, "CrimsonSaveEditor_Patches.zip")
+
+        def _task(report):
             from mod_export import ModExporter
             from paz_patcher import PazPatchManager
+
+            report("Locating the game installation...", 5)
             game_path = PazPatchManager.find_game_path()
             if not game_path:
-                QMessageBox.warning(self, "Export", "Game installation not found.")
-                return
-
+                raise RuntimeError("Game installation not found.")
             exporter = ModExporter(game_path)
             summary = exporter.get_summary()
             if "No modifications" in summary:
-                QMessageBox.information(self, "Export", summary)
-                return
-
-            reply = QMessageBox.question(
-                self, "Export CDUMM ZIP",
-                "This exports your game file modifications as a ZIP\n"
-                "compatible with CrimsonDesert Ultimate Mods Manager.\n\n"
-                "WARNING: This takes 5-10 MINUTES and the window\n"
-                "WILL FREEZE during export (packaging ~250MB+ PAZ file).\n"
-                "DO NOT CLOSE the program while exporting.\n\n"
-                "The ZIP will be saved to the Exports folder next to the exe.\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                return "empty", summary, path
+            report("Packaging CDUMM archive...", 15)
+            ok, message = exporter.export_cdumm_zip(
+                path,
+                mod_name="CrimsonSaveEditor Patches",
+                progress_callback=lambda value: report(str(value), 55),
             )
-            if reply != QMessageBox.Yes:
-                return
+            return ("complete" if ok else "failed"), message, path
 
-            export_dir = self._get_export_dir()
-            path = os.path.join(export_dir, "CrimsonSaveEditor_Patches.zip")
+        def _progress(message: str, _value: int) -> None:
+            if hasattr(self, "_export_status"):
+                self._export_status.setText(message)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
 
-            self._export_status.setText("EXPORTING — DO NOT CLOSE. This takes 5-10 minutes...")
-            self._export_status.setStyleSheet(f"color: {COLORS['error']}; font-weight: bold; font-size: 13px; padding: 4px;")
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("EXPORTING ZIP — DO NOT CLOSE (5-10 minutes)")
-            QApplication.processEvents()
-
-            ok, msg = exporter.export_cdumm_zip(
-                path, mod_name="CrimsonSaveEditor Patches",
-                progress_callback=lambda s: (
-                    self._export_status.setText(s), QApplication.processEvents()
+        def _completed(result) -> None:
+            state, message, output_path = result
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText(message)
+            if state == "empty":
+                QMessageBox.information(self, "Export", message)
+            elif state == "complete":
+                if hasattr(self, "_center_status"):
+                    self._center_status.setText("Export complete")
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"{message}\n\nSaved to:\n{output_path}\n\nDrag this ZIP into CDUMM to import.",
                 )
-            )
-
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            self._export_status.setText(msg)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText("Export complete")
-            if ok:
-                QMessageBox.information(self, "Export Complete",
-                    f"{msg}\n\nSaved to:\n{path}\n\n"
-                    f"Drag this ZIP into CDUMM to import.")
             else:
-                QMessageBox.warning(self, "Export Failed", msg)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
-            QMessageBox.critical(self, "Export Error", str(e))
+                QMessageBox.warning(self, "Export Failed", message)
+
+        def _failed(message: str, details: str) -> None:
+            log.error("CDUMM ZIP export failed: %s\n%s", message, details)
+            if hasattr(self, "_export_status"):
+                self._export_status.setStyleSheet(f"color: {COLORS['accent']}; padding: 4px;")
+                self._export_status.setText("Export failed")
+            QMessageBox.critical(self, "Export Error", message)
+
+        def _finished() -> None:
+            self._mod_export_handle = None
+
+        _progress("Preparing CDUMM export...", 0)
+        self._mod_export_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            progress=_progress,
+            finished=_finished,
+        )
 
 
     def _cmod_get_loader(self):
@@ -17064,9 +17549,10 @@ QCheckBox::indicator {{
             from fieldinfo_parser import parse_pabgh_index, parse_entry
             idx = parse_pabgh_index(self._field_edit_schema)
             sorted_offs = sorted(set(idx.values()))
+            off_positions = {off: i for i, off in enumerate(sorted_offs)}
             entries = []
             for key, eoff in sorted(idx.items()):
-                bi = sorted_offs.index(eoff)
+                bi = off_positions[eoff]
                 end = sorted_offs[bi + 1] if bi + 1 < len(sorted_offs) else len(self._field_edit_data)
                 entry = parse_entry(bytes(self._field_edit_data), eoff, end)
                 if entry:
@@ -17085,9 +17571,10 @@ QCheckBox::indicator {{
                 from vehicleinfo_parser import parse_pabgh_index_u16, parse_entry as vparse
                 vidx = parse_pabgh_index_u16(self._vehicle_schema)
                 vsorted = sorted(set(vidx.values()))
+                voff_positions = {off: i for i, off in enumerate(vsorted)}
                 ventries = []
                 for vk, vo in sorted(vidx.items()):
-                    vbi = vsorted.index(vo)
+                    vbi = voff_positions[vo]
                     vend = vsorted[vbi + 1] if vbi + 1 < len(vsorted) else len(self._vehicle_data)
                     ve = vparse(bytes(self._vehicle_data), vo, vend)
                     if ve:
@@ -20117,6 +20604,8 @@ QCheckBox::indicator {{
             self._paz_game_path.setText(path)
         if hasattr(self, '_paz_manager'):
             self._paz_manager.game_path = path
+        if hasattr(self, '_blackstar_timer_panel'):
+            self._blackstar_timer_panel.set_game_path(path)
         if hasattr(self, '_global_game_path'):
             self._global_game_path.setText(path)
             self._global_game_path.setToolTip(path)
@@ -20167,13 +20656,35 @@ QCheckBox::indicator {{
         self._set_game_path(path)
 
     def _global_auto_detect_path(self) -> None:
-        detected = PazPatchManager.find_game_path()
-        if detected:
-            self._set_game_path(detected)
-        else:
-            QMessageBox.warning(self, "Not Found",
-                "Could not auto-detect Crimson Desert.\n"
-                "Use Browse to set the path manually.")
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching for the Crimson Desert installation...")
+
+        def _completed(detected: str | None) -> None:
+            if detected:
+                self._set_game_path(detected)
+                self._update_status(f"Game found: {detected}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Not Found",
+                    "Could not auto-detect Crimson Desert.\n"
+                    "Use Browse to set the path manually.",
+                )
+
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known Steam and library locations...", 20),
+                PazPatchManager.find_game_path(),
+            )[-1],
+            completed=_completed,
+            failed=lambda message, details: (
+                log.error("Game path detection failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Detection Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
 
     def _paz_browse_game_path(self) -> None:
         current = self._paz_game_path.text().strip() or self._config.get("game_install_path", "")
@@ -20193,14 +20704,32 @@ QCheckBox::indicator {{
             self._set_game_path(path)
 
     def _paz_auto_detect_path(self) -> None:
-        detected = PazPatchManager.find_game_path()
-        if detected:
-            self._set_game_path(detected)
-            self._paz_status_label.setText(f"Game found at: {detected}")
-        else:
-            self._paz_status_label.setText(
-                "Could not auto-detect game installation. Use Browse to set the path manually."
-            )
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._paz_status_label.setText("Searching for the Crimson Desert installation...")
+
+        def _completed(detected: str | None) -> None:
+            if detected:
+                self._set_game_path(detected)
+                self._paz_status_label.setText(f"Game found at: {detected}")
+            else:
+                self._paz_status_label.setText(
+                    "Could not auto-detect game installation. Use Browse to set the path manually."
+                )
+
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known Steam and library locations...", 20),
+                PazPatchManager.find_game_path(),
+            )[-1],
+            completed=_completed,
+            failed=lambda message, details: (
+                log.error("PAZ path detection failed: %s\n%s", message, details),
+                self._paz_status_label.setText(f"Detection failed: {message}"),
+            ),
+            progress=lambda message, _value: self._paz_status_label.setText(message),
+        )
 
     def _paz_get_selected_patch(self) -> Optional[PazPatch]:
         rows = self._paz_patch_table.selectionModel().selectedRows()
@@ -28237,12 +28766,13 @@ QCheckBox::indicator {{
                 idx[k] = o
 
             sorted_offs = sorted(set(idx.values())) + [len(self._spawn_data)]
+            off_positions = {off: i for i, off in enumerate(sorted_offs)}
 
             MARKER = b'\x0A\x36\xC1\xE0'
             elements = []
 
             for region_key, entry_off in sorted(idx.items(), key=lambda x: x[1]):
-                ni = sorted_offs.index(entry_off) + 1
+                ni = off_positions[entry_off] + 1
                 entry_end = sorted_offs[ni]
                 raw = self._spawn_data[entry_off:entry_end]
 
@@ -31153,6 +31683,7 @@ QCheckBox::indicator {{
 
     def _build_status_bar(self) -> None:
         self._status = self.statusBar()
+        self._status.setObjectName("statusRail")
         self._status_file_label = QLabel("No file loaded")
         self._status_items_label = QLabel("Items: 0")
         self._status_parc_label = QLabel("")
@@ -31198,6 +31729,30 @@ QCheckBox::indicator {{
             if hasattr(self, '_center_status'):
                 self._center_status.setText(action)
 
+    def _update_schema_write_controls(self) -> None:
+        supported = bool(
+            self._save_data
+            and not self._save_data.is_raw_stream
+            and self._save_data.is_schema_supported
+        )
+        busy = self._blackstar_thread is not None
+        enabled = supported and not busy
+        for action_name in ("_save_action", "_save_as_action"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(enabled)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(enabled)
+            if self._save_data and not supported:
+                self._quick_save_btn.setToolTip(
+                    "Read-only: the loaded save schema is not supported for writing."
+                )
+        blackstar_enabled = bool(self._save_data and not self._save_data.is_raw_stream) and not busy
+        if hasattr(self, "_blackstar_btn"):
+            self._blackstar_btn.setEnabled(blackstar_enabled)
+        if hasattr(self, "_blackstar_dry_run"):
+            self._blackstar_dry_run.setEnabled(blackstar_enabled)
+
 
     def _open_save_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -31217,16 +31772,36 @@ QCheckBox::indicator {{
             return
         try:
             self._save_data = load_raw_stream(path)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
             self._scan_and_populate()
+            self._update_schema_write_controls()
             self._update_status(f"Loaded raw stream: {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load raw stream:\n{e}")
 
     def _auto_find_save(self) -> None:
-        saves = find_save_files()
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching known save locations...")
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known save locations...", 15),
+                find_save_files(),
+            )[-1],
+            completed=self._show_auto_find_results,
+            failed=lambda message, details: (
+                log.error("Save search failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Auto-Find Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
+
+    def _show_auto_find_results(self, saves: List[dict]) -> None:
         if not saves:
             QMessageBox.information(
                 self, "Auto-Find",
@@ -31263,69 +31838,171 @@ QCheckBox::indicator {{
             self._load_save(saves[idx]["path"])
 
     def _load_save(self, path: str) -> None:
-        from PySide6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Loading save file...", None, 0, 5, self)
+        self._blackstar_preview_token = None
+        if (
+            (self._load_handle is not None and self._load_handle.is_running)
+            or self._load_population_pending
+        ):
+            self._update_status("A save is already loading")
+            return
+        if self._parc_handle is not None:
+            self._parc_handle.cancel()
+
+        from crimson_common.gui_task_worker import start_gui_task
+
+        progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Loading")
         progress.setMinimumDuration(0)
         progress.setWindowModality(Qt.WindowModal)
         progress.setValue(0)
-        QApplication.processEvents()
 
-        def _step(msg, val):
-            progress.setLabelText(msg)
-            progress.setValue(val)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText(msg)
-            QApplication.processEvents()
+        def _task(report):
+            report("Decrypting save file...", 10)
+            save_data = load_save_file(path)
+            report("Parsing save structure...", 35)
+            import sys as _sys
+            _sys.path.insert(0, 'Communitydump/desktopeditor')
+            from save_parser import build_result_from_raw
+            parse_result = build_result_from_raw(
+                bytes(save_data.decompressed_blob), {'input_kind': 'raw_blob'}
+            )
+            report("Scanning items...", 55)
+            items = scan_items_smart(save_data.decompressed_blob, parse_result)
+            report("Resolving item names...", 70)
+            for item in items:
+                item.name = self._name_db.get_name(item.item_key)
+                item.category = self._name_db.get_category(item.item_key)
+            report("Creating pristine backup...", 85)
+            pristine = self._create_pristine_backup(path)
+            report("Preparing the editor...", 95)
+            return save_data, items, pristine, parse_result
 
-        try:
-            _step("Decrypting save file...", 1)
-            self._save_data = load_save_file(path)
+        self._load_progress = progress
+        self._set_load_busy(True)
+
+        def _on_progress(message: str, value: int) -> None:
+            progress.setLabelText(message)
+            progress.setValue(value)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
+
+        def _release_load_ui() -> None:
+            self._load_population_pending = False
+            if self._load_progress is progress:
+                progress.close()
+                self._load_progress = None
+            self._set_load_busy(False)
+
+        def _population_failed(message: str, details: str) -> None:
+            log.error("Editor population failed: %s\n%s", message, details)
+            _release_load_ui()
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"The save was loaded, but the editor could not be populated:\n\n{message}\n\n{details}",
+            )
+
+        def _on_completed(result) -> None:
+            save_data, items, pristine, parse_result = result
+            self._save_data = save_data
+            self._items = items
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
-
-            _step("Creating backup...", 2)
-            pristine = self._create_pristine_backup(path)
+            self._parse_cache.store(save_data, parse_result)
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            _step("Scanning items...", 3)
-            self._scan_and_populate()
+            def _finish_population() -> None:
+                try:
+                    slot_dir = os.path.basename(os.path.dirname(path))
+                    friendly = self._friendly_slot_name(slot_dir)
+                    self._config["last_save_path"] = path
+                    self._config["last_slot"] = friendly
+                    self._save_config()
+                    self._refresh_sidebar()
 
-            _step("Populating UI...", 4)
+                    self._update_schema_write_controls()
+                    schema_notice = ""
+                    if self._save_data.is_schema_supported:
+                        self._quick_save_btn.setToolTip(f"Save to: {path}")
+                    else:
+                        schema_sha256 = self._save_data.schema_identity.schema_sha256
+                        log.warning(
+                            "Loaded unknown full save schema %s read-only; General Save disabled; "
+                            "Blackstar Preview uses its own compatibility check.",
+                            schema_sha256,
+                        )
+                        schema_notice = (
+                            " | General Save disabled (unknown full schema); "
+                            "Blackstar Preview uses its own compatibility check"
+                        )
 
-            slot_dir = os.path.basename(os.path.dirname(path))
-            friendly = self._friendly_slot_name(slot_dir)
-            self._config["last_save_path"] = path
-            self._config["last_slot"] = friendly
-            self._save_config()
-            self._refresh_sidebar()
+                    self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
+                    progress.setValue(100)
+                    self._update_status(f"Loaded: {friendly} ({slot_dir}){schema_notice}")
+                except Exception as exc:
+                    _population_failed(str(exc), traceback.format_exc())
+                    return
+                _release_load_ui()
 
-            self._quick_save_btn.setEnabled(True)
-            self._quick_save_btn.setToolTip(f"Save to: {path}")
+            progress.setCancelButton(None)
+            self._load_population_pending = True
+            try:
+                self._populate_scanned_items(
+                    incremental=True,
+                    progress=_on_progress,
+                    completed=_finish_population,
+                    failed=_population_failed,
+                )
+            except Exception as exc:
+                _population_failed(str(exc), traceback.format_exc())
 
-            self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
-            self._update_status(f"Loaded: {friendly} ({slot_dir})")
-
-            progress.setValue(5)
-        except Warning as w:
-            self._update_status(f"Loaded (HMAC warning): {os.path.basename(path)}")
-            progress.close()
-        except Exception as e:
-            progress.close()
-            err_msg = str(e)
+        def _on_failed(message: str, details: str) -> None:
             hint = ""
-            if "byte must be in range" in err_msg or "chacha20" in traceback.format_exc().lower():
+            if "byte must be in range" in message or "chacha20" in details.lower():
                 hint = (
                     "\n\nThis file appears to be corrupted or is not a valid save file.\n"
                     "If this is a backup, it may have been created from an already-broken save.\n"
                     "Try loading a different save or restoring from an earlier backup."
                 )
             QMessageBox.critical(
-                self, "Error",
-                f"Failed to load save file:\n\n{e}{hint}\n\n{traceback.format_exc()}"
+                self,
+                "Error",
+                f"Failed to load save file:\n\n{message}{hint}\n\n{details}",
             )
+
+        def _on_cancelled() -> None:
+            self._update_status("Save loading cancelled; no save was changed")
+
+        def _background_finished() -> None:
+            self._load_handle = None
+            if not self._load_population_pending:
+                _release_load_ui()
+
+        progress.show()
+        self._load_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            cancelled=_on_cancelled,
+            finished=_background_finished,
+        )
+        progress.canceled.connect(self._load_handle.cancel)
+
+    def _set_load_busy(self, busy: bool) -> None:
+        for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and bool(self._save_data))
+        if not busy:
+            self._update_schema_write_controls()
 
     def _save_file(self) -> None:
         if not self._save_data or not self._loaded_path:
@@ -31352,26 +32029,57 @@ QCheckBox::indicator {{
         self._do_save(path)
 
     def _do_save(self, path: str) -> None:
-        try:
-            reply = QMessageBox.question(
-                self, "Backup Save?",
-                "Create a backup of your current save before writing changes?\n\n"
-                "Highly recommended — you can restore from Backup/Restore tab if anything goes wrong.",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
+        if not self._save_data or not self._loaded_path:
+            QMessageBox.warning(self, "Save", "No encrypted save is loaded.")
+            return
+        if not self._save_data.is_schema_supported:
+            QMessageBox.critical(
+                self,
+                "Unsupported Save Schema",
+                "This save is read-only because its schema is unknown. No file was written.",
             )
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Yes:
-                backup_path = self._create_backup(path)
-                if backup_path:
-                    self._update_status(f"Backup created: {os.path.basename(backup_path)}")
+            return
+        if not self._save_data.raw_header or self._save_data.schema_identity is None:
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                "The loaded save is missing its original header or schema identity.",
+            )
+            return
 
-            write_save_file(
-                path,
-                bytes(self._save_data.decompressed_blob),
-                self._save_data.raw_header if self._save_data.raw_header else None,
+        reply = QMessageBox.question(
+            self,
+            "Write Save with Verified Backup",
+            "A verified backup is mandatory and will be created automatically before "
+            "the destination is replaced. The temporary output will also be decrypted "
+            "and validated before the final write.\n\n"
+            f"Destination: {path}\n"
+            "Backup policy: preserve the existing destination; if this is a new path, "
+            f"preserve the loaded source ({self._loaded_path}).\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        from app_logging import new_operation_id
+
+        operation_id = new_operation_id("save")
+        try:
+            result = transactional_write_save(
+                destination=path,
+                edited_blob=bytes(self._save_data.decompressed_blob),
+                original_header=self._save_data.raw_header,
+                backup_source=self._loaded_path,
+                expected_identity=self._save_data.schema_identity,
+                operation_id=operation_id,
             )
+            with open(path, "rb") as stream:
+                self._save_data.raw_header = stream.read(HEADER_SIZE)
+            self._save_data.source_file_sha256 = result.output_sha256
+            self._blackstar_preview_token = None
+            self._save_data.file_path = path
             self._loaded_path = path
             self._dirty = False
 
@@ -31380,53 +32088,28 @@ QCheckBox::indicator {{
             self._config["last_save_path"] = path
             self._config["last_slot"] = friendly
             self._save_config()
+            self._update_schema_write_controls()
 
             self._update_status(f"Saved: {friendly} ({slot_dir})")
             self._refresh_backups()
             self._refresh_sidebar()
-            QMessageBox.warning(
-                self, "Save",
+            QMessageBox.information(
+                self,
+                "Save Complete",
                 f"Save file written successfully.\n{path}\n\n"
-                "WARNING: It is recommended to save again in game after loading\n"
-                "the changes to have a new clean save to work with, before\n"
-                "applying another change."
+                f"Verified backup:\n{result.backup_path}\n\n"
+                f"Output SHA-256: {result.output_sha256}\n"
+                f"Operation ID: {operation_id}\n\n"
+                "Save once in game after loading these changes to create a clean new save.",
             )
-        except Exception as e:
+        except Exception as exc:
+            log.exception("operation=%s save_failed destination=%s", operation_id, path)
             QMessageBox.critical(
-                self, "Save Error",
-                f"Failed to save:\n\n{e}\n\n{traceback.format_exc()}"
-            )
-
-
-    def _fix_duplicate_item_nos(self) -> None:
-        if not self._items or not self._save_data:
-            return
-
-        from collections import Counter
-        no_counts = Counter(it.item_no for it in self._items)
-        duplicated_nos = {no for no, count in no_counts.items() if count > 1}
-
-        if not duplicated_nos:
-            return
-
-        max_no = get_max_itemno(self._items)
-        next_no = max_no + 1
-        fixed = 0
-
-        for dup_no in duplicated_nos:
-            sharing = [it for it in self._items if it.item_no == dup_no]
-            for item in sharing[1:]:
-                apply_itemno_edit(
-                    self._save_data.decompressed_blob, item, next_no
-                )
-                next_no += 1
-                fixed += 1
-
-        if fixed > 0:
-            self._dirty = True
-            self._update_status(
-                f"Fixed {fixed} duplicate ItemNo(s) across "
-                f"{len(duplicated_nos)} group(s) — each item now has a unique ID."
+                self,
+                "Save Error",
+                f"Failed to save: {exc}\n\n"
+                "The destination was not accepted unless backup and temporary validation "
+                f"both succeeded.\n\nOperation ID: {operation_id}",
             )
 
     def _scan_and_populate(self) -> None:
@@ -31435,63 +32118,221 @@ QCheckBox::indicator {{
 
         self._quest_entries = []
         self._mission_entries = []
-        self._items = scan_items(self._save_data.decompressed_blob)
+        try:
+            parse_result = self._get_parse_result()
+        except Exception:
+            parse_result = None
+        self._items = scan_items_smart(
+            self._save_data.decompressed_blob, parse_result
+        )
 
         for item in self._items:
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
-        self._fix_duplicate_item_nos()
+        self._populate_scanned_items(incremental=True)
 
-        self._status_parc_label.setText("Loading... (PARC enriching in background)")
-        self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
-        self._populate_inventory()
-        self._populate_equipment()
-        self._populate_socket_items()
+    def _populate_scanned_items(
+        self,
+        *,
+        incremental: bool = False,
+        schedule_enrichment: bool = True,
+        progress: Callable[[str, int], None] | None = None,
+        completed: Callable[[], None] | None = None,
+        failed: Callable[[str, str], None] | None = None,
+    ) -> None:
+        if schedule_enrichment:
+            self._status_parc_label.setText("Loading... (PARC enriching in background)")
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 8px;")
+            self._set_inv_subtabs_loading()
+        if not incremental:
+            self._populate_inventory()
+            self._populate_equipment()
+            self._populate_socket_items()
+            self._inv_count_label.setText(str(len(self._items)))
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+            return
 
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._deferred_parc_enrich)
+        from crimson_common.gui_population import IncrementalGuiJob
+
+        # A superseded job would keep writing rows by index into tables a
+        # newer populate had refilled, silently dropping or mixing items.
+        self._cancel_population_job('_inventory_population_job')
+        self._cancel_population_job('_equipment_population_job')
+
+        inventory = self._filtered_inventory_items()
+        inventory_table = self._inv_table
+        inventory_table.setSortingEnabled(False)
+        inventory_table.setRowCount(0)
+        inventory_table.setRowCount(len(inventory))
+
+        def _fail(message: str, details: str) -> None:
+            inventory_table.setSortingEnabled(True)
+            self._equip_table.setSortingEnabled(True)
+            self._inventory_population_job = None
+            self._equipment_population_job = None
+            if failed is not None:
+                failed(message, details)
+            else:
+                log.error("Incremental editor population failed: %s\n%s", message, details)
+
+        def _equipment_done() -> None:
+            self._equip_table.setSortingEnabled(True)
+            self._equipment_population_job = None
+            try:
+                if progress is not None:
+                    progress("Preparing sockets and editor controls...", 99)
+                self._populate_socket_items()
+                self._inv_count_label.setText(str(len(self._items)))
+                if schedule_enrichment:
+                    QTimer.singleShot(100, self._deferred_parc_enrich)
+                if completed is not None:
+                    completed()
+            except Exception as exc:
+                _fail(str(exc), traceback.format_exc())
+
+        def _inventory_done() -> None:
+            inventory_table.setSortingEnabled(True)
+            self._inventory_population_job = None
+            equipment = self._filtered_equipment_items()
+            equipment_table = self._equip_table
+            equipment_table.setSortingEnabled(False)
+            equipment_table.setRowCount(0)
+            equipment_table.setRowCount(len(equipment))
+            job = IncrementalGuiJob(
+                self,
+                items=equipment,
+                consume=lambda row, item: self._write_equipment_row(row, item),
+                batch_size=72,
+                time_budget_ms=9,
+            )
+            self._equipment_population_job = job
+            job.progress.connect(
+                lambda done, total: progress(
+                    f"Populating equipment ({done:,}/{total:,})...",
+                    98 + int(done / max(1, total)),
+                )
+                if progress is not None
+                else None
+            )
+            job.completed.connect(_equipment_done)
+            job.failed.connect(_fail)
+            job.start()
+
+        job = IncrementalGuiJob(
+            self,
+            items=inventory,
+            consume=lambda row, item: self._write_inventory_row(row, item),
+            batch_size=96,
+            time_budget_ms=9,
+        )
+        self._inventory_population_job = job
+        job.progress.connect(
+            lambda done, total: progress(
+                f"Populating inventory ({done:,}/{total:,})...",
+                95 + int((done / max(1, total)) * 3),
+            )
+            if progress is not None
+            else None
+        )
+        job.completed.connect(_inventory_done)
+        job.failed.connect(_fail)
+        job.start()
 
     def _deferred_parc_enrich(self) -> None:
         if not self._save_data or not self._items:
             return
+        if self._parc_handle is not None and self._parc_handle.is_running:
+            return
 
-        try:
+        from crimson_common.gui_task_worker import start_gui_task
+
+        save_data = self._save_data
+        items = self._items
+        generation = save_data.document_generation
+
+        def _task(report):
+            def _on_progress(step: int, total: int) -> None:
+                total = max(1, total)
+                value = 10 + int((min(step, total) / total) * 85)
+                report(f"Enriching item offsets ({step}/{total})...", value)
+
             enriched, parc_status = enrich_items_with_parc(
-                self._save_data.decompressed_blob, self._items
+                save_data.decompressed_blob, items, _on_progress
             )
-            self._parc_status = parc_status
-            if enriched > 0:
-                self._status_parc_label.setText(parc_status)
-                self._status_parc_label.setStyleSheet(f"color: {COLORS['success']}; padding: 0 8px;")
-            else:
-                self._status_parc_label.setText("Legacy mode: pattern-based scanning")
-                self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
-        except Exception:
-            self._parc_status = "Legacy mode: pattern-based scanning"
-            self._status_parc_label.setText(self._parc_status)
-            self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
+            return generation, enriched, parc_status
 
+        def _on_progress(message: str, _value: int) -> None:
+            self._status_parc_label.setText(message)
+
+        def _on_completed(result) -> None:
+            result_generation, enriched, parc_status = result
+            if (
+                self._save_data is save_data
+                and self._save_data.document_generation == result_generation
+            ):
+                self._finish_parc_enrich(enriched, parc_status)
+
+        def _on_failed(message: str, details: str) -> None:
+            log.error("PARC enrichment failed: %s\n%s", message, details)
+            if self._save_data is save_data:
+                self._finish_parc_enrich(0, "Legacy mode: pattern-based scanning")
+
+        def _cleanup() -> None:
+            stale = self._save_data is not save_data
+            self._parc_handle = None
+            if stale:
+                QTimer.singleShot(0, self._deferred_parc_enrich)
+
+        self._parc_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            finished=_cleanup,
+        )
+
+    def _finish_parc_enrich(self, enriched: int, parc_status: str) -> None:
+        self._parc_status = parc_status
+        if enriched > 0:
+            self._status_parc_label.setText(parc_status)
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['success']}; padding: 0 8px;")
+        else:
+            self._status_parc_label.setText("Legacy mode: pattern-based scanning")
+            self._status_parc_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0 8px;")
         self._enrich_vendor_names()
         self._update_inv_subtab_counts()
 
-        self._populate_inventory()
-        self._populate_equipment()
-        self._populate_repurchase()
-        self._populate_socket_items()
+        def _refresh_failed(message: str, details: str) -> None:
+            log.error("PARC table refresh failed: %s\n%s", message, details)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText("Save loaded; table refresh failed")
+
+        self._populate_scanned_items(
+            incremental=True,
+            schedule_enrichment=False,
+            progress=lambda message, _value: self._center_status.setText(message)
+            if hasattr(self, "_center_status")
+            else None,
+            failed=_refresh_failed,
+        )
+        # These views do not depend on the incremental table fill above, so
+        # run them directly: a superseded (cancelled) fill can no longer lose
+        # this refresh work.
         self._populate_repurchase()
         self._populate_faction_tab()
         self._refresh_backups()
         self._inv_count_label.setText(str(len(self._items)))
+        if hasattr(self, "_center_status"):
+            self._center_status.setText("Save data enriched and ready")
 
 
-    def _populate_inventory(self) -> None:
-        table = self._inv_table
-        table.setSortingEnabled(False)
-        table.setRowCount(0)
-
+    def _filtered_inventory_items(self) -> List[SaveItem]:
         search = self._inv_search.text().lower().strip()
-
         filtered = self._items
         subtab_idx = self._inv_subtabs.currentIndex() if hasattr(self, '_inv_subtabs') else 0
         if 0 <= subtab_idx < len(self._inv_subtab_filters):
@@ -31513,63 +32354,72 @@ QCheckBox::indicator {{
                 or search in i.category.lower()
                 or search in self._name_db.get_internal_name(i.item_key).lower()
             ]
+        return filtered
+
+    def _cancel_population_job(self, attr: str) -> None:
+        job = getattr(self, attr, None)
+        if job is not None and job.is_running:
+            job.cancel()
+        setattr(self, attr, None)
+
+    def _populate_inventory(self) -> None:
+        self._cancel_population_job('_inventory_population_job')
+        table = self._inv_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        filtered = self._filtered_inventory_items()
 
         table.setRowCount(len(filtered))
 
         for row, item in enumerate(filtered):
-            color = QColor(CATEGORY_COLORS.get(item.category, COLORS["text"]))
-
-            icon_item = QTableWidgetItem()
-            if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(item.item_key)
-                if px:
-                    icon_item.setIcon(QIcon(px))
-                elif self._icon_cache.has_icon(item.item_key):
-                    self._icon_cache.request_icon(item.item_key, self._on_icon_loaded)
-            table.setItem(row, 0, icon_item)
-
-            name_item = QTableWidgetItem(item.name)
-            name_item.setForeground(QBrush(color))
-            name_item.setData(Qt.UserRole, id(item))
-            table.setItem(row, 1, name_item)
-
-            no_item = _num_item(item.item_no)
-            no_item.setForeground(QBrush(QColor(COLORS["text_dim"])))
-            table.setItem(row, 2, no_item)
-
-            source_item = QTableWidgetItem(item.source)
-            table.setItem(row, 3, source_item)
-
-            cat_item = QTableWidgetItem(item.category)
-            cat_item.setForeground(QBrush(color))
-            table.setItem(row, 4, cat_item)
-
-            key_item = _num_item(item.item_key)
-            key_item.setData(Qt.UserRole + 1, item.item_key)
-            table.setItem(row, 5, key_item)
-
-            slot_item = _num_item(item.slot_no)
-            table.setItem(row, 6, slot_item)
-
-            stack_item = _num_item(item.stack_count)
-            table.setItem(row, 7, stack_item)
-
-            enc_text = f"+{item.enchant_level}" if item.has_enchant else "-"
-            enc_item = QTableWidgetItem(enc_text)
-            if item.has_enchant:
-                enc_item.setForeground(QBrush(QColor(COLORS["success"])))
-            table.setItem(row, 8, enc_item)
+            self._write_inventory_row(row, item)
 
         table.setSortingEnabled(True)
+
+    def _write_inventory_row(self, row: int, item: SaveItem) -> None:
+        table = self._inv_table
+        color = QColor(CATEGORY_COLORS.get(item.category, COLORS["text"]))
+
+        icon_item = QTableWidgetItem()
+        if self._icons_enabled:
+            px = self._icon_cache.get_pixmap(item.item_key)
+            if px:
+                icon_item.setIcon(QIcon(px))
+            elif self._icon_cache.has_icon(item.item_key):
+                self._icon_cache.request_icon(item.item_key, self._on_icon_loaded)
+        table.setItem(row, 0, icon_item)
+
+        name_item = QTableWidgetItem(item.name)
+        name_item.setForeground(QBrush(color))
+        name_item.setData(Qt.UserRole, id(item))
+        table.setItem(row, 1, name_item)
+
+        no_item = _num_item(item.item_no)
+        no_item.setForeground(QBrush(QColor(COLORS["text_dim"])))
+        table.setItem(row, 2, no_item)
+        table.setItem(row, 3, QTableWidgetItem(item.source))
+
+        cat_item = QTableWidgetItem(item.category)
+        cat_item.setForeground(QBrush(color))
+        table.setItem(row, 4, cat_item)
+
+        key_item = _num_item(item.item_key)
+        key_item.setData(Qt.UserRole + 1, item.item_key)
+        table.setItem(row, 5, key_item)
+        table.setItem(row, 6, _num_item(item.slot_no))
+        table.setItem(row, 7, _num_item(item.stack_count))
+
+        enc_item = QTableWidgetItem(
+            f"+{item.enchant_level}" if item.has_enchant else "-"
+        )
+        if item.has_enchant:
+            enc_item.setForeground(QBrush(QColor(COLORS["success"])))
+        table.setItem(row, 8, enc_item)
 
     def _filter_equipment(self) -> None:
         self._populate_equipment()
 
-    def _populate_equipment(self) -> None:
-        table = self._equip_table
-        table.setSortingEnabled(False)
-        table.setRowCount(0)
-
+    def _filtered_equipment_items(self) -> List[SaveItem]:
         search = self._equip_search.text().lower().strip()
         equip_items = [i for i in self._items if i.is_equipment or i.has_enchant]
         if search:
@@ -31580,69 +32430,158 @@ QCheckBox::indicator {{
                 or search in i.category.lower()
                 or search in self._name_db.get_internal_name(i.item_key).lower()
             ]
+        return equip_items
+
+    def _populate_equipment(self) -> None:
+        self._cancel_population_job('_equipment_population_job')
+        table = self._equip_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        equip_items = self._filtered_equipment_items()
         table.setRowCount(len(equip_items))
 
         for row, item in enumerate(equip_items):
-            color = QColor(CATEGORY_COLORS.get("Equipment", COLORS["text"]))
-
-            icon_item = QTableWidgetItem()
-            if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(item.item_key)
-                if px:
-                    icon_item.setIcon(QIcon(px))
-            table.setItem(row, 0, icon_item)
-
-            name_item = QTableWidgetItem(item.name)
-            name_item.setForeground(QBrush(color))
-            name_item.setData(Qt.UserRole, id(item))
-            table.setItem(row, 1, name_item)
-
-            table.setItem(row, 2, _num_item(item.item_key))
-            table.setItem(row, 3, _num_item(item.slot_no))
-
-            max_enc = self._get_max_enchant(item.item_key)
-            if item.has_enchant:
-                if max_enc >= 0:
-                    enchant_text = f"+{item.enchant_level}/{max_enc}"
-                else:
-                    enchant_text = f"+{item.enchant_level}"
-            else:
-                enchant_text = "-"
-            enchant_item = QTableWidgetItem(enchant_text)
-            if item.has_enchant and max_enc >= 0 and item.enchant_level > max_enc:
-                enchant_item.setForeground(QBrush(QColor(COLORS["error"])))
-                enchant_item.setToolTip(f"OVER LIMIT! Max enchant is +{max_enc}. Game may crash!")
-            elif item.has_enchant and item.enchant_level > 0:
-                enchant_item.setForeground(QBrush(QColor(COLORS["accent"])))
-            table.setItem(row, 4, enchant_item)
-
-            endurance_item = _num_item(item.actual_endurance)
-            if item.socket_count_from_endurance > 0:
-                endurance_item.setText(f"{item.actual_endurance} ({item.socket_count_from_endurance}s)")
-                endurance_item.setToolTip(f"Endurance={item.actual_endurance}, Sockets={item.socket_count_from_endurance} (raw=0x{item.endurance:04X})")
-            table.setItem(row, 5, endurance_item)
-
-            sharpness_item = _num_item(item.sharpness)
-            table.setItem(row, 6, sharpness_item)
-
-            table.setItem(row, 7, _num_item(item.stack_count))
-            table.setItem(row, 8, _num_item(item.item_no))
+            self._write_equipment_row(row, item)
 
         table.setSortingEnabled(True)
+
+    def _write_equipment_row(self, row: int, item: SaveItem) -> None:
+        table = self._equip_table
+        color = QColor(CATEGORY_COLORS.get("Equipment", COLORS["text"]))
+
+        icon_item = QTableWidgetItem()
+        if self._icons_enabled:
+            px = self._icon_cache.get_pixmap(item.item_key)
+            if px:
+                icon_item.setIcon(QIcon(px))
+        table.setItem(row, 0, icon_item)
+
+        name_item = QTableWidgetItem(item.name)
+        name_item.setForeground(QBrush(color))
+        name_item.setData(Qt.UserRole, id(item))
+        table.setItem(row, 1, name_item)
+        table.setItem(row, 2, _num_item(item.item_key))
+        table.setItem(row, 3, _num_item(item.slot_no))
+
+        max_enc = self._get_max_enchant(item.item_key)
+        if item.has_enchant:
+            enchant_text = (
+                f"+{item.enchant_level}/{max_enc}"
+                if max_enc >= 0
+                else f"+{item.enchant_level}"
+            )
+        else:
+            enchant_text = "-"
+        enchant_item = QTableWidgetItem(enchant_text)
+        if item.has_enchant and max_enc >= 0 and item.enchant_level > max_enc:
+            enchant_item.setForeground(QBrush(QColor(COLORS["error"])))
+            enchant_item.setToolTip(
+                f"OVER LIMIT! Max enchant is +{max_enc}. Game may crash!"
+            )
+        elif item.has_enchant and item.enchant_level > 0:
+            enchant_item.setForeground(QBrush(QColor(COLORS["accent"])))
+        table.setItem(row, 4, enchant_item)
+
+        endurance_item = _num_item(item.actual_endurance)
+        if item.socket_count_from_endurance > 0:
+            endurance_item.setText(
+                f"{item.actual_endurance} ({item.socket_count_from_endurance}s)"
+            )
+            endurance_item.setToolTip(
+                f"Endurance={item.actual_endurance}, "
+                f"Sockets={item.socket_count_from_endurance} "
+                f"(raw=0x{item.endurance:04X})"
+            )
+        table.setItem(row, 5, endurance_item)
+        table.setItem(row, 6, _num_item(item.sharpness))
+        table.setItem(row, 7, _num_item(item.stack_count))
+        table.setItem(row, 8, _num_item(item.item_no))
+
+    def _apply_icon_display_metrics(self) -> None:
+        row_h = max(ICON_SIZE + 2, 24) if self._icons_enabled else 24
+        for name in ('_inv_table', '_equip_table', '_repurch_table',
+                     '_db_table', '_swap_list', '_merc_table'):
+            tbl = getattr(self, name, None)
+            if tbl is None:
+                continue
+            tbl.setColumnWidth(0, (ICON_SIZE + 16) if self._icons_enabled else 0)
+            tbl.verticalHeader().setDefaultSectionSize(row_h)
+
+    def _apply_icon_button_labels(self) -> None:
+        if not self._icons_enabled:
+            label = "Show Icons"
+        elif self._icon_cache.coverage < 100:
+            label = "Download Icons…"
+        else:
+            label = "Hide Icons"
+        for name in ('_show_icons_btn', '_db_show_icons_btn', '_global_icons_btn'):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setText(label)
+
+    def _maybe_offer_icon_download(self) -> None:
+        if not self._icons_enabled:
+            return
+        if self._icon_cache.coverage >= 100:
+            return
+        if getattr(self, '_icon_seed_pending', False):
+            return
+        if self._config.get("icons_download_declined"):
+            return
+        reply = QMessageBox.question(
+            self, "Download Item Icons",
+            "Item icons are enabled but not downloaded yet (about 70 MB, one "
+            "time).\n\nDownload them now with a progress bar?\n\n"
+            "You can also start this anytime with the \"Download Icons…\" "
+            "button in the Items toolbar.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._bulk_download_icons()
+        else:
+            self._config["icons_download_declined"] = True
+            self._save_config()
+            self._update_status(
+                'Icons not downloaded — use the "Download Icons…" button in '
+                'the Items toolbar anytime'
+            )
+            self._apply_icon_button_labels()
+
+    def _on_icons_seeded(self, count: int) -> None:
+        self._icon_seed_pending = False
+        if count:
+            log.info("Seeded %d bundled icons next to the executable", count)
+            self._update_status(f"Item icons installed ({count} from bundle)")
+        self._apply_icon_button_labels()
+        self._start_icon_warm()
+        self._maybe_offer_icon_download()
+
+    def _start_icon_warm(self) -> None:
+        if not self._icons_enabled:
+            return
+        keys = [info.item_key for info in self._name_db.get_all_sorted()]
+        self._icon_cache.warm_cache_async(keys, completed=self._on_icons_warmed)
+
+    def _on_icons_warmed(self, count: int) -> None:
+        if not count:
+            return
+        log.info("Warmed %d item icons into memory", count)
+        if hasattr(self, '_swap_list'):
+            self._filter_swap_items()
+        if hasattr(self, '_db_table'):
+            # Stagger the two big synchronous rebuilds across event-loop turns.
+            QTimer.singleShot(100, self._filter_database)
+        if self._save_data and self._items:
+            self._populate_scanned_items(
+                incremental=True, schedule_enrichment=False
+            )
 
     def _toggle_icons(self) -> None:
         self._icons_enabled = not self._icons_enabled
         self._config["show_icons"] = self._icons_enabled
         self._save_config()
 
-        btn_text = "Hide Icons" if self._icons_enabled else "Show Icons"
-        row_h = max(ICON_SIZE + 2, 24) if self._icons_enabled else 24
-
-        self._show_icons_btn.setText(btn_text)
-        if hasattr(self, '_db_show_icons_btn'):
-            self._db_show_icons_btn.setText(btn_text)
-        if hasattr(self, '_global_icons_btn'):
-            self._global_icons_btn.setText(btn_text)
+        self._apply_icon_button_labels()
 
         if self._icons_enabled and self._icon_cache.coverage < 100:
             reply = QMessageBox.question(
@@ -31656,9 +32595,10 @@ QCheckBox::indicator {{
             if reply == QMessageBox.Yes:
                 self._bulk_download_icons()
 
-        for tbl in [self._inv_table, self._equip_table, self._repurch_table, self._db_table, self._swap_list, self._merc_table]:
-            tbl.setColumnWidth(0, (ICON_SIZE + 16) if self._icons_enabled else 0)
-            tbl.verticalHeader().setDefaultSectionSize(row_h)
+        if self._icons_enabled:
+            self._start_icon_warm()
+
+        self._apply_icon_display_metrics()
 
         self._populate_inventory()
         self._populate_equipment()
@@ -31667,29 +32607,57 @@ QCheckBox::indicator {{
         self._merc_refresh()
 
     def _bulk_download_icons(self) -> None:
-        self._update_status("Downloading icons from GitHub...")
-        QApplication.processEvents()
+        if getattr(self, '_icon_download_cancel', None) is not None:
+            self._update_status("Icon download is already running")
+            return
 
-        def _progress(folder, downloaded, skipped, errors, total):
-            self._update_status(
-                f"Icons [{folder}]: {downloaded} downloaded, {skipped} cached, "
-                f"{errors} failed ({total} total)")
-            QApplication.processEvents()
+        import threading as _threading
+        cancel_event = _threading.Event()
 
-        import threading
-        def _do_download():
-            stats = self._icon_cache.bulk_download_all(progress_callback=_progress)
-            from PySide6.QtCore import QMetaObject, Qt as _Qt
-            self._update_status(
-                f"Icons: {stats['downloaded']} downloaded, {stats['skipped']} cached, "
-                f"{stats['errors']} failed")
-
-        thread = threading.Thread(target=_do_download, daemon=True)
-        thread.start()
-        self._populate_swap_list(
-            self._swap_search.text().strip() if hasattr(self, '_swap_search') else "",
-            self._swap_category.currentText() if hasattr(self, '_swap_category') else "All",
+        progress = QProgressDialog(
+            "Contacting GitHub for the icon list...", "Cancel", 0, 100, self
         )
+        progress.setWindowTitle("Downloading Item Icons")
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.canceled.connect(cancel_event.set)
+        progress.show()
+
+        def _on_progress(folder, downloaded, skipped, errors, total) -> None:
+            done = downloaded + skipped + errors
+            progress.setLabelText(
+                f"Downloading item icons [{folder}]\n"
+                f"{downloaded} downloaded, {skipped} cached, {errors} failed "
+                f"of {total}"
+            )
+            progress.setValue(min(99, int(done / max(1, total) * 100)))
+
+        def _on_finished(stats) -> None:
+            self._icon_download_cancel = None
+            progress.setValue(100)
+            progress.close()
+            if stats.get('cancelled'):
+                self._update_status(
+                    f"Icon download cancelled after {stats['downloaded']} files; "
+                    "run it again anytime to resume"
+                )
+            else:
+                self._config.pop("icons_download_declined", None)
+                self._save_config()
+                self._update_status(
+                    f"Icons ready: {stats['downloaded']} downloaded, "
+                    f"{stats['skipped']} cached, {stats['errors']} failed"
+                )
+            self._apply_icon_button_labels()
+            self._start_icon_warm()
+
+        if self._icon_cache.bulk_download_async(
+            progress=_on_progress, completed=_on_finished, cancel_event=cancel_event
+        ):
+            self._icon_download_cancel = cancel_event
+        else:
+            progress.close()
 
     def _on_icon_loaded(self, item_key: int, pixmap) -> None:
         self._icon_ready.emit(item_key)
@@ -31715,8 +32683,14 @@ QCheckBox::indicator {{
     def _on_inv_subtab_changed(self, index: int) -> None:
         self._populate_inventory()
 
+    def _set_inv_subtabs_loading(self) -> None:
+        if not hasattr(self, '_inv_subtabs'):
+            return
+        for idx, (label, _filter_type, _filter_val) in enumerate(self._inv_subtab_filters):
+            self._inv_subtabs.setTabText(idx, f"{label} (loading…)")
+
     def _update_inv_subtab_counts(self) -> None:
-        if not hasattr(self, '_inv_subtabs') or not self._items:
+        if not hasattr(self, '_inv_subtabs'):
             return
         known_sources = {"Equipment", "Inventory", "Mercenary"}
         for idx, (label, filter_type, filter_val) in enumerate(self._inv_subtab_filters):
@@ -32618,7 +33592,10 @@ QCheckBox::indicator {{
         for row, info in enumerate(items):
             icon_item = QTableWidgetItem()
             if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(info.item_key)
+                # This runs synchronously for ~6,000 rows during startup and on
+                # every filter keystroke; only attach pixmaps already warmed
+                # into memory — never decode from disk here.
+                px = self._icon_cache.peek(info.item_key)
                 if px:
                     icon_item.setIcon(QIcon(px))
             table.setItem(row, 0, icon_item)
@@ -33129,11 +34106,12 @@ QCheckBox::indicator {{
 
             icon_item = QTableWidgetItem()
             if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(info.item_key)
+                # Runs synchronously for ~6,000 rows at startup and on every
+                # search keystroke; only attach pixmaps already warmed into
+                # memory — never decode from disk here.
+                px = self._icon_cache.peek(info.item_key)
                 if px:
                     icon_item.setIcon(QIcon(px))
-                elif self._icon_cache.has_icon(info.item_key):
-                    self._icon_cache.request_icon(info.item_key, self._on_icon_loaded)
             table.setItem(row, 0, icon_item)
 
             key_item = QTableWidgetItem(str(info.item_key))
@@ -33306,9 +34284,6 @@ QCheckBox::indicator {{
         QMessageBox.information(self, "GitHub Sync", msg)
 
     def _sync_all_icons(self) -> None:
-        import json as _json
-        from urllib.request import urlopen, Request
-
         keys = set()
         for item in self._name_db._items.values():
             keys.add(item.item_key)
@@ -33333,37 +34308,7 @@ QCheckBox::indicator {{
         if reply != QMessageBox.Yes:
             return
 
-        self._update_status(f"Downloading {needed} icons...")
-        QApplication.processEvents()
-
-        from icon_cache import _GITHUB_ICON_BASE
-        downloaded = 0
-        errors = 0
-        for i, key in enumerate(sorted(keys)):
-            local_path = os.path.join(local_dir, f"{key}.webp")
-            if os.path.isfile(local_path):
-                continue
-            try:
-                url = f"{_GITHUB_ICON_BASE}/{key}.webp"
-                req = Request(url, headers={"User-Agent": "CrimsonSaveEditor"})
-                with urlopen(req, timeout=15) as resp:
-                    data = resp.read()
-                if data and len(data) > 100:
-                    with open(local_path, 'wb') as f:
-                        f.write(data)
-                    downloaded += 1
-                else:
-                    errors += 1
-            except Exception:
-                errors += 1
-
-            if (downloaded + errors) % 100 == 0:
-                self._update_status(f"Icons: {downloaded} downloaded, {errors} failed, {needed - downloaded - errors} remaining...")
-                QApplication.processEvents()
-
-        msg = f"Downloaded {downloaded} icons, {errors} not available on GitHub.\nTotal cached: {already + downloaded}"
-        self._update_status(msg)
-        QMessageBox.information(self, "Sync Complete", msg)
+        self._bulk_download_icons()
 
 
     def _get_backup_dir(self) -> str:
@@ -34228,6 +35173,14 @@ QCheckBox::indicator {{
             return
 
         entry = self._undo_stack.pop()
+        if entry.previous_blob is not None:
+            self._save_data.decompressed_blob = bytearray(entry.previous_blob)
+            self._document_generation_counter += 1
+            self._save_data.document_generation = self._document_generation_counter
+            self._scan_and_populate()
+            self._dirty = bool(self._undo_stack)
+            self._update_status(f"Undone: {entry.description}")
+            return
         blob = self._save_data.decompressed_blob
 
         for offset, old_bytes, _new_bytes in entry.patches:
@@ -34724,26 +35677,22 @@ QCheckBox::indicator {{
         if scope == "save":
             text = "This tab modifies your SAVE FILE"
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         elif scope == "game":
             text = "This tab modifies GAME FILES (requires admin + restart)"
-            color = "#FFB74D"
-            bg = "rgba(255,183,77,0.08)"
+            color = COLORS["error"]
         elif scope == "readonly":
             text = "This tab is READ-ONLY (browse only)"
             color = "#B0A088"
-            bg = "rgba(176,160,136,0.05)"
         else:
             text = scope
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding: 3px 8px; "
-            f"border: 1px solid {color}; border-radius: 3px; "
-            f"background-color: {bg}; font-weight: bold;"
+            f"color: {color}; font-size: 10px; padding: 2px 8px; "
+            f"border: 0; border-left: 2px solid {color}; "
+            "background: transparent; font-weight: bold;"
         )
-        lbl.setFixedHeight(22)
+        lbl.setFixedHeight(20)
         return lbl
 
     def _show_guide(self, key: str) -> None:

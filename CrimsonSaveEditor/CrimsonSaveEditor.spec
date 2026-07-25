@@ -1,6 +1,12 @@
+from pathlib import Path
+
+SPEC_DIR = Path(SPECPATH).resolve()
+REPO_ROOT = SPEC_DIR.parent
+GAME_MODS_ROOT = REPO_ROOT / 'CrimsonGameMods'
+
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=[str(SPEC_DIR), str(REPO_ROOT), str(GAME_MODS_ROOT)],
     binaries=[],
     datas=[
         ('parc_parser.dll', '.'),
@@ -27,8 +33,12 @@ a = Analysis(
         ('game_map.json', '.'),
         ('localizationstring_eng_items.tsv', '.'),
         ('editor_version_standalone.json', '.'),
+        ('save_schema_profiles.json', '.'),
         ('locale', 'locale'),
         ('knowledge_packs', 'knowledge_packs'),
+        (str(REPO_ROOT / 'icons_mercenary' / '1000799.webp'), 'crimson_assets'),
+        (str(REPO_ROOT / 'crimson_common'), 'crimson_common'),
+        (str(GAME_MODS_ROOT / 'crimson_rs'), 'crimson_rs'),
     ],
     hiddenimports=[
         'lz4',
@@ -46,6 +56,22 @@ a = Analysis(
         'questinfo_parser',
         'item_template_db',
         'ben_save_decrypt',
+        'app_logging',
+        'save_compat',
+        'blackstar_compat',
+        'blackstar_template',
+        'blackstar_unlock',
+        'blackstar_worker',
+        'crimson_common',
+        'crimson_common.blackstar_timer',
+        'crimson_common.blackstar_timer_worker',
+        'crimson_common.blackstar_timer_ui',
+        'crimson_common.crimson_theme',
+        'crimson_common.crimson_icons',
+        'crimson_common.crimson_shell',
+        'crimson_common.gui_population',
+        'crimson_common.gui_task_worker',
+        'crimson_theme',
         'crimson_rs',
         'crimson_rs.enums',
         'crimson_rs.create_pack',

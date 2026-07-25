@@ -1,5 +1,12 @@
 import sys
 import os
+from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    value = str(REPO_ROOT)
+    if value not in sys.path:
+        sys.path.insert(0, value)
 
 
 def _splash(text: str) -> None:
@@ -94,7 +101,7 @@ from gui import MainWindow
 
 
 _CJK_FONT_STACK = [
-    "Consolas",
+    "Bahnschrift",
     "Segoe UI",
     "Microsoft YaHei",
     "Microsoft JhengHei",
@@ -189,7 +196,8 @@ def main() -> None:
     font = QFont()
     font.setFamilies(_CJK_FONT_STACK)
     font.setPointSize(10)
-    font.setStyleHint(QFont.Monospace)
+    font.setStyleName("SemiCondensed")
+    font.setStyleHint(QFont.SansSerif)
     app.setFont(font)
 
     chosen_language = _compute_startup_language()

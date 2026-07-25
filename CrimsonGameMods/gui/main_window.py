@@ -11,9 +11,9 @@ import traceback
 
 
 log = logging.getLogger(__name__)
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSortFilterProxyModel, Signal, QSize, QThread
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QBrush, QShortcut,
 )
@@ -55,6 +55,13 @@ from localization import tr, set_language, get_language, get_available_languages
 from gui.theme import (
     COLORS, CATEGORY_COLORS, _TAB_SELECTED_BG, _TAB_SELECTED_COLOR,
     _TAB_SELECTED_BORDER, DARK_STYLESHEET, LIGHT_STYLESHEET, apply_theme,
+    install_crimson_shell,
+)
+from crimson_common.crimson_shell import (
+    ShellCommand,
+    ShellDestination,
+    ShellRoute,
+    install_crimson_application_shell,
 )
 from gui.utils import _num_item
 
@@ -129,6 +136,7 @@ from gui.tabs.world import (
 from gui.tabs.patches import GamePatchesTab
 from gui.tabs.field_edit import FieldEditTab
 from gui.tabs.bagspace import BagSpaceTab
+from gui.tabs.reserveslot import ReserveSlotTab
 from gui.tabs.skill_tree import SkillTreeTab
 from gui.tabs.pas_editor import PasEditorTab
 from gui.tabs.quest_mods import QuestModsTab
@@ -186,6 +194,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("crimsonWindow")
         try:
             from updater import APP_VARIANT as _variant
         except Exception:
@@ -228,6 +237,12 @@ class MainWindow(QMainWindow):
         self._undo_stack: List[UndoEntry] = []
         self._loaded_path: str = ""
         self._dirty: bool = False
+        self._load_thread = None
+        self._load_worker = None
+        self._load_handle = None
+        self._load_progress = None
+        self._load_population_pending = False
+        self._editor_population_job = None
         self._parc_status: str = ""
         self._tab_loaders: dict = {}
         self._loaded_tabs: set = set()
@@ -320,7 +335,7 @@ class MainWindow(QMainWindow):
             self._update_status(
                 f"Ready. Item DB: {len(self._name_db.items)} items"
                 + (f" from {os.path.basename(db_path)}" if db_path else " (not found)")
-                + "  |  Select a save from the sidebar or File > Open"
+                + "  |  Select a save with SAVES or Menu > File > Open"
             )
 
 
@@ -352,6 +367,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
 
         sidebar = QFrame()
+        sidebar.setObjectName("saveBrowser")
         sidebar.setMinimumWidth(40)
         sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-right: 1px solid {COLORS['border']};")
         sb_layout = QVBoxLayout(sidebar)
@@ -370,23 +386,25 @@ class MainWindow(QMainWindow):
         self._sb_collapse_btn.clicked.connect(self._toggle_save_sidebar)
         hdr_row.addWidget(self._sb_collapse_btn)
         hdr = QLabel("Save Browser")
+        hdr.setProperty("heading", True)
         hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 4px 0;")
         hdr_row.addWidget(hdr)
         hdr_row.addStretch()
+        sb_layout.addLayout(hdr_row)
 
+        nav_row = QHBoxLayout()
         home_btn = QPushButton("Home")
         home_btn.setFixedHeight(22)
         home_btn.setToolTip("Go to Inventory tab (Tab 1)")
         home_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(0))
-        hdr_row.addWidget(home_btn)
+        nav_row.addWidget(home_btn)
 
         backup_nav_btn = QPushButton("Backup")
         backup_nav_btn.setFixedHeight(22)
         backup_nav_btn.setToolTip("Go to Backup/Restore tab")
         backup_nav_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(self._tabs.count() - 1))
-        hdr_row.addWidget(backup_nav_btn)
-
-        sb_layout.addLayout(hdr_row)
+        nav_row.addWidget(backup_nav_btn)
+        sb_layout.addLayout(nav_row)
 
         path_row = QHBoxLayout()
         self._save_root_label = QLabel("(auto-detect)")
@@ -423,6 +441,7 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(ref_btn)
 
         self._quick_save_btn = QPushButton("SAVE EDIT TO SELECTED FILE")
+        self._quick_save_btn.setProperty("primaryAction", True)
         self._quick_save_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLORS['accent']}; color: white; font-weight: bold; "
             f"padding: 8px; border-radius: 4px; font-size: 11px; }}"
@@ -440,8 +459,8 @@ class MainWindow(QMainWindow):
 
         settings_btn = QPushButton("Settings")
         settings_btn.setStyleSheet(
-            f"font-size: 12px; font-weight: bold; color: #4FC3F7; "
-            f"border: 1px solid #4FC3F7; border-radius: 4px; padding: 4px 8px;"
+            f"font-size: 10px; font-weight: bold; color: {COLORS['text_dim']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: 0; padding: 4px 8px;"
         )
         settings_btn.clicked.connect(self._open_settings)
         sb_layout.addWidget(settings_btn)
@@ -459,10 +478,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._save_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._save_dock.setWidget(sidebar)
         self._save_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_sb_collapsed': not v})
@@ -474,20 +489,21 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        self._center_status = QLabel("Ready — Select a save from the sidebar or File > Open")
+        self._center_status = QLabel("Ready — Select a save with SAVES or Menu > File > Open")
         self._center_status.setAlignment(Qt.AlignCenter)
         self._center_status.setStyleSheet(
-            f"background-color: {COLORS['panel']}; "
-            f"color: {COLORS['accent']}; "
-            f"font-size: 13px; font-weight: bold; "
-            f"padding: 8px; "
+            "background: transparent; "
+            f"color: {COLORS['text_dim']}; "
+            "font-size: 10px; font-weight: normal; "
+            "padding: 4px; "
             f"border-bottom: 1px solid {COLORS['border']};"
         )
-        self._center_status.setMaximumHeight(36)
+        self._center_status.setMaximumHeight(28)
         self._center_status.setVisible(False)  # hidden in gamemods variant
         right_layout.addWidget(self._center_status)
 
         self._global_info_widget = QWidget()
+        self._global_info_widget.setObjectName("contextStrip")
         info_layout = QHBoxLayout(self._global_info_widget)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(4)
@@ -497,9 +513,9 @@ class MainWindow(QMainWindow):
 
         self._global_game_path = QLabel("Not set — click Browse")
         self._global_game_path.setStyleSheet(
-            f"color: {COLORS['accent']}; padding: 2px 6px; "
-            f"border: 1px solid {COLORS['border']}; border-radius: 3px; "
-            f"background-color: {COLORS['input_bg']};"
+            f"color: {COLORS['text_dim']}; padding: 2px 6px; "
+            f"border: 0; border-bottom: 1px solid {COLORS['border']}; "
+            "background: transparent;"
         )
         self._global_game_path.setToolTip("Game installation path used by Game Data, ItemBuffs, and Stores")
         info_layout.addWidget(self._global_game_path, 1)
@@ -520,9 +536,9 @@ class MainWindow(QMainWindow):
         self._global_hide_btn.setCheckable(True)
         self._global_hide_btn.setToolTip("Hide game path bar (▲ collapse / ▼ expand)")
         self._global_hide_btn.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['accent']}; color: white; "
-            f"font-weight: bold; border-radius: 12px; font-size: 14px; }}"
-            f"QPushButton:checked {{ background: {COLORS['accent']}; }}")
+            f"QPushButton {{ background: transparent; color: {COLORS['text_dim']}; "
+            f"font-weight: bold; border: 1px solid {COLORS['border']}; "
+            "border-radius: 0; font-size: 11px; }}")
         self._global_hide_btn.clicked.connect(self._toggle_global_info)
         info_layout.addWidget(self._global_hide_btn)
 
@@ -540,11 +556,15 @@ class MainWindow(QMainWindow):
             self._global_game_path.setToolTip(saved_gp)
 
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("primaryNav")
+        self._tabs.tabBar().setObjectName("primaryTabBar")
+        self._tabs.setTabPosition(QTabWidget.North)
         right_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(right_panel)
 
         from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
         pack_sidebar = QFrame()
+        pack_sidebar.setObjectName("packBrowser")
         pack_sidebar.setMinimumWidth(40)
         pack_sidebar.setStyleSheet(f"background-color: {COLORS['panel']}; border-left: 1px solid {COLORS['border']};")
         ps_layout = QVBoxLayout(pack_sidebar)
@@ -553,6 +573,7 @@ class MainWindow(QMainWindow):
 
         ps_hdr_row = QHBoxLayout()
         ps_hdr = QLabel("Pack Browser")
+        ps_hdr.setProperty("heading", True)
         ps_hdr.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {COLORS['accent']}; padding: 2px 0;")
         ps_hdr_row.addWidget(ps_hdr)
         ps_hdr_row.addStretch()
@@ -629,10 +650,6 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFloatable |
             QDockWidget.DockWidgetClosable
         )
-        self._pack_dock.setStyleSheet(
-            f"QDockWidget::title {{ background: {COLORS['accent']}; padding: 4px; "
-            f"color: white; font-weight: bold; }}"
-            f"QDockWidget {{ border: 1px solid {COLORS['accent']}; }}")
         self._pack_dock.setWidget(pack_sidebar)
         self._pack_dock.visibilityChanged.connect(
             lambda v: self.__dict__.update({'_ps_collapsed': not v})
@@ -681,11 +698,17 @@ class MainWindow(QMainWindow):
         )
         _corner_layout.addWidget(self._btn_toggle_save_browser)
 
-        self._tabs.setCornerWidget(_corner, Qt.TopRightCorner)
+        install_crimson_shell(
+            self._tabs,
+            product="GAME MODS",
+            action_widget=_corner,
+        )
 
 
         self._mods_tabs = QTabWidget()
-        self._mods_tabs.setTabPosition(QTabWidget.South)
+        self._mods_tabs.setObjectName("sectionNav")
+        self._mods_tabs.tabBar().setObjectName("sectionTabBar")
+        self._mods_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._mods_tabs, tr("tab.game_mods"))
 
         # if DmmWebViewTab is not None:
@@ -694,11 +717,17 @@ class MainWindow(QMainWindow):
         #     self._tabs.addTab(self._dmm_webview_tab, "Mod Manager")
 
         self._items_tabs = QTabWidget()
-        self._items_tabs.setTabPosition(QTabWidget.South)
+        self._items_tabs.setObjectName("sectionNav")
+        self._items_tabs.tabBar().setObjectName("sectionTabBar")
+        self._items_tabs.setTabPosition(QTabWidget.North)
         self._tabs.addTab(self._items_tabs, tr("tab.items"))
 
         self._save_tabs = QTabWidget()
+        self._save_tabs.setObjectName("sectionNav")
+        self._save_tabs.tabBar().setObjectName("sectionTabBar")
         self._world_tabs = QTabWidget()
+        self._world_tabs.setObjectName("sectionNav")
+        self._world_tabs.tabBar().setObjectName("sectionTabBar")
 
         _real_tabs = self._tabs
 
@@ -713,6 +742,7 @@ class MainWindow(QMainWindow):
         self._patches_tab.status_message.connect(self._update_status)
         self._patches_tab.game_path_changed.connect(self._set_game_path)
         self._patches_tab.config_save_requested.connect(self._save_config)
+        self._mods_tabs.addTab(self._patches_tab, "Game Patches")
 
         self._field_edit_tab_obj = FieldEditTab(
             config=self._config,
@@ -728,6 +758,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._mods_tabs.addTab(self._field_edit_tab_obj, tr("FieldEdit"))
+
+        self._reserve_slot_tab = ReserveSlotTab(
+            config=self._config,
+            game_path_getter=lambda: self._config.get("game_install_path", ""),
+        )
+        self._reserve_slot_tab.status_message.connect(self._update_status)
+        self._reserve_slot_tab.config_save_requested.connect(self._save_config)
+        _saved_gp_reserveslot = self._config.get("game_install_path", "")
+        if _saved_gp_reserveslot:
+            self._reserve_slot_tab.set_game_path(_saved_gp_reserveslot)
+        self._mods_tabs.addTab(self._reserve_slot_tab, "Dragon Wheel")
 
         self._iteminfo_cache = ItemInfoCache()
         self._iteminfo_cache.set_game_path(self._config.get("game_install_path", ""))
@@ -949,6 +990,124 @@ class MainWindow(QMainWindow):
 
         if self._config.get("ui_scale", 100) != 100 or self._config.get("compact_mode", False):
             self._apply_ui_settings()
+
+        self._shell = install_crimson_application_shell(
+            self,
+            product="GAME MODS",
+            router_tabs=self._real_tabs,
+            destinations=self._shell_destinations(),
+            context_widget=self._global_info_widget,
+            commands=(
+                ShellCommand("SAVES", self._toggle_save_sidebar, "Open the save browser"),
+                ShellCommand("PACKS", self._toggle_pack_sidebar, "Open the item pack browser"),
+            ),
+            docks=(self._save_dock, self._pack_dock),
+            preserve_widgets=(self._center_status,),
+        )
+        self._patches_tab.set_shell_mode(True)
+
+    def _shell_destinations(self) -> tuple[ShellDestination, ...]:
+        outer = self._real_tabs
+
+        def find_route(
+            label: str,
+            section: QTabWidget,
+            tab_name: str,
+            description: str = "",
+            *,
+            icon_name: str = "",
+            game_art_id: int | None = None,
+            badge: str = "",
+            immersive: bool = False,
+        ) -> ShellRoute | None:
+            for index in range(section.count()):
+                if section.tabText(index) == tab_name:
+                    return ShellRoute(
+                        label,
+                        outer.indexOf(section),
+                        section,
+                        index,
+                        description,
+                        icon_name,
+                        game_art_id,
+                        badge,
+                        immersive,
+                    )
+            return None
+
+        def routes(*candidates: ShellRoute | None) -> tuple[ShellRoute, ...]:
+            return tuple(route for route in candidates if route is not None)
+
+        blackstar = find_route(
+            "Blackstar",
+            self._mods_tabs,
+            "Game Patches",
+            "Preview, apply, and restore Blackstar's verified archive preset.",
+            icon_name="mounts",
+            game_art_id=1000799,
+            badge="DRAGON",
+            immersive=True,
+        )
+        game_patches = find_route(
+            "Game Patches",
+            self._mods_tabs,
+            "Game Patches",
+            "Verified archive patches and recovery tools.",
+            icon_name="mods",
+        )
+        item_buffs = find_route("Item Buffs", self._mods_tabs, tr("tab.itembuffs"))
+        merc_pets = find_route("Mercenaries & Pets", self._mods_tabs, "MercPets")
+        database = find_route("Item Database", self._items_tabs, tr("tab.database"))
+        field_edit = find_route("Field & Regions", self._mods_tabs, tr("FieldEdit"))
+        game_browser = find_route("Game Browser", self._mods_tabs, tr("Game Browser"))
+        return (
+            ShellDestination(
+                "SAVE",
+                routes(item_buffs, merc_pets, database),
+                "Save-aware tools",
+            ),
+            ShellDestination(
+                "MOUNTS",
+                routes(
+                    blackstar,
+                    find_route("Dragon Wheel", self._mods_tabs, "Dragon Wheel"),
+                    merc_pets,
+                    field_edit,
+                ),
+                "Mount systems",
+            ),
+            ShellDestination(
+                "INVENTORY",
+                routes(
+                    item_buffs,
+                    find_route("Stores", self._mods_tabs, tr("tab.stores")),
+                    find_route("Storage", self._mods_tabs, "BagSpace"),
+                    find_route("Drop Sets", self._mods_tabs, "DropSets"),
+                    database,
+                ),
+                "Items & economy",
+            ),
+            ShellDestination(
+                "WORLD",
+                routes(
+                    field_edit,
+                    find_route("Spawn Editor", self._mods_tabs, "SpawnEdit"),
+                    find_route("Skill Tree", self._mods_tabs, "SkillTree"),
+                    game_browser,
+                ),
+                "World systems",
+            ),
+            ShellDestination(
+                "MODS",
+                routes(
+                    game_patches,
+                    find_route("Stacker Tool", self._mods_tabs, "Stacker Tool"),
+                    find_route("Load Manager", self._mods_tabs, "Load Manager"),
+                    game_browser,
+                ),
+                "Archive workshop",
+            ),
+        )
 
     def _toggle_save_sidebar(self) -> None:
         if self._save_dock.isVisible():
@@ -1986,6 +2145,14 @@ class MainWindow(QMainWindow):
     def _apply_ui_settings(self) -> None:
         scale = self._config.get("ui_scale", 100) / 100.0
         compact = self._config.get("compact_mode", False)
+        sheet = apply_theme(
+            QApplication.instance(),
+            self._config.get("theme", "dark"),
+            scale=scale,
+            compact=compact,
+        )
+        self.setStyleSheet(sheet)
+        return
 
         if compact:
             font_main = 11
@@ -2483,6 +2650,8 @@ QCheckBox::indicator {{
             self._field_edit_tab_obj.set_game_path(path)
         if hasattr(self, '_bagspace_tab'):
             self._bagspace_tab.set_game_path(path)
+        if hasattr(self, '_reserve_slot_tab'):
+            self._reserve_slot_tab.set_game_path(path)
         if hasattr(self, '_load_manager_tab'):
             self._load_manager_tab.set_game_path(path)
         if hasattr(self, '_quest_mods_tab'):
@@ -2535,13 +2704,35 @@ QCheckBox::indicator {{
         self._set_game_path(path)
 
     def _global_auto_detect_path(self) -> None:
-        detected = PazPatchManager.find_game_path()
-        if detected:
-            self._set_game_path(detected)
-        else:
-            QMessageBox.warning(self, "Not Found",
-                "Could not auto-detect Crimson Desert.\n"
-                "Use Browse to set the path manually.")
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching for the Crimson Desert installation...")
+
+        def _completed(detected: str | None) -> None:
+            if detected:
+                self._set_game_path(detected)
+                self._update_status(f"Game found: {detected}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Not Found",
+                    "Could not auto-detect Crimson Desert.\n"
+                    "Use Browse to set the path manually.",
+                )
+
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known Steam and library locations...", 20),
+                PazPatchManager.find_game_path(),
+            )[-1],
+            completed=_completed,
+            failed=lambda message, details: (
+                log.error("Game path detection failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Detection Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
 
 
     def _on_tab_navigate_requested(self, selector: str) -> None:
@@ -2996,6 +3187,7 @@ QCheckBox::indicator {{
 
     def _build_status_bar(self) -> None:
         self._status = self.statusBar()
+        self._status.setObjectName("statusRail")
         self._status_file_label = QLabel("No file loaded")
         self._status_items_label = QLabel("Items: 0")
         self._status_parc_label = QLabel("")
@@ -3084,7 +3276,24 @@ QCheckBox::indicator {{
             QMessageBox.critical(self, "Error", f"Failed to load raw stream:\n{e}")
 
     def _auto_find_save(self) -> None:
-        saves = find_save_files()
+        from crimson_common.gui_task_worker import start_gui_task
+
+        self._update_status("Searching known save locations...")
+        start_gui_task(
+            self,
+            task=lambda report: (
+                report("Searching known save locations...", 15),
+                find_save_files(),
+            )[-1],
+            completed=self._show_auto_find_results,
+            failed=lambda message, details: (
+                log.error("Save search failed: %s\n%s", message, details),
+                QMessageBox.critical(self, "Auto-Find Failed", message),
+            ),
+            progress=lambda message, _value: self._update_status(message),
+        )
+
+    def _show_auto_find_results(self, saves: list[dict]) -> None:
         if not saves:
             QMessageBox.information(
                 self, "Auto-Find",
@@ -3121,72 +3330,145 @@ QCheckBox::indicator {{
             self._load_save(saves[idx]["path"])
 
     def _load_save(self, path: str) -> None:
+        if (
+            (self._load_handle is not None and self._load_handle.is_running)
+            or self._load_population_pending
+        ):
+            self._update_status("A save is already loading")
+            return
+
+        from crimson_common.gui_task_worker import start_gui_task
         from PySide6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("Loading save file...", None, 0, 5, self)
+
+        progress = QProgressDialog("Preparing save load...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Loading")
         progress.setMinimumDuration(0)
         progress.setWindowModality(Qt.WindowModal)
         progress.setValue(0)
-        QApplication.processEvents()
 
-        def _step(msg, val):
-            progress.setLabelText(msg)
-            progress.setValue(val)
-            if hasattr(self, '_center_status'):
-                self._center_status.setText(msg)
-            QApplication.processEvents()
+        def _task(report):
+            report("Decrypting save file...", 10)
+            save_data = load_save_file(path)
+            report("Scanning items...", 45)
+            items = scan_items(save_data.decompressed_blob)
+            report("Resolving item names...", 65)
+            for item in items:
+                item.name = self._name_db.get_name(item.item_key)
+                item.category = self._name_db.get_category(item.item_key)
+            report("Creating pristine backup...", 80)
+            pristine = self._create_pristine_backup(path)
+            report("Preparing the editor...", 95)
+            return save_data, items, pristine
 
-        try:
-            _step("Decrypting save file...", 1)
-            self._save_data = load_save_file(path)
+        self._load_progress = progress
+        self._set_load_busy(True)
+
+        def _on_progress(message: str, value: int) -> None:
+            progress.setLabelText(message)
+            progress.setValue(value)
+            if hasattr(self, "_center_status"):
+                self._center_status.setText(message)
+
+        def _release_load_ui() -> None:
+            self._load_population_pending = False
+            if self._load_progress is progress:
+                progress.close()
+                self._load_progress = None
+            self._set_load_busy(False)
+
+        def _population_failed(message: str, details: str) -> None:
+            log.error("Editor population failed: %s\n%s", message, details)
+            _release_load_ui()
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"The save was loaded, but the editor could not be populated:\n\n{message}\n\n{details}",
+            )
+
+        def _on_completed(result) -> None:
+            save_data, items, pristine = result
+            self._save_data = save_data
+            self._items = items
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
-
-            _step("Creating backup...", 2)
-            pristine = self._create_pristine_backup(path)
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
-            _step("Scanning items...", 3)
-            self._scan_and_populate()
+            def _finish_population() -> None:
+                try:
+                    slot_dir = os.path.basename(os.path.dirname(path))
+                    friendly = self._friendly_slot_name(slot_dir)
+                    self._config["last_save_path"] = path
+                    self._config["last_slot"] = friendly
+                    self._save_config()
+                    self._refresh_sidebar()
 
-            _step("Populating UI...", 4)
+                    self._quick_save_btn.setEnabled(True)
+                    self._quick_save_btn.setToolTip(f"Save to: {path}")
+                    self.setWindowTitle(f"Crimson Desert Save Editor - {friendly}")
+                    self._update_status(f"Loaded: {friendly} ({slot_dir})")
+                    if hasattr(self, "_backup_tab"):
+                        self._backup_tab.set_loaded_path(path)
+                    progress.setValue(100)
+                except Exception as exc:
+                    _population_failed(str(exc), traceback.format_exc())
+                    return
+                _release_load_ui()
 
-            slot_dir = os.path.basename(os.path.dirname(path))
-            friendly = self._friendly_slot_name(slot_dir)
-            self._config["last_save_path"] = path
-            self._config["last_slot"] = friendly
-            self._save_config()
-            self._refresh_sidebar()
+            progress.setCancelButton(None)
+            self._load_population_pending = True
+            try:
+                self._populate_scanned_items(
+                    incremental=True,
+                    progress=_on_progress,
+                    completed=_finish_population,
+                    failed=_population_failed,
+                )
+            except Exception as exc:
+                _population_failed(str(exc), traceback.format_exc())
 
-            self._quick_save_btn.setEnabled(True)
-            self._quick_save_btn.setToolTip(f"Save to: {path}")
-
-            self.setWindowTitle(f"Crimson Desert Save Editor — {friendly}")
-            self._update_status(f"Loaded: {friendly} ({slot_dir})")
-
-            if hasattr(self, '_backup_tab'):
-                self._backup_tab.set_loaded_path(path)
-
-            progress.setValue(5)
-        except Warning as w:
-            self._update_status(f"Loaded (HMAC warning): {os.path.basename(path)}")
-            progress.close()
-        except Exception as e:
-            progress.close()
-            err_msg = str(e)
+        def _on_failed(message: str, details: str) -> None:
             hint = ""
-            if "byte must be in range" in err_msg or "chacha20" in traceback.format_exc().lower():
+            if "byte must be in range" in message or "chacha20" in details.lower():
                 hint = (
                     "\n\nThis file appears to be corrupted or is not a valid save file.\n"
                     "If this is a backup, it may have been created from an already-broken save.\n"
                     "Try loading a different save or restoring from an earlier backup."
                 )
             QMessageBox.critical(
-                self, "Error",
-                f"Failed to load save file:\n\n{e}{hint}\n\n{traceback.format_exc()}"
+                self,
+                "Error",
+                f"Failed to load save file:\n\n{message}{hint}\n\n{details}",
             )
+
+        def _on_cancelled() -> None:
+            self._update_status("Save loading cancelled; no save was changed")
+
+        def _background_finished() -> None:
+            self._load_handle = None
+            if not self._load_population_pending:
+                _release_load_ui()
+
+        progress.show()
+        self._load_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+            cancelled=_on_cancelled,
+            finished=_background_finished,
+        )
+        progress.canceled.connect(self._load_handle.cancel)
+
+    def _set_load_busy(self, busy: bool) -> None:
+        for name in ("_open_action", "_auto_find_action", "_save_action", "_save_as_action"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(not busy)
+        if hasattr(self, "_quick_save_btn"):
+            self._quick_save_btn.setEnabled(not busy and bool(self._save_data))
 
     def _save_file(self) -> None:
         if not self._save_data or not self._loaded_path:
@@ -3303,28 +3585,114 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
+        self._populate_scanned_items(incremental=True)
+
+    def _populate_scanned_items(
+        self,
+        *,
+        incremental: bool = False,
+        schedule_enrichment: bool = True,
+        progress: Optional[Callable[[str, int], None]] = None,
+        completed: Optional[Callable[[], None]] = None,
+        failed: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
         self._fix_duplicate_item_nos()
 
         self._loaded_tabs.clear()
 
-        self._status_parc_label.hide()
-        self._parc_progress.setValue(0)
-        self._parc_progress.setFormat("Scanning offsets...")
-        self._parc_progress.show()
-        if hasattr(self, '_inventory_tab'):
-            self._inventory_tab.load(self._save_data, self._items)
-            self._inventory_tab._populate_inventory()
-            self._loaded_tabs.add(self._inventory_tab)
-        if hasattr(self, '_equipment_tab'):
-            self._equipment_tab.load(self._save_data, self._items)
-            self._equipment_tab._populate_equipment()
-            self._loaded_tabs.add(self._equipment_tab)
-        if hasattr(self, '_buffs_tab'):
-            self._buffs_tab.load(self._save_data, self._items)
-            self._loaded_tabs.add(self._buffs_tab)
+        if schedule_enrichment:
+            self._status_parc_label.hide()
+            self._parc_progress.setValue(0)
+            self._parc_progress.setFormat("Scanning offsets...")
+            self._parc_progress.show()
+        if not incremental:
+            if hasattr(self, '_inventory_tab'):
+                self._inventory_tab.load(self._save_data, self._items)
+                self._inventory_tab._populate_inventory()
+                self._loaded_tabs.add(self._inventory_tab)
+            if hasattr(self, '_equipment_tab'):
+                self._equipment_tab.load(self._save_data, self._items)
+                self._equipment_tab._populate_equipment()
+                self._loaded_tabs.add(self._equipment_tab)
+            if hasattr(self, '_buffs_tab'):
+                self._buffs_tab.load(self._save_data, self._items)
+                self._loaded_tabs.add(self._buffs_tab)
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+            return
 
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._deferred_parc_enrich)
+        from crimson_common.gui_population import IncrementalGuiJob
+
+        preparation_steps: list[Callable[[], None]] = []
+        if hasattr(self, '_inventory_tab'):
+            preparation_steps.append(
+                lambda: (
+                    self._inventory_tab.load(self._save_data, self._items),
+                    self._inventory_tab._populate_inventory(),
+                    self._loaded_tabs.add(self._inventory_tab),
+                )
+            )
+        if hasattr(self, '_equipment_tab'):
+            preparation_steps.append(
+                lambda: (
+                    self._equipment_tab.load(self._save_data, self._items),
+                    self._equipment_tab._populate_equipment(),
+                    self._loaded_tabs.add(self._equipment_tab),
+                )
+            )
+
+        def _fail(message: str, details: str) -> None:
+            self._editor_population_job = None
+            if failed is not None:
+                failed(message, details)
+            else:
+                log.error("Incremental editor population failed: %s\n%s", message, details)
+
+        def _done() -> None:
+            self._editor_population_job = None
+            if schedule_enrichment:
+                QTimer.singleShot(100, self._deferred_parc_enrich)
+            if completed is not None:
+                completed()
+
+        def _load_buffs() -> None:
+            if not hasattr(self, '_buffs_tab'):
+                _done()
+                return
+            self._loaded_tabs.add(self._buffs_tab)
+            self._buffs_tab.load(
+                self._save_data,
+                self._items,
+                completed=_done,
+                failed=_fail,
+                progress=progress,
+            )
+
+        def _prepared() -> None:
+            self._editor_population_job = None
+            _load_buffs()
+
+        job = IncrementalGuiJob(
+            self,
+            items=preparation_steps,
+            consume=lambda _index, step: step(),
+            batch_size=1,
+            time_budget_ms=6,
+        )
+        self._editor_population_job = job
+        job.progress.connect(
+            lambda done, total: progress(
+                f"Preparing editor panels ({done:,}/{total:,})...",
+                96 + int((done / max(1, total)) * 2),
+            )
+            if progress is not None
+            else None
+        )
+        job.completed.connect(_prepared)
+        job.failed.connect(_fail)
+        job.start()
 
     def _deferred_parc_enrich(self) -> None:
         if not self._save_data or not self._items:
@@ -3373,17 +3741,22 @@ QCheckBox::indicator {{
         self._enrich_vendor_names()
 
         self._loaded_tabs.clear()
-        if hasattr(self, '_inventory_tab'):
-            self._inventory_tab._populate_inventory()
-            self._inventory_tab._inv_count_label.setText(str(len(self._items)))
-            self._loaded_tabs.add(self._inventory_tab)
-        if hasattr(self, '_equipment_tab'):
-            self._equipment_tab._populate_equipment()
-            self._loaded_tabs.add(self._equipment_tab)
 
-        self._reload_visible_tabs()
+        def _after_refresh() -> None:
+            if hasattr(self, '_inventory_tab'):
+                self._inventory_tab._inv_count_label.setText(str(len(self._items)))
+            self._reload_visible_tabs()
+            self._prefetch_parse_cache()
 
-        self._prefetch_parse_cache()
+        self._populate_scanned_items(
+            incremental=True,
+            schedule_enrichment=False,
+            progress=lambda message, _value: self._update_status(message),
+            completed=_after_refresh,
+            failed=lambda message, details: log.error(
+                "PARC table refresh failed: %s\n%s", message, details
+            ),
+        )
 
     def _prefetch_parse_cache(self) -> None:
         sd = self._save_data
@@ -4108,26 +4481,22 @@ QCheckBox::indicator {{
         if scope == "save":
             text = "This tab modifies your SAVE FILE"
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         elif scope == "game":
             text = "This tab modifies GAME FILES (requires admin + restart)"
-            color = "#FFB74D"
-            bg = "rgba(255,183,77,0.08)"
+            color = COLORS["error"]
         elif scope == "readonly":
             text = "This tab is READ-ONLY (browse only)"
             color = "#B0A088"
-            bg = "rgba(176,160,136,0.05)"
         else:
             text = scope
             color = "#4FC3F7"
-            bg = "rgba(79,195,247,0.08)"
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding: 3px 8px; "
-            f"border: 1px solid {color}; border-radius: 3px; "
-            f"background-color: {bg}; font-weight: bold;"
+            f"color: {color}; font-size: 10px; padding: 2px 8px; "
+            f"border: 0; border-left: 2px solid {color}; "
+            "background: transparent; font-weight: bold;"
         )
-        lbl.setFixedHeight(22)
+        lbl.setFixedHeight(20)
         return lbl
 
     def _show_guide(self, key: str) -> None:

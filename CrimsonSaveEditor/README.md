@@ -1,43 +1,43 @@
 # Crimson Save Editor
 
-A PySide6 desktop tool for editing **Crimson Desert** save files. It handles inventory, equipment, quests, knowledge, abyss gates, dyes, and related save data.
+A PySide6 desktop editor for encrypted Crimson Desert saves. It supports
+inventory, equipment, quests, knowledge, abyss gates, dyes, mercenaries, and
+related PARC structures.
 
-## Install
+## Blackstar safety
 
-1. Download the latest release build for your platform.
-2. Place the app in a folder where you want it to keep config and backups.
-3. Run it and let it auto-detect your save location, or point it at your save manually.
+The no-quest Blackstar action defaults to Preview (dry run), runs outside the Qt
+GUI thread, and validates a legitimate 1.14 ownership record without changing
+quests or knowledge. A successful preview authorizes Apply & Save only for the
+exact unchanged source and candidate. Apply creates a verified encrypted backup,
+validates a temporary save, and atomically replaces the selected file. Running
+the operation twice is a byte-identical no-op; recognized obsolete 206-byte
+Blackstar records are replaced rather than duplicated.
 
-## Build from source
+General GUI writes require a known compatibility profile. Blackstar uses a
+narrow compatibility family covering only its mount/equipment structures and
+does not enable any other editor write on an unknown full schema. Before every write the editor
+creates and SHA-256-verifies an encrypted backup, writes a sibling temporary
+file, decrypts and validates it, and only then atomically replaces the
+destination. Save As backs up an existing destination rather than an unrelated
+loaded slot, and a last-moment destination hash check rejects concurrent changes.
 
-## Windows
+## Windows build
 
-```bat
-pip install PySide6 lz4 cryptography Pillow pyinstaller
+From the repository root:
 
-:: Build Save Editor
-cd ..\CrimsonSaveEditor
-python -m PyInstaller CrimsonSaveEditor.spec --noconfirm
-:: Output: CrimsonSaveEditor\dist\CrimsonSaveEditor.exe
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r CrimsonSaveEditor\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest tests -v --timeout=600
+Push-Location CrimsonSaveEditor
+..\.venv\Scripts\python.exe -m PyInstaller CrimsonSaveEditor.spec --noconfirm --clean
+Pop-Location
 ```
 
-## Linux / SteamOS
+Output: `CrimsonSaveEditor\dist\CrimsonSaveEditorStandalone.exe`.
 
-```bash
-sudo apt install python3 python3-pip git   # Debian/Ubuntu/SteamOS
-pip install PySide6 lz4 cryptography Pillow pyinstaller
-
-git clone https://github.com/NattKh/CRIMSON-DESERT-SAVE-EDITOR-AND-GAME-MODS.git
-cd CRIMSON-DESERT-SAVE-EDITOR-AND-GAME-MODS/CrimsonSaveEditor
-
-python -m PyInstaller CrimsonSaveEditor.spec --noconfirm
-```
-
-## Note on native extensions
-
-The tools use `dmm_parser` (Rust-based parser). Pre-built `.pyd` (Windows) and `.abi3.so` (Linux) binaries ship with the repo in `CrimsonGameMods/dmm_parser/`. You do not need Rust installed to build.
-
-## Notes
-
-- The save editor shares parser/backend components with `CrimsonGameMods`.
-- The Linux build expects the native backend artifacts to be present in the sibling `CrimsonGameMods` tree.
+See `BUILD_FROM_SOURCE.md` in the repository root for the complete dependency
+inventory, fixture-copy dry-run command, optional `crimson_rs` limitations,
+native runtime requirement, packaged data list, and troubleshooting guidance.

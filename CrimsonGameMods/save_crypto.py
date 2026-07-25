@@ -7,6 +7,7 @@ import struct
 from typing import Tuple
 
 import lz4.block
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 from models import SaveData
 
@@ -42,89 +43,12 @@ HMAC_OFFSET = 0x2A
 PAYLOAD_OFFSET = 0x80
 
 
-def _rotl32(v: int, n: int) -> int:
-    v &= 0xFFFFFFFF
-    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
-
-
-def _quarter_round(s: list, a: int, b: int, c: int, d: int) -> None:
-    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
-    s[d] ^= s[a]
-    s[d] = _rotl32(s[d], 16)
-
-    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
-    s[b] ^= s[c]
-    s[b] = _rotl32(s[b], 12)
-
-    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
-    s[d] ^= s[a]
-    s[d] = _rotl32(s[d], 8)
-
-    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
-    s[b] ^= s[c]
-    s[b] = _rotl32(s[b], 7)
-
-
-def _chacha20_block(key_words: list, counter: int, nonce_words: list) -> bytes:
-    s = [
-        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
-        key_words[0], key_words[1], key_words[2], key_words[3],
-        key_words[4], key_words[5], key_words[6], key_words[7],
-        counter & 0xFFFFFFFF,
-        nonce_words[0], nonce_words[1], nonce_words[2],
-    ]
-
-    w = list(s)
-
-    for _ in range(10):
-        _quarter_round(w, 0, 4, 8, 12)
-        _quarter_round(w, 1, 5, 9, 13)
-        _quarter_round(w, 2, 6, 10, 14)
-        _quarter_round(w, 3, 7, 11, 15)
-        _quarter_round(w, 0, 5, 10, 15)
-        _quarter_round(w, 1, 6, 11, 12)
-        _quarter_round(w, 2, 7, 8, 13)
-        _quarter_round(w, 3, 4, 9, 14)
-
-    result = bytearray(64)
-    for i in range(16):
-        v = (w[i] + s[i]) & 0xFFFFFFFF
-        struct.pack_into("<I", result, i * 4, v)
-
-    return bytes(result)
-
-
 def chacha20_crypt(data: bytes, nonce16: bytes, key: bytes = None) -> bytes:
     if key is None:
         key = KEY
-    init_counter = struct.unpack_from("<I", nonce16, 0)[0]
-    nonce12 = nonce16[4:16]
-
-    try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
-        algo = algorithms.ChaCha20(key, nonce16)
-        cipher = Cipher(algo, mode=None)
-        enc = cipher.encryptor()
-        return enc.update(data) + enc.finalize()
-    except Exception:
-        pass
-
-    key_words = [struct.unpack_from("<I", key, i * 4)[0] for i in range(8)]
-    nonce_words = [struct.unpack_from("<I", nonce12, i * 4)[0] for i in range(3)]
-
-    output = bytearray(len(data))
-    pos = 0
-    counter = init_counter
-
-    while pos < len(data):
-        block = _chacha20_block(key_words, counter, nonce_words)
-        end = min(pos + 64, len(data))
-        for i in range(pos, end):
-            output[i] = data[i] ^ block[i - pos]
-        pos = end
-        counter = (counter + 1) & 0xFFFFFFFF
-
-    return bytes(output)
+    cipher = Cipher(algorithms.ChaCha20(key, nonce16), mode=None)
+    encryptor = cipher.encryptor()
+    return encryptor.update(data) + encryptor.finalize()
 
 
 def compute_hmac(data: bytes, key: bytes = None) -> bytes:
@@ -179,6 +103,7 @@ def load_save_file(path: str) -> SaveData:
     header = file_data[:HEADER_SIZE]
 
     save_data = SaveData(
+        source_file_sha256=hashlib.sha256(file_data).hexdigest(),
         raw_header=header,
         decompressed_blob=bytearray(decompressed),
         original_compressed_size=payload_size,
@@ -197,6 +122,7 @@ def load_raw_stream(path: str) -> SaveData:
     with open(path, "rb") as f:
         blob = f.read()
     return SaveData(
+        source_file_sha256=hashlib.sha256(blob).hexdigest(),
         raw_header=b"",
         decompressed_blob=bytearray(blob),
         original_compressed_size=0,
@@ -220,7 +146,7 @@ def write_save_file(
         bytes(edited_blob),
         store_size=False,
         mode="high_compression",
-        compression=9,
+        compression=3,
     )
 
     nonce = os.urandom(16)
@@ -235,7 +161,7 @@ def write_save_file(
         header[:0x12] = original_header[:0x12]
 
     header[0:4] = b"SAVE"
-    struct.pack_into("<H", header, VERSION_OFFSET, 2)
+    struct.pack_into("<H", header, VERSION_OFFSET, version)
     struct.pack_into("<H", header, FLAGS_OFFSET, 0x0080)
 
     struct.pack_into("<I", header, UNCOMP_SIZE_OFFSET, len(edited_blob))

@@ -1,6 +1,16 @@
 import sys
 import os
 import logging
+from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    for shared_path in (REPO_ROOT, REPO_ROOT / "CrimsonGameMods"):
+        value = str(shared_path)
+        if value not in sys.path:
+            sys.path.insert(0, value)
+
+from app_logging import configure_logging
 
 
 def _splash(text: str) -> None:
@@ -21,11 +31,8 @@ def _splash_close() -> None:
 
 _splash("Starting up...")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+LOG_PATH = configure_logging()
+logging.getLogger(__name__).info("Application logging initialized: %s", LOG_PATH)
 
 _splash("Loading Qt framework...")
 from PySide6.QtWidgets import QApplication
@@ -46,8 +53,9 @@ def main() -> None:
     app.setApplicationName("Crimson Desert Save Editor")
     app.setApplicationVersion(APP_VERSION)
 
-    font = QFont("Consolas", 10)
-    font.setStyleHint(QFont.Monospace)
+    font = QFont("Bahnschrift", 10)
+    font.setStyleName("SemiCondensed")
+    font.setStyleHint(QFont.SansSerif)
     app.setFont(font)
 
     _splash("Building main window...")

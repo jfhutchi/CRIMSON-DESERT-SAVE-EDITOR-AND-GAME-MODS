@@ -7,9 +7,12 @@ import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import save_crypto
+
+if TYPE_CHECKING:
+    from parc_serializer import ParcBlob
 
 
 RAW_MAGIC = b"\xFF\xFF\x04\x00"
@@ -1380,9 +1383,105 @@ def build_result_from_raw(
     raw = bytes(raw)
     schema = parse_schema(raw)
     type_names = [t.name for t in schema["types"]]
-    type_map = classify_type_indices(schema["types"])
     toc = parse_toc(raw, schema["schema_end"], type_names)
-    objects = decode_object_blocks(raw, toc["entries"], schema["types"])
+    return build_result_from_layout(
+        raw,
+        load_meta,
+        schema,
+        toc,
+        include_legacy=include_legacy,
+    )
+
+
+def build_result_from_parc(
+    raw: bytes | bytearray,
+    load_meta: dict[str, Any],
+    parc: ParcBlob,
+    *,
+    object_class_names: set[str] | None = None,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    raw = bytes(raw)
+    types = [
+        TypeDef(
+            index=type_def.index,
+            name=type_def.name,
+            fields=[
+                FieldDef(
+                    name=field.name,
+                    type_name=field.type_name,
+                    meta_kind=field.meta_kind,
+                    meta_size=field.meta_size,
+                    meta_aux=field.meta_aux,
+                    start_offset=field.start_offset,
+                    end_offset=field.end_offset,
+                )
+                for field in type_def.fields
+            ],
+            start_offset=type_def.start_offset,
+            end_offset=type_def.end_offset,
+        )
+        for type_def in parc.types
+    ]
+    schema = {
+        "header_tag": _u16(raw, 0x0E),
+        "header_zero": _u16(raw, 0x10),
+        "type_count": len(types),
+        "root_type": types[0].name if types else "",
+        "types": types,
+        "schema_end": parc.schema_end,
+    }
+    toc_entries = [
+        TocEntry(
+            index=entry.index,
+            class_index=entry.class_index,
+            class_name=(
+                parc.type_by_index[entry.class_index].name
+                if entry.class_index in parc.type_by_index
+                else f"<class_{entry.class_index}>"
+            ),
+            sentinel1=entry.sentinel1,
+            sentinel2=entry.sentinel2,
+            data_offset=entry.data_offset,
+            data_size=entry.data_size,
+            entry_offset=parc.toc_offset + 12 + entry.index * 20,
+        )
+        for entry in parc.toc_entries
+    ]
+    toc = {
+        "prefix_zero": _u32(parc.toc_header_bytes, 0),
+        "toc_count": len(parc.toc_entries),
+        "stream_size": parc.stream_size,
+        "entries": toc_entries,
+    }
+    return build_result_from_layout(
+        raw,
+        load_meta,
+        schema,
+        toc,
+        object_class_names=object_class_names,
+        include_legacy=include_legacy,
+    )
+
+
+def build_result_from_layout(
+    raw: bytes | bytearray,
+    load_meta: dict[str, Any],
+    schema: dict[str, Any],
+    toc: dict[str, Any],
+    *,
+    object_class_names: set[str] | None = None,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    raw = bytes(raw)
+    object_entries = toc["entries"]
+    if object_class_names is not None:
+        object_entries = [
+            entry
+            for entry in toc["entries"]
+            if entry.class_name in object_class_names
+        ]
+    objects = decode_object_blocks(raw, object_entries, schema["types"])
 
     result = {
         "input": load_meta,
@@ -1408,6 +1507,7 @@ def build_result_from_raw(
         "objects": objects,
     }
     if include_legacy:
+        type_map = classify_type_indices(schema["types"])
         character = parse_character_stats(raw, toc["entries"], type_map)
         items = scan_items(raw, toc["entries"], type_map)
         bags = scan_bag_expansion(raw, toc["entries"], type_map)

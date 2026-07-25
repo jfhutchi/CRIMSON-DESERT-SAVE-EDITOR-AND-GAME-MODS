@@ -11,6 +11,8 @@ class FieldDef:
     meta_kind: int
     meta_size: int
     meta_aux: int
+    start_offset: int = 0
+    end_offset: int = 0
 
 
 @dataclass
@@ -18,6 +20,8 @@ class TypeDef:
     index: int
     name: str
     fields: List[FieldDef]
+    start_offset: int = 0
+    end_offset: int = 0
 
     def bitmask_width(self) -> int:
         n = len(self.fields)
@@ -104,10 +108,12 @@ def parse_parc_blob(data: bytes) -> ParcBlob:
     for i in range(num_types):
         name_len = _u32(data, pos); pos += 4
         name = data[pos:pos + name_len].decode("utf-8"); pos += name_len
+        type_start = pos
         field_count = _u16(data, pos); pos += 2
 
         fields = []
         for j in range(field_count):
+            field_start = pos
             fname_len = _u32(data, pos); pos += 4
             fname = data[pos:pos + fname_len].decode("utf-8"); pos += fname_len
             tname_len = _u32(data, pos); pos += 4
@@ -116,9 +122,23 @@ def parse_parc_blob(data: bytes) -> ParcBlob:
             ms = _u16(data, pos + 2)
             ma = _u32(data, pos + 4)
             pos += 8
-            fields.append(FieldDef(name=fname, type_name=tname, meta_kind=mk, meta_size=ms, meta_aux=ma))
+            fields.append(FieldDef(
+                name=fname,
+                type_name=tname,
+                meta_kind=mk,
+                meta_size=ms,
+                meta_aux=ma,
+                start_offset=field_start,
+                end_offset=pos,
+            ))
 
-        td = TypeDef(index=i, name=name, fields=fields)
+        td = TypeDef(
+            index=i,
+            name=name,
+            fields=fields,
+            start_offset=type_start,
+            end_offset=pos,
+        )
         types.append(td)
         type_by_index[i] = td
 
@@ -249,9 +269,9 @@ def _fixup_global_self_references(
     for block_start, block_end, _ in shifted_blocks:
         pos = block_start
         while pos < block_end - 12:
-            if out[pos:pos + 8] != sentinel:
-                pos += 1
-                continue
+            pos = out.find(sentinel, pos, block_end - 5)
+            if pos == -1:
+                break
 
             ref_pos = pos + 8
             if ref_pos + 4 > block_end:

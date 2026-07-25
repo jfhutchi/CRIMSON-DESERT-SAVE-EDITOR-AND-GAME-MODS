@@ -1,7 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from save_compat import SaveSchemaIdentity
 
 
 class QuestState(IntEnum):
@@ -47,12 +50,28 @@ class SaveItem:
 
 @dataclass
 class SaveData:
+    source_file_sha256: str
     raw_header: bytes = b""
     decompressed_blob: bytearray = field(default_factory=bytearray)
     original_compressed_size: int = 0
     original_decompressed_size: int = 0
     file_path: str = ""
     is_raw_stream: bool = False
+    schema_identity: SaveSchemaIdentity | None = None
+    compatibility_profile_id: str | None = None
+    is_schema_supported: bool = False
+    document_generation: int = 0
+    parse_epoch: int = 0
+
+    def __setattr__(self, name, value):
+        # Structural edits replace decompressed_blob by assignment, which
+        # invalidates every previously parsed offset. In-place byte edits keep
+        # offsets valid and do not pass through here.
+        if name == "decompressed_blob":
+            object.__setattr__(
+                self, "parse_epoch", getattr(self, "parse_epoch", 0) + 1
+            )
+        object.__setattr__(self, name, value)
 
 
 @dataclass
@@ -71,3 +90,4 @@ class UndoEntry:
     old_bytes: bytes = b""
     new_bytes: bytes = b""
     patches: list = field(default_factory=list)
+    previous_blob: bytes | None = None

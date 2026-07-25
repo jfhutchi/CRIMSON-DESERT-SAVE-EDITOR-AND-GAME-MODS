@@ -1,0 +1,34 @@
+{
+  "name": "Blackstar 30m Ride 1s Cooldown (1.14)",
+  "version": "1.0.0",
+  "author": "Codex",
+  "description": "Blackstar only: mounted duration 600 -> 1800 seconds and summon cooldown 3600 -> 1 second. Requires the recorded 1.14 characterinfo fingerprint.",
+  "supported_characterinfo": {
+    "body_size": 26431464,
+    "body_sha256": "e234565b744fb1bb304547b5883cf9249c6cfff54c034c2611a87da26d8324d2",
+    "header_size": 56842,
+    "header_sha256": "f774cd93b0cd865297918b849472d276bd5a04355fdf908b541b043a40a5ab22",
+    "entry_key": 1000799,
+    "entry_name": "Riding_Dragon_1",
+    "scope": "Blackstar globally across all saves while enabled"
+  },
+  "patches": [
+    {
+      "game_file": "gamedata/characterinfo.pabgb",
+      "changes": [
+        {
+          "offset": 25579991,
+          "label": "Riding_Dragon_1: _callMercenaryCoolTime (3600s -> 1s)",
+          "original": "100E000000000000",
+          "patched": "0100000000000000"
+        },
+        {
+          "offset": 25579999,
+          "label": "Riding_Dragon_1: _callMercenarySpawnDuration (600s -> 1800s)",
+          "original": "5802000000000000",
+          "patched": "0807000000000000"
+        }
+      ]
+    }
+  ]
+}

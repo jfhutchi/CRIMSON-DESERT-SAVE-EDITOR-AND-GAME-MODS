@@ -112,24 +112,21 @@ def make_scope_label(scope: str) -> QLabel:
     if scope == "save":
         text = "This tab modifies your SAVE FILE"
         color = COLORS["scope_save"]
-        bg = "rgba(79,195,247,0.08)"
     elif scope == "game":
         text = "This tab modifies GAME FILES (requires admin + restart)"
         color = COLORS["scope_game"]
-        bg = "rgba(255,183,77,0.08)"
     elif scope == "readonly":
         text = "This tab is READ-ONLY (browse only)"
         color = COLORS["text_dim"]
-        bg = "rgba(176,160,136,0.05)"
     else:
         raise ValueError(f"Unknown scope {scope!r} — expected 'save', 'game', or 'readonly'")
     lbl = QLabel(text)
     lbl.setStyleSheet(
-        f"color: {color}; font-size: 11px; padding: 3px 8px; "
-        f"border: 1px solid {color}; border-radius: 3px; "
-        f"background-color: {bg}; font-weight: bold;"
+        f"color: {color}; font-size: 10px; padding: 2px 8px; "
+        f"border: 0; border-left: 2px solid {color}; "
+        "background: transparent; font-weight: bold;"
     )
-    lbl.setFixedHeight(22)
+    lbl.setFixedHeight(20)
     return lbl
 
 
