@@ -11752,9 +11752,9 @@ QCheckBox::indicator {{
             QMessageBox.warning(self, "Scan Slots", "Load a save file first.")
             return
         save_dir = os.path.dirname(os.path.dirname(self._loaded_path))
+        loaded_path = os.path.abspath(self._loaded_path)
 
         self._qe_status.setText(f"Scanning all slots for quest {quest_key}...")
-        QApplication.processEvents()
 
         STATE_NAMES = {
             0x01: "Locked", 0x02: "Available", 0x03: "Available+",
@@ -11764,92 +11764,105 @@ QCheckBox::indicator {{
             0x1105: "Completed", 0x1502: "Side Content", 0x1905: "Fully Completed",
         }
 
-        lines = [f"Cross-Slot Scan: {quest_name} (key={quest_key})", "=" * 50, ""]
+        def _task(report):
+            lines = [f"Cross-Slot Scan: {quest_name} (key={quest_key})", "=" * 50, ""]
+            try:
+                _mydir = os.path.dirname(os.path.abspath(__file__))
+                for d in ['Communitydump/desktopeditor', 'desktopeditor']:
+                    p = os.path.join(_mydir, d)
+                    if os.path.isdir(p) and p not in sys.path:
+                        sys.path.insert(0, p)
+                from save_parser import build_result_from_raw
 
-        try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
+                slot_names = {"slot0": "Auto 1", "slot1": "Auto 2", "slot2": "Auto 3"}
+                for i in range(100, 110):
+                    slot_names[f"slot{i}"] = f"Manual {i-99}"
 
-            slot_names = {"slot0": "Auto 1", "slot1": "Auto 2", "slot2": "Auto 3"}
-            for i in range(100, 110):
-                slot_names[f"slot{i}"] = f"Manual {i-99}"
+                slot_paths = sorted(glob.glob(os.path.join(save_dir, 'slot*', 'save.save')))
+                for index, slot_path in enumerate(slot_paths):
+                    slot_id = os.path.basename(os.path.dirname(slot_path))
+                    slot_label = slot_names.get(slot_id, slot_id)
+                    report(
+                        f"Decoding {slot_label} ({index + 1}/{len(slot_paths)})...",
+                        int(index / max(1, len(slot_paths)) * 95),
+                    )
+                    is_loaded = os.path.abspath(slot_path) == loaded_path
 
-            for slot_path in sorted(glob.glob(os.path.join(save_dir, 'slot*', 'save.save'))):
-                slot_id = os.path.basename(os.path.dirname(slot_path))
-                slot_label = slot_names.get(slot_id, slot_id)
-                is_loaded = os.path.abspath(slot_path) == os.path.abspath(self._loaded_path)
+                    try:
+                        sd = load_save_file(slot_path)
+                        raw = bytes(sd.decompressed_blob)
+                        result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
 
-                try:
-                    sd = load_save_file(slot_path)
-                    raw = bytes(sd.decompressed_blob)
-                    result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-                    found = []
-                    for obj in result['objects']:
-                        if obj.class_name not in ('QuestSaveData', 'MissionSaveData'):
-                            continue
-                        for f in obj.fields:
-                            if not f.list_elements:
+                        found = []
+                        for obj in result['objects']:
+                            if obj.class_name not in ('QuestSaveData', 'MissionSaveData'):
                                 continue
-                            for elem in f.list_elements:
-                                if not elem.child_fields:
+                            for f in obj.fields:
+                                if not f.list_elements:
                                     continue
-                                qk = None
-                                state = None
-                                has_ct = False
-                                has_bt = False
-                                for cf in elem.child_fields:
-                                    if cf.name in ('_key', '_questKey') and cf.present:
-                                        qk = _s.unpack_from('<I', raw, cf.start_offset)[0]
-                                    if cf.name == '_state' and cf.present:
-                                        sz = cf.end_offset - cf.start_offset
-                                        state = raw[cf.start_offset] if sz == 1 else _s.unpack_from('<I', raw, cf.start_offset)[0]
-                                    if cf.name == '_completedTime' and cf.present:
-                                        has_ct = True
-                                    if cf.name == '_branchedTime' and cf.present:
-                                        has_bt = True
-                                if qk == quest_key:
-                                    sn = STATE_NAMES.get(state, f"0x{state:X}")
-                                    flags = []
-                                    if has_ct:
-                                        flags.append("completedTime")
-                                    if has_bt:
-                                        flags.append("branchedTime")
-                                    flag_str = f" [{', '.join(flags)}]" if flags else " [no timestamps]"
-                                    found.append(f"state=0x{state:X} ({sn}){flag_str}")
+                                for elem in f.list_elements:
+                                    if not elem.child_fields:
+                                        continue
+                                    qk = None
+                                    state = None
+                                    has_ct = False
+                                    has_bt = False
+                                    for cf in elem.child_fields:
+                                        if cf.name in ('_key', '_questKey') and cf.present:
+                                            qk = _s.unpack_from('<I', raw, cf.start_offset)[0]
+                                        if cf.name == '_state' and cf.present:
+                                            sz = cf.end_offset - cf.start_offset
+                                            state = raw[cf.start_offset] if sz == 1 else _s.unpack_from('<I', raw, cf.start_offset)[0]
+                                        if cf.name == '_completedTime' and cf.present:
+                                            has_ct = True
+                                        if cf.name == '_branchedTime' and cf.present:
+                                            has_bt = True
+                                    if qk == quest_key:
+                                        sn = STATE_NAMES.get(state, f"0x{state:X}")
+                                        flags = []
+                                        if has_ct:
+                                            flags.append("completedTime")
+                                        if has_bt:
+                                            flags.append("branchedTime")
+                                        flag_str = f" [{', '.join(flags)}]" if flags else " [no timestamps]"
+                                        found.append(f"state=0x{state:X} ({sn}){flag_str}")
 
-                    marker = " <<< LOADED" if is_loaded else ""
-                    if found:
-                        for f in found:
-                            lines.append(f"  {slot_id} ({slot_label}): {f}{marker}")
-                    else:
-                        lines.append(f"  {slot_id} ({slot_label}): NOT FOUND{marker}")
-                except Exception as e:
-                    lines.append(f"  {slot_id}: error ({e})")
+                        marker = " <<< LOADED" if is_loaded else ""
+                        if found:
+                            for f in found:
+                                lines.append(f"  {slot_id} ({slot_label}): {f}{marker}")
+                        else:
+                            lines.append(f"  {slot_id} ({slot_label}): NOT FOUND{marker}")
+                    except Exception as e:
+                        lines.append(f"  {slot_id}: error ({e})")
 
-        except Exception as e:
-            lines.append(f"Error: {e}")
+            except Exception as e:
+                lines.append(f"Error: {e}")
+            return lines
 
-        self._qe_status.setText(f"Scan complete")
+        def _completed(lines) -> None:
+            self._qe_status.setText("Scan complete")
+            report_text = "\n".join(lines)
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Cross-Slot Scan: {quest_name}")
+            dlg.resize(650, 450)
+            dl = QVBoxLayout(dlg)
+            txt = QTextEdit()
+            txt.setReadOnly(True)
+            txt.setFont(QFont("Consolas", 10))
+            txt.setPlainText(report_text)
+            dl.addWidget(txt)
+            copy_btn = QPushButton("Copy to Clipboard")
+            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(report_text))
+            dl.addWidget(copy_btn)
+            dlg.exec()
 
-        report = "\n".join(lines)
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Cross-Slot Scan: {quest_name}")
-        dlg.resize(650, 450)
-        dl = QVBoxLayout(dlg)
-        txt = QTextEdit()
-        txt.setReadOnly(True)
-        txt.setFont(QFont("Consolas", 10))
-        txt.setPlainText(report)
-        dl.addWidget(txt)
-        copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(report))
-        dl.addWidget(copy_btn)
-        dlg.exec()
+        self._run_blocking_task(
+            title="Cross-Slot Scan",
+            message=f"Scanning save slots for quest {quest_key}...",
+            task=_task,
+            completed=_completed,
+        )
 
     def _qe_health_check(self) -> None:
         if not self._save_data:
@@ -14490,16 +14503,72 @@ QCheckBox::indicator {{
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Pack Error", str(e))
 
+    def _run_blocking_task(
+        self,
+        *,
+        title: str,
+        message: str,
+        task,
+        completed,
+        failed=None,
+    ) -> None:
+        """Run a long task off the GUI thread behind a modal busy dialog.
+
+        The WindowModal dialog blocks interaction, so save state cannot be
+        edited while the worker runs; ``task(report)`` executes on a worker
+        thread and ``completed``/``failed`` run on the GUI thread after the
+        dialog closes. Use for every operation that can take more than a
+        moment: injections, scans, exports.
+        """
+        from crimson_common.gui_task_worker import start_gui_task
+
+        progress = QProgressDialog(message, "", 0, 100, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        def _on_progress(text: str, value: int) -> None:
+            progress.setLabelText(text)
+            progress.setValue(max(0, min(99, int(value))))
+
+        def _on_completed(result) -> None:
+            progress.setValue(100)
+            progress.close()
+            completed(result)
+
+        def _on_failed(message_text: str, details: str) -> None:
+            progress.close()
+            if failed is not None:
+                failed(message_text, details)
+            else:
+                log.error("%s failed: %s\n%s", title, message_text, details)
+                QMessageBox.critical(self, title, f"{message_text}\n\n{details}")
+
+        start_gui_task(
+            self,
+            task=task,
+            completed=_on_completed,
+            failed=_on_failed,
+            progress=_on_progress,
+        )
+
     def _know_inject_keys(self, keys: list) -> None:
         self._know_status.setText(f"Injecting {len(keys)} entries...")
-        QApplication.processEvents()
+        save_data = self._save_data
+        blob = bytearray(save_data.decompressed_blob)
 
-        try:
+        def _task(report):
+            report(f"Injecting {len(keys)} knowledge entries...", 30)
             from parc_inserter3 import inject_all_knowledge
+            return inject_all_knowledge(blob, keys_filter=keys)
 
-            blob = bytearray(self._save_data.decompressed_blob)
-            ok, new_blob, msg = inject_all_knowledge(blob, keys_filter=keys)
-
+        def _completed(result) -> None:
+            if self._save_data is not save_data:
+                return
+            ok, new_blob, msg = result
             if ok:
                 self._save_data.decompressed_blob = bytearray(new_blob)
                 self._dirty = True
@@ -14520,10 +14589,18 @@ QCheckBox::indicator {{
                 self._know_status.setText(f"Failed: {msg}")
                 QMessageBox.critical(self, "Injection Failed", msg)
 
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._know_status.setText(f"Error: {e}")
-            QMessageBox.critical(self, "Error", str(e))
+        def _failed(message: str, details: str) -> None:
+            log.error("Knowledge injection failed: %s\n%s", message, details)
+            self._know_status.setText(f"Error: {message}")
+            QMessageBox.critical(self, "Error", message)
+
+        self._run_blocking_task(
+            title="Injecting Knowledge",
+            message=f"Injecting {len(keys)} knowledge entries...",
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+        )
 
 
     def _build_player_tab(self) -> None:

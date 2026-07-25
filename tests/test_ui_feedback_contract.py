@@ -71,6 +71,28 @@ def test_dye_swatch_cell_shows_color_not_hex_text() -> None:
     assert "swatch.setToolTip(" in segment
 
 
+def test_blocking_task_helper_pairs_worker_with_modal_progress() -> None:
+    segment = _method_source(
+        ROOT / "CrimsonSaveEditor" / "gui.py", "MainWindow", "_run_blocking_task"
+    )
+    assert "start_gui_task" in segment, "the work must leave the GUI thread"
+    assert "QProgressDialog" in segment, "the user must see a busy dialog"
+    assert "WindowModal" in segment, (
+        "interaction must be blocked while save bytes are being rewritten"
+    )
+
+
+def test_long_mutations_and_scans_show_progress_dialogs() -> None:
+    path = ROOT / "CrimsonSaveEditor" / "gui.py"
+    for method_name in ("_know_inject_keys", "_qe_scan_slots"):
+        segment = _method_source(path, "MainWindow", method_name)
+        assert "_run_blocking_task(" in segment, (
+            f"{method_name} froze the GUI with no feedback; long operations "
+            "run behind the shared modal progress helper"
+        )
+        assert "QApplication.processEvents" not in segment, method_name
+
+
 def test_shell_utility_buttons_show_labels_under_icons() -> None:
     source = (ROOT / "crimson_common" / "crimson_shell.py").read_text(
         encoding="utf-8-sig"
