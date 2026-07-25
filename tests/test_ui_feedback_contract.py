@@ -58,6 +58,18 @@ def test_inventory_subtabs_show_loading_state() -> None:
     )
 
 
+def test_already_unlocked_blackstar_offers_the_cooldown_panel() -> None:
+    path = ROOT / "CrimsonSaveEditor" / "gui.py"
+    segment = _method_source(path, "MainWindow", "_finish_blackstar_unlock")
+    assert "classification_before" in segment
+    assert "_focus_blackstar_timer_panel(" in segment, (
+        "an already-unlocked save must be offered the reduced-cooldown "
+        "(Blackstar Game Settings) panel instead of dead-ending"
+    )
+    helper = _method_source(path, "MainWindow", "_focus_blackstar_timer_panel")
+    assert "ensureWidgetVisible" in helper
+
+
 def test_dye_swatch_cell_shows_color_not_hex_text() -> None:
     segment = _method_source(
         ROOT / "CrimsonSaveEditor" / "gui.py", "MainWindow", "_dye_refresh_parts"

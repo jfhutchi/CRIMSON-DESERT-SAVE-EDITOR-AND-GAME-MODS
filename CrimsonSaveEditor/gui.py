@@ -9924,10 +9924,34 @@ QCheckBox::indicator {{
         if self._blackstar_progress is not None:
             self._blackstar_progress.close()
         QMessageBox.information(self, "Blackstar Unlock Report", details)
+        if str(report.classification_before).startswith("legitimate"):
+            reply = QMessageBox.question(
+                self, "Blackstar Already Unlocked",
+                "Blackstar is already unlocked on this save.\n\n"
+                "Want the reduced summon cooldown too? That is the Blackstar\n"
+                "Game Settings panel at the top of this page (Preview, then\n"
+                "Apply) — it patches the game folder, not the save.\n\n"
+                "Jump to it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._focus_blackstar_timer_panel()
         if not self._blackstar_dry_run_active and worker_result.write_result:
             path = self._loaded_path
             self._blackstar_preview_token = None
             self._load_save(path)
+
+    def _focus_blackstar_timer_panel(self) -> None:
+        panel = getattr(self, '_blackstar_timer_panel', None)
+        if panel is None:
+            return
+        from PySide6.QtWidgets import QScrollArea
+        parent = panel.parent()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parent()
+        if isinstance(parent, QScrollArea):
+            parent.ensureWidgetVisible(panel)
+        panel.setFocus(Qt.OtherFocusReason)
 
     def _discard_stale_blackstar_result(self) -> None:
         log.warning("Discarded stale Blackstar worker result")
