@@ -136,11 +136,11 @@ QToolButton#destinationButton:checked {{
     border-bottom: 2px solid {c['accent_red']};
 }}
 QToolButton#shellUtilityButton {{
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
-    padding: 0px;
+    min-width: 52px;
+    max-width: 84px;
+    min-height: 40px;
+    max-height: 44px;
+    padding: 2px 6px;
     color: {c['ash']};
     background: transparent;
     border: 0px;

@@ -71,6 +71,26 @@ def test_dye_swatch_cell_shows_color_not_hex_text() -> None:
     assert "swatch.setToolTip(" in segment
 
 
+def test_repopulates_cancel_superseded_row_jobs() -> None:
+    path = ROOT / "CrimsonSaveEditor" / "gui.py"
+    for method_name in (
+        "_populate_scanned_items",
+        "_populate_inventory",
+        "_populate_equipment",
+    ):
+        segment = _method_source(path, "MainWindow", method_name)
+        assert "_cancel_population_job(" in segment, (
+            f"{method_name}: a superseded incremental job kept writing rows "
+            "by index into a freshly refilled table, dropping or mixing items"
+        )
+
+    enrich = _method_source(path, "MainWindow", "_finish_parc_enrich")
+    assert "completed=_after_refresh" not in enrich, (
+        "post-enrich refresh work must not ride on a population completion "
+        "callback that a superseding populate can cancel"
+    )
+
+
 def test_blocking_task_helper_pairs_worker_with_modal_progress() -> None:
     segment = _method_source(
         ROOT / "CrimsonSaveEditor" / "gui.py", "MainWindow", "_run_blocking_task"
@@ -106,5 +126,16 @@ def test_shell_utility_buttons_show_labels_under_icons() -> None:
                 "the upper-right command buttons must label their icons"
             )
             assert "ToolButtonIconOnly" not in segment
-            return
-    raise AssertionError("_utility_button not found in crimson_shell.py")
+            break
+    else:
+        raise AssertionError("_utility_button not found in crimson_shell.py")
+
+    theme = (ROOT / "crimson_common" / "crimson_theme.py").read_text(
+        encoding="utf-8-sig"
+    )
+    rule = theme.split("QToolButton#shellUtilityButton", 1)[1][:400]
+    assert "max-width: 34px" not in rule, (
+        "a 34px width cap elides the labels to 'S...S'; the buttons must be "
+        "wide enough for their full text"
+    )
+    assert "min-width: 52px" in rule

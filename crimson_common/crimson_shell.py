@@ -293,7 +293,7 @@ class CrimsonApplicationShell(QWidget):
         utility.setObjectName("shellUtilities")
         utility_layout = QHBoxLayout(utility)
         utility_layout.setContentsMargins(0, 0, 0, 0)
-        utility_layout.setSpacing(3)
+        utility_layout.setSpacing(10)
         if self._menu_bar is not None:
             utility_layout.addWidget(
                 self._utility_button(

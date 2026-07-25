@@ -32120,6 +32120,11 @@ QCheckBox::indicator {{
 
         from crimson_common.gui_population import IncrementalGuiJob
 
+        # A superseded job would keep writing rows by index into tables a
+        # newer populate had refilled, silently dropping or mixing items.
+        self._cancel_population_job('_inventory_population_job')
+        self._cancel_population_job('_equipment_population_job')
+
         inventory = self._filtered_inventory_items()
         inventory_table = self._inv_table
         inventory_table.setSortingEnabled(False)
@@ -32264,14 +32269,6 @@ QCheckBox::indicator {{
         self._enrich_vendor_names()
         self._update_inv_subtab_counts()
 
-        def _after_refresh() -> None:
-            self._populate_repurchase()
-            self._populate_faction_tab()
-            self._refresh_backups()
-            self._inv_count_label.setText(str(len(self._items)))
-            if hasattr(self, "_center_status"):
-                self._center_status.setText("Save data enriched and ready")
-
         def _refresh_failed(message: str, details: str) -> None:
             log.error("PARC table refresh failed: %s\n%s", message, details)
             if hasattr(self, "_center_status"):
@@ -32283,9 +32280,17 @@ QCheckBox::indicator {{
             progress=lambda message, _value: self._center_status.setText(message)
             if hasattr(self, "_center_status")
             else None,
-            completed=_after_refresh,
             failed=_refresh_failed,
         )
+        # These views do not depend on the incremental table fill above, so
+        # run them directly: a superseded (cancelled) fill can no longer lose
+        # this refresh work.
+        self._populate_repurchase()
+        self._populate_faction_tab()
+        self._refresh_backups()
+        self._inv_count_label.setText(str(len(self._items)))
+        if hasattr(self, "_center_status"):
+            self._center_status.setText("Save data enriched and ready")
 
 
     def _filtered_inventory_items(self) -> List[SaveItem]:
@@ -32313,7 +32318,14 @@ QCheckBox::indicator {{
             ]
         return filtered
 
+    def _cancel_population_job(self, attr: str) -> None:
+        job = getattr(self, attr, None)
+        if job is not None and job.is_running:
+            job.cancel()
+        setattr(self, attr, None)
+
     def _populate_inventory(self) -> None:
+        self._cancel_population_job('_inventory_population_job')
         table = self._inv_table
         table.setSortingEnabled(False)
         table.setRowCount(0)
@@ -32383,6 +32395,7 @@ QCheckBox::indicator {{
         return equip_items
 
     def _populate_equipment(self) -> None:
+        self._cancel_population_job('_equipment_population_job')
         table = self._equip_table
         table.setSortingEnabled(False)
         table.setRowCount(0)
