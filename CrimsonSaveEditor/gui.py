@@ -36,7 +36,7 @@ from save_crypto import (
     transactional_write_save,
 )
 from item_scanner import (
-    scan_items, apply_stack_edit, apply_enchant_edit,
+    scan_items, scan_items_smart, apply_stack_edit, apply_enchant_edit,
     apply_endurance_edit, apply_sharpness_edit, apply_item_swap, apply_item_swap_all,
     enrich_items_with_parc, smart_item_swap,
     apply_itemno_edit, get_max_itemno,
@@ -31835,16 +31835,23 @@ QCheckBox::indicator {{
         def _task(report):
             report("Decrypting save file...", 10)
             save_data = load_save_file(path)
-            report("Scanning items...", 45)
-            items = scan_items(save_data.decompressed_blob)
-            report("Resolving item names...", 65)
+            report("Parsing save structure...", 35)
+            import sys as _sys
+            _sys.path.insert(0, 'Communitydump/desktopeditor')
+            from save_parser import build_result_from_raw
+            parse_result = build_result_from_raw(
+                bytes(save_data.decompressed_blob), {'input_kind': 'raw_blob'}
+            )
+            report("Scanning items...", 55)
+            items = scan_items_smart(save_data.decompressed_blob, parse_result)
+            report("Resolving item names...", 70)
             for item in items:
                 item.name = self._name_db.get_name(item.item_key)
                 item.category = self._name_db.get_category(item.item_key)
-            report("Creating pristine backup...", 80)
+            report("Creating pristine backup...", 85)
             pristine = self._create_pristine_backup(path)
             report("Preparing the editor...", 95)
-            return save_data, items, pristine
+            return save_data, items, pristine, parse_result
 
         self._load_progress = progress
         self._set_load_busy(True)
@@ -31872,7 +31879,7 @@ QCheckBox::indicator {{
             )
 
         def _on_completed(result) -> None:
-            save_data, items, pristine = result
+            save_data, items, pristine, parse_result = result
             self._save_data = save_data
             self._items = items
             self._document_generation_counter += 1
@@ -31880,6 +31887,7 @@ QCheckBox::indicator {{
             self._loaded_path = path
             self._dirty = False
             self._undo_stack.clear()
+            self._parse_cache.store(save_data, parse_result)
             if pristine:
                 log.info("Pristine backup created: %s", pristine)
 
@@ -32086,7 +32094,13 @@ QCheckBox::indicator {{
 
         self._quest_entries = []
         self._mission_entries = []
-        self._items = scan_items(self._save_data.decompressed_blob)
+        try:
+            parse_result = self._get_parse_result()
+        except Exception:
+            parse_result = None
+        self._items = scan_items_smart(
+            self._save_data.decompressed_blob, parse_result
+        )
 
         for item in self._items:
             item.name = self._name_db.get_name(item.item_key)
