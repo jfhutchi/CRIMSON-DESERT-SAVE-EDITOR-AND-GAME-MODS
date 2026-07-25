@@ -1,8 +1,32 @@
+import zipfile
 from pathlib import Path
 
 SPEC_DIR = Path(SPECPATH).resolve()
 REPO_ROOT = SPEC_DIR.parent
 GAME_MODS_ROOT = REPO_ROOT / 'CrimsonGameMods'
+
+# Bundle the complete icon set as one stored zip; the app extracts it next to
+# the executable on first launch so icons work offline and default to on.
+ICONS_BUNDLE = Path(workpath) / 'icons_bundle.zip'
+_icon_sources = [
+    ('icons_local', REPO_ROOT / 'icons_local'),
+    ('icons_mercenary', REPO_ROOT / 'icons_mercenary'),
+]
+_source_files = [
+    (prefix, path)
+    for prefix, folder in _icon_sources
+    if folder.is_dir()
+    for path in sorted(folder.glob('*.webp'))
+]
+_needs_build = True
+if ICONS_BUNDLE.is_file():
+    with zipfile.ZipFile(ICONS_BUNDLE) as _zf:
+        _needs_build = len(_zf.namelist()) != len(_source_files)
+if _needs_build:
+    ICONS_BUNDLE.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(ICONS_BUNDLE, 'w', zipfile.ZIP_STORED) as _zf:
+        for _prefix, _path in _source_files:
+            _zf.write(_path, f'{_prefix}/{_path.name}')
 
 a = Analysis(
     ['main.py'],
@@ -37,6 +61,7 @@ a = Analysis(
         ('locale', 'locale'),
         ('knowledge_packs', 'knowledge_packs'),
         (str(REPO_ROOT / 'icons_mercenary' / '1000799.webp'), 'crimson_assets'),
+        (str(ICONS_BUNDLE), '.'),
         (str(REPO_ROOT / 'crimson_common'), 'crimson_common'),
         (str(GAME_MODS_ROOT / 'crimson_rs'), 'crimson_rs'),
     ],

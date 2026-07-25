@@ -2480,6 +2480,11 @@ class MainWindow(QMainWindow):
         self._pack_mgr = PackManager()
         self._set_mgr = SetManager()
         self._icon_cache = IconCache()
+        self._icon_seed_pending = self._icon_cache.ensure_seeded(
+            completed=self._on_icons_seeded
+        )
+        from parse_reuse import ParsedResultCache
+        self._parse_cache = ParsedResultCache()
 
         self._max_enchant_map: dict = {}
         try:
@@ -2547,6 +2552,9 @@ class MainWindow(QMainWindow):
         if saved_widget_scale and saved_widget_scale != 1.0:
             self._set_widget_scale(saved_widget_scale)
 
+        self._apply_icon_display_metrics()
+        if not self._icon_seed_pending:
+            self._start_icon_warm()
         self._refresh_sidebar()
         last_path = self._config.get("last_save_path", "")
         if last_path and os.path.isfile(last_path):
@@ -2639,7 +2647,7 @@ class MainWindow(QMainWindow):
         browse_btn.setToolTip("Set save folder path")
         browse_btn.clicked.connect(self._browse_save_root)
         path_row.addWidget(browse_btn)
-        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
+        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
         self._global_icons_btn.setFixedHeight(22)
         self._global_icons_btn.setToolTip("Toggle item icons on all tabs")
         self._global_icons_btn.clicked.connect(self._toggle_icons)
@@ -4395,11 +4403,11 @@ QCheckBox::indicator {{
         top.addWidget(self._inv_group)
         self._inv_group.setVisible(False)
 
-        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
+        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
         self._show_icons_btn.setToolTip("Download and display item icons (requires internet first time)")
         self._show_icons_btn.clicked.connect(self._toggle_icons)
         top.addWidget(self._show_icons_btn)
-        self._icons_enabled = self._config.get("show_icons", False)
+        self._icons_enabled = self._config.get("show_icons", True)
 
         layout.addLayout(top)
 
@@ -5987,9 +5995,8 @@ QCheckBox::indicator {{
         try:
             from item_template_db import extract_items_from_parse_tree, save_db, load_db, _get_parser
             from template_sync import load_local_master, find_new_templates
-            sp = _get_parser()
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             templates = extract_items_from_parse_tree(result, raw, 'loaded_save')
             db = load_db()
             new_count = 0
@@ -6046,10 +6053,9 @@ QCheckBox::indicator {{
         if not self._save_data:
             return
         try:
-            from item_template_db import extract_items_from_parse_tree, save_db, load_db, _get_parser
-            sp = _get_parser()
+            from item_template_db import extract_items_from_parse_tree, save_db, load_db
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             templates = extract_items_from_parse_tree(result, raw, 'auto_scan')
             db = load_db()
             new_count = 0
@@ -8332,9 +8338,8 @@ QCheckBox::indicator {{
             _ensure = 'Communitydump/desktopeditor'
             if _ensure not in __import__('sys').path:
                 __import__('sys').path.insert(0, _ensure)
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             max_no = 0
             for obj in result['objects']:
                 if 'MercenaryClan' not in obj.class_name:
@@ -8362,12 +8367,8 @@ QCheckBox::indicator {{
             QMessageBox.warning(self, "Entitlements", "Load a save file first.")
             return
         try:
-            sys_path = __import__('sys').path
-            if 'Communitydump/desktopeditor' not in sys_path:
-                sys_path.insert(0, 'Communitydump/desktopeditor')
-            import save_parser as sp
             raw = bytes(self._save_data.decompressed_blob)
-            result = sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             lines = []
             found = False
             for obj in result['objects']:
@@ -10093,7 +10094,7 @@ QCheckBox::indicator {{
             import save_parser as sp
 
             raw = self._save_data.decompressed_blob
-            result = sp.build_result_from_raw(bytes(raw), {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
 
             mission_names = {}
             try:
@@ -10662,7 +10663,7 @@ QCheckBox::indicator {{
                 from quest_deep_parser import parse_quest_deep
 
                 raw = bytes(self._save_data.decompressed_blob)
-                _result = _sp.build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+                _result = self._get_parse_result()
 
                 _base = getattr(_sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
                 _qn = {}
@@ -11651,13 +11652,7 @@ QCheckBox::indicator {{
         raw = bytes(blob)
 
         try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
         except Exception as e:
             QMessageBox.critical(self, "Diagnose", f"Parse error: {e}")
             return
@@ -11869,13 +11864,7 @@ QCheckBox::indicator {{
         raw = bytes(blob)
 
         try:
-            _mydir = os.path.dirname(os.path.abspath(__file__))
-            for d in ['Communitydump/desktopeditor', 'desktopeditor']:
-                p = os.path.join(_mydir, d)
-                if os.path.isdir(p) and p not in sys.path:
-                    sys.path.insert(0, p)
-            from save_parser import build_result_from_raw
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
         except Exception as e:
             QMessageBox.critical(self, "Health Check", f"Parse error: {e}")
             return
@@ -15354,32 +15343,29 @@ QCheckBox::indicator {{
 
     @staticmethod
     def _load_game_map_names() -> dict:
-        names = {'factions': {}, 'factionnodes': {}, 'characters': {}, 'sublevels': {}}
-        try:
-            _base = getattr(__import__('sys'), '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-            gm_path = os.path.join(_base, 'game_map.json')
-            if os.path.isfile(gm_path):
-                with open(gm_path, 'r', encoding='utf-8') as f:
-                    gm = json.load(f)
-                for k, v in gm.get('factions', {}).items():
-                    if isinstance(v, dict):
-                        names['factions'][int(k)] = v.get('name', '')
-                for k, v in gm.get('factionnodes', {}).items():
-                    if isinstance(v, dict):
-                        names['factionnodes'][int(k)] = v.get('name', '')
-                for k, v in gm.get('characters', {}).items():
-                    if isinstance(v, dict):
-                        names['characters'][int(k)] = v.get('name', '')
-                    elif isinstance(v, str):
-                        names['characters'][int(k)] = v
-                for k, v in gm.get('sublevels', {}).items():
-                    if isinstance(v, dict):
-                        names['sublevels'][int(k)] = v.get('name', f'SubLevel_{k}')
-                    else:
-                        names['sublevels'][int(k)] = str(v)
-        except Exception:
-            pass
-        return names
+        from parse_reuse import load_game_map_names
+        return load_game_map_names()
+
+    def _get_parse_result(self):
+        """Full parse of the current save, reused until the blob is replaced.
+
+        In-place byte edits keep every cached offset valid; structural edits
+        replace decompressed_blob, which bumps SaveData.parse_epoch and makes
+        the next call re-parse.
+        """
+        if not self._save_data:
+            return None
+        cached = self._parse_cache.get(self._save_data)
+        if cached is not None:
+            return cached
+        import sys as _sys
+        _sys.path.insert(0, 'Communitydump/desktopeditor')
+        from save_parser import build_result_from_raw
+        result = build_result_from_raw(
+            bytes(self._save_data.decompressed_blob), {'input_kind': 'raw_blob'}
+        )
+        self._parse_cache.store(self._save_data, result)
+        return result
 
     @staticmethod
     def _extract_faction_entries(raw: bytes, result) -> tuple:
@@ -15516,6 +15502,8 @@ QCheckBox::indicator {{
 
         save_data = self._save_data
         raw = bytes(save_data.decompressed_blob)
+        epoch_at_start = getattr(save_data, 'parse_epoch', 0)
+        cached_result = self._parse_cache.get(save_data)
         if hasattr(self, '_name_db'):
             name_lookup = self._name_db.get_name
         else:
@@ -15526,21 +15514,26 @@ QCheckBox::indicator {{
 
         def _task(report):
             report("Parsing faction data...", 15)
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            if cached_result is not None:
+                result = cached_result
+            else:
+                import sys as _sys
+                _sys.path.insert(0, 'Communitydump/desktopeditor')
+                from save_parser import build_result_from_raw
+                result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
             report("Extracting faction entries...", 80)
             names = MainWindow._load_game_map_names()
             elem_entries, node_entries = MainWindow._extract_faction_entries(raw, result)
             bond_entries = MainWindow._extract_bond_entries(raw, result, name_lookup)
             sublevel_entries = MainWindow._extract_sublevel_entries(raw, result, names['sublevels'])
-            return names, elem_entries, node_entries, bond_entries, sublevel_entries
+            return result, names, elem_entries, node_entries, bond_entries, sublevel_entries
 
         def _completed(payload) -> None:
             if self._save_data is not save_data:
                 return
-            names, elem_entries, node_entries, bond_entries, sublevel_entries = payload
+            parsed, names, elem_entries, node_entries, bond_entries, sublevel_entries = payload
+            if getattr(save_data, 'parse_epoch', 0) == epoch_at_start:
+                self._parse_cache.store(save_data, parsed)
             try:
                 self._apply_faction_tables(names, elem_entries, node_entries)
                 self._apply_bond_entries(bond_entries)
@@ -15638,11 +15631,8 @@ QCheckBox::indicator {{
             return
         self._bond_table.setRowCount(0)
         try:
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             if hasattr(self, '_name_db'):
                 name_lookup = self._name_db.get_name
             else:
@@ -15706,11 +15696,8 @@ QCheckBox::indicator {{
             return
         self._sublevel_table.setRowCount(0)
         try:
-            import sys as _sys
-            _sys.path.insert(0, 'Communitydump/desktopeditor')
-            from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
-            result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
             sublevel_names = self._load_game_map_names()['sublevels']
             self._apply_sublevel_entries(
                 self._extract_sublevel_entries(raw, result, sublevel_names)
@@ -17461,9 +17448,10 @@ QCheckBox::indicator {{
             from fieldinfo_parser import parse_pabgh_index, parse_entry
             idx = parse_pabgh_index(self._field_edit_schema)
             sorted_offs = sorted(set(idx.values()))
+            off_positions = {off: i for i, off in enumerate(sorted_offs)}
             entries = []
             for key, eoff in sorted(idx.items()):
-                bi = sorted_offs.index(eoff)
+                bi = off_positions[eoff]
                 end = sorted_offs[bi + 1] if bi + 1 < len(sorted_offs) else len(self._field_edit_data)
                 entry = parse_entry(bytes(self._field_edit_data), eoff, end)
                 if entry:
@@ -17482,9 +17470,10 @@ QCheckBox::indicator {{
                 from vehicleinfo_parser import parse_pabgh_index_u16, parse_entry as vparse
                 vidx = parse_pabgh_index_u16(self._vehicle_schema)
                 vsorted = sorted(set(vidx.values()))
+                voff_positions = {off: i for i, off in enumerate(vsorted)}
                 ventries = []
                 for vk, vo in sorted(vidx.items()):
-                    vbi = vsorted.index(vo)
+                    vbi = voff_positions[vo]
                     vend = vsorted[vbi + 1] if vbi + 1 < len(vsorted) else len(self._vehicle_data)
                     ve = vparse(bytes(self._vehicle_data), vo, vend)
                     if ve:
@@ -28676,12 +28665,13 @@ QCheckBox::indicator {{
                 idx[k] = o
 
             sorted_offs = sorted(set(idx.values())) + [len(self._spawn_data)]
+            off_positions = {off: i for i, off in enumerate(sorted_offs)}
 
             MARKER = b'\x0A\x36\xC1\xE0'
             elements = []
 
             for region_key, entry_off in sorted(idx.items(), key=lambda x: x[1]):
-                ni = sorted_offs.index(entry_off) + 1
+                ni = off_positions[entry_off] + 1
                 entry_end = sorted_offs[ni]
                 raw = self._spawn_data[entry_off:entry_end]
 
@@ -32378,13 +32368,49 @@ QCheckBox::indicator {{
         table.setItem(row, 7, _num_item(item.stack_count))
         table.setItem(row, 8, _num_item(item.item_no))
 
+    def _apply_icon_display_metrics(self) -> None:
+        row_h = max(ICON_SIZE + 2, 24) if self._icons_enabled else 24
+        for name in ('_inv_table', '_equip_table', '_repurch_table',
+                     '_db_table', '_swap_list', '_merc_table'):
+            tbl = getattr(self, name, None)
+            if tbl is None:
+                continue
+            tbl.setColumnWidth(0, (ICON_SIZE + 16) if self._icons_enabled else 0)
+            tbl.verticalHeader().setDefaultSectionSize(row_h)
+
+    def _on_icons_seeded(self, count: int) -> None:
+        self._icon_seed_pending = False
+        if count:
+            log.info("Seeded %d bundled icons next to the executable", count)
+            self._update_status(f"Item icons installed ({count} from bundle)")
+        self._start_icon_warm()
+
+    def _start_icon_warm(self) -> None:
+        if not self._icons_enabled:
+            return
+        keys = [info.item_key for info in self._name_db.get_all_sorted()]
+        self._icon_cache.warm_cache_async(keys, completed=self._on_icons_warmed)
+
+    def _on_icons_warmed(self, count: int) -> None:
+        if not count:
+            return
+        log.info("Warmed %d item icons into memory", count)
+        if hasattr(self, '_swap_list'):
+            self._filter_swap_items()
+        if hasattr(self, '_db_table'):
+            # Stagger the two big synchronous rebuilds across event-loop turns.
+            QTimer.singleShot(100, self._filter_database)
+        if self._save_data and self._items:
+            self._populate_scanned_items(
+                incremental=True, schedule_enrichment=False
+            )
+
     def _toggle_icons(self) -> None:
         self._icons_enabled = not self._icons_enabled
         self._config["show_icons"] = self._icons_enabled
         self._save_config()
 
         btn_text = "Hide Icons" if self._icons_enabled else "Show Icons"
-        row_h = max(ICON_SIZE + 2, 24) if self._icons_enabled else 24
 
         self._show_icons_btn.setText(btn_text)
         if hasattr(self, '_db_show_icons_btn'):
@@ -32404,9 +32430,10 @@ QCheckBox::indicator {{
             if reply == QMessageBox.Yes:
                 self._bulk_download_icons()
 
-        for tbl in [self._inv_table, self._equip_table, self._repurch_table, self._db_table, self._swap_list, self._merc_table]:
-            tbl.setColumnWidth(0, (ICON_SIZE + 16) if self._icons_enabled else 0)
-            tbl.verticalHeader().setDefaultSectionSize(row_h)
+        if self._icons_enabled:
+            self._start_icon_warm()
+
+        self._apply_icon_display_metrics()
 
         self._populate_inventory()
         self._populate_equipment()
@@ -33366,7 +33393,10 @@ QCheckBox::indicator {{
         for row, info in enumerate(items):
             icon_item = QTableWidgetItem()
             if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(info.item_key)
+                # This runs synchronously for ~6,000 rows during startup and on
+                # every filter keystroke; only attach pixmaps already warmed
+                # into memory — never decode from disk here.
+                px = self._icon_cache.peek(info.item_key)
                 if px:
                     icon_item.setIcon(QIcon(px))
             table.setItem(row, 0, icon_item)
@@ -33877,11 +33907,12 @@ QCheckBox::indicator {{
 
             icon_item = QTableWidgetItem()
             if self._icons_enabled:
-                px = self._icon_cache.get_pixmap(info.item_key)
+                # Runs synchronously for ~6,000 rows at startup and on every
+                # search keystroke; only attach pixmaps already warmed into
+                # memory — never decode from disk here.
+                px = self._icon_cache.peek(info.item_key)
                 if px:
                     icon_item.setIcon(QIcon(px))
-                elif self._icon_cache.has_icon(info.item_key):
-                    self._icon_cache.request_icon(info.item_key, self._on_icon_loaded)
             table.setItem(row, 0, icon_item)
 
             key_item = QTableWidgetItem(str(info.item_key))

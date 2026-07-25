@@ -61,6 +61,17 @@ class SaveData:
     compatibility_profile_id: str | None = None
     is_schema_supported: bool = False
     document_generation: int = 0
+    parse_epoch: int = 0
+
+    def __setattr__(self, name, value):
+        # Structural edits replace decompressed_blob by assignment, which
+        # invalidates every previously parsed offset. In-place byte edits keep
+        # offsets valid and do not pass through here.
+        if name == "decompressed_blob":
+            object.__setattr__(
+                self, "parse_epoch", getattr(self, "parse_epoch", 0) + 1
+            )
+        object.__setattr__(self, name, value)
 
 
 @dataclass

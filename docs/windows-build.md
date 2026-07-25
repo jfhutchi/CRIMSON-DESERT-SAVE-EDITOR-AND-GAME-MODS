@@ -89,6 +89,12 @@ The completed executables are:
 - `CrimsonSaveEditor\dist\CrimsonSaveEditorStandalone.exe`
 - `CrimsonGameMods\dist\CrimsonGameMods.exe`
 
+The Save Editor spec packs `icons_local\` and `icons_mercenary\` from the
+repository root into a single `icons_bundle.zip` inside the executable
+(roughly 69 MB). On first launch the application extracts the bundle next to
+the executable in the background, so item icons are on by default and work
+offline; later launches reuse the extracted folders.
+
 Launch each executable without a command-line file for the first smoke test.
 Confirm that both display the Blackstar timer panel. If testing Apply or Restore,
 select only the copied synthetic game directory and keep Crimson Desert closed.
