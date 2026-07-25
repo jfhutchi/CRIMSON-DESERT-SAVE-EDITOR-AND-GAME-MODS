@@ -16,7 +16,7 @@ APP_VERSION = "2.0.7"
 
 APP_VARIANT = "gamemods"
 
-UPDATE_REPO = "NattKh/CRIMSON-DESERT-SAVE-EDITOR-AND-GAME-MODS"
+UPDATE_REPO = "jfhutchi/CRIMSON-DESERT-SAVE-EDITOR-AND-GAME-MODS"
 _MANIFEST_BY_VARIANT = {
     "gamemods":   "editor_version_gamemods.json",
     "standalone": "editor_version_standalone.json",
