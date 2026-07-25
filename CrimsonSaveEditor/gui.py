@@ -15352,21 +15352,9 @@ QCheckBox::indicator {{
 
         return best or []
 
-    def _populate_faction_tab(self) -> None:
-        if not hasattr(self, '_faction_elem_table'):
-            return
-        self._faction_elem_table.setRowCount(0)
-        self._faction_node_table.setRowCount(0)
-        self._faction_reward_spin.setValue(0)
-        self._faction_reward_offset = -1
-        self._faction_count.setText("")
-
-        if not self._save_data:
-            return
-
-        faction_names = {}
-        node_names = {}
-        char_names = {}
+    @staticmethod
+    def _load_game_map_names() -> dict:
+        names = {'factions': {}, 'factionnodes': {}, 'characters': {}, 'sublevels': {}}
         try:
             _base = getattr(__import__('sys'), '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
             gm_path = os.path.join(_base, 'game_map.json')
@@ -15375,134 +15363,275 @@ QCheckBox::indicator {{
                     gm = json.load(f)
                 for k, v in gm.get('factions', {}).items():
                     if isinstance(v, dict):
-                        faction_names[int(k)] = v.get('name', '')
+                        names['factions'][int(k)] = v.get('name', '')
                 for k, v in gm.get('factionnodes', {}).items():
                     if isinstance(v, dict):
-                        node_names[int(k)] = v.get('name', '')
+                        names['factionnodes'][int(k)] = v.get('name', '')
                 for k, v in gm.get('characters', {}).items():
                     if isinstance(v, dict):
-                        char_names[int(k)] = v.get('name', '')
+                        names['characters'][int(k)] = v.get('name', '')
                     elif isinstance(v, str):
-                        char_names[int(k)] = v
+                        names['characters'][int(k)] = v
+                for k, v in gm.get('sublevels', {}).items():
+                    if isinstance(v, dict):
+                        names['sublevels'][int(k)] = v.get('name', f'SubLevel_{k}')
+                    else:
+                        names['sublevels'][int(k)] = str(v)
         except Exception:
             pass
+        return names
 
-        try:
+    @staticmethod
+    def _extract_faction_entries(raw: bytes, result) -> tuple:
+        elem_entries = []
+        node_entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'FactionSaveData':
+                continue
+            for f in obj.fields:
+                if f.name == '_factionElementSaveDataList' and f.list_elements:
+                    for elem in f.list_elements:
+                        if not elem.child_fields:
+                            continue
+                        entry = {}
+                        for cf in elem.child_fields:
+                            if cf.present:
+                                sz = cf.end_offset - cf.start_offset
+                                if sz <= 4:
+                                    entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                                elif sz == 1:
+                                    entry[cf.name] = raw[cf.start_offset]
+                        elem_entries.append(entry)
+
+                elif f.name == '_factionNodeElementSaveDataList' and f.list_elements:
+                    for elem in f.list_elements:
+                        if not elem.child_fields:
+                            continue
+                        entry = {}
+                        offsets = {}
+                        for cf in elem.child_fields:
+                            if cf.present:
+                                sz = cf.end_offset - cf.start_offset
+                                offsets[cf.name] = (cf.start_offset, sz)
+                                if sz == 1:
+                                    entry[cf.name] = raw[cf.start_offset]
+                                elif sz == 2:
+                                    entry[cf.name] = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                                elif sz == 4:
+                                    entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                        entry['_offsets'] = offsets
+                        node_entries.append(entry)
+        return elem_entries, node_entries
+
+    def _apply_faction_tables(self, names: dict, elem_entries: list, node_entries: list) -> None:
+        faction_names = names['factions']
+        node_names = names['factionnodes']
+        char_names = names['characters']
+
+        table = self._faction_elem_table
+        table.setRowCount(len(elem_entries))
+        for r, entry in enumerate(elem_entries):
+            owner = entry.get('_ownerFactionKey', 0)
+            fname = faction_names.get(owner, '')
+            display = f"{fname} ({owner})" if fname else str(owner)
+            table.setItem(r, 0, QTableWidgetItem(display))
+
+            leader = entry.get('_leaderCharacterKey', 0)
+            lname = char_names.get(leader, '')
+            table.setItem(r, 1, QTableWidgetItem(f"{lname} ({leader})" if lname and leader else str(leader) if leader else "—"))
+
+            parent = entry.get('_parentFactionKey', 0)
+            pname = faction_names.get(parent, '')
+            table.setItem(r, 2, QTableWidgetItem(f"{pname} ({parent})" if pname else str(parent) if parent else "—"))
+
+            rg = entry.get('_relationGroupKey', 0)
+            table.setItem(r, 3, QTableWidgetItem(str(rg) if rg else "—"))
+
+        STATE_LABELS = {0: "Undiscovered", 1: "Discovered", 2: "Active", 3: "Conquered", 4: "Lost"}
+        self._faction_node_entries = node_entries
+
+        table2 = self._faction_node_table
+        table2.setRowCount(len(node_entries))
+        for r, entry in enumerate(node_entries):
+            owner = entry.get('_ownerFactionKey', 0)
+            nname = node_names.get(owner, faction_names.get(owner, ''))
+            display = f"{nname} ({owner})" if nname else str(owner)
+            owner_w = QTableWidgetItem(display)
+            owner_w.setData(Qt.UserRole, r)
+            table2.setItem(r, 0, owner_w)
+
+            state = entry.get('_factionState', 0)
+            state_w = QTableWidgetItem(STATE_LABELS.get(state, str(state)))
+            if state == 2:
+                state_w.setForeground(QBrush(QColor(COLORS['success'])))
+            elif state == 3:
+                state_w.setForeground(QBrush(QColor(COLORS['accent'])))
+            table2.setItem(r, 1, state_w)
+
+            conq = entry.get('_conquerorFactionKey', 0)
+            cname = faction_names.get(conq, '')
+            table2.setItem(r, 2, QTableWidgetItem(f"{cname} ({conq})" if cname else str(conq) if conq else "—"))
+
+            is_cap = entry.get('_isCapital', 0)
+            cap_w = QTableWidgetItem("Yes" if is_cap else "")
+            if is_cap:
+                cap_w.setForeground(QBrush(QColor(COLORS['accent'])))
+            table2.setItem(r, 3, cap_w)
+
+            extras = {k: v for k, v in entry.items()
+                      if k not in ('_ownerFactionKey', '_factionState', '_conquerorFactionKey', '_isCapital')
+                      and v and v != 0}
+            table2.setItem(r, 4, QTableWidgetItem(", ".join(f"{k}={v}" for k, v in extras.items())))
+
+        self._faction_count.setText(
+            f"{len(elem_entries)} factions, {len(node_entries)} nodes"
+        )
+
+    def _populate_faction_tab(self, done_message: str | None = None) -> None:
+        if not hasattr(self, '_faction_elem_table'):
+            return
+        self._faction_elem_table.setRowCount(0)
+        self._faction_node_table.setRowCount(0)
+        if hasattr(self, '_bond_table'):
+            self._bond_table.setRowCount(0)
+        if hasattr(self, '_sublevel_table'):
+            self._sublevel_table.setRowCount(0)
+        self._faction_reward_spin.setValue(0)
+        self._faction_reward_offset = -1
+        self._faction_count.setText("")
+
+        if not self._save_data:
+            return
+
+        if getattr(self, '_faction_populate_handle', None) is not None:
+            self._faction_populate_rerun = True
+            self._faction_populate_rerun_message = done_message
+            return
+
+        from crimson_common.gui_task_worker import start_gui_task
+
+        save_data = self._save_data
+        raw = bytes(save_data.decompressed_blob)
+        if hasattr(self, '_name_db'):
+            name_lookup = self._name_db.get_name
+        else:
+            def name_lookup(key):
+                return f"Char_{key}"
+
+        self._faction_count.setText("Parsing faction data...")
+
+        def _task(report):
+            report("Parsing faction data...", 15)
             import sys as _sys
             _sys.path.insert(0, 'Communitydump/desktopeditor')
             from save_parser import build_result_from_raw
-            raw = bytes(self._save_data.decompressed_blob)
             result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
+            report("Extracting faction entries...", 80)
+            names = MainWindow._load_game_map_names()
+            elem_entries, node_entries = MainWindow._extract_faction_entries(raw, result)
+            bond_entries = MainWindow._extract_bond_entries(raw, result, name_lookup)
+            sublevel_entries = MainWindow._extract_sublevel_entries(raw, result, names['sublevels'])
+            return names, elem_entries, node_entries, bond_entries, sublevel_entries
 
-            elem_entries = []
-            node_entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'FactionSaveData':
+        def _completed(payload) -> None:
+            if self._save_data is not save_data:
+                return
+            names, elem_entries, node_entries, bond_entries, sublevel_entries = payload
+            try:
+                self._apply_faction_tables(names, elem_entries, node_entries)
+                self._apply_bond_entries(bond_entries)
+                self._apply_sublevel_entries(sublevel_entries)
+                if done_message:
+                    self._faction_count.setText(done_message)
+            except Exception as exc:
+                log.warning("Faction tab populate failed: %s", exc)
+                self._faction_count.setText(f"Parse error: {exc}")
+
+        def _failed(message: str, details: str) -> None:
+            log.warning("Faction tab populate failed: %s\n%s", message, details)
+            if self._save_data is save_data:
+                self._faction_count.setText(f"Parse error: {message}")
+
+        def _finished() -> None:
+            self._faction_populate_handle = None
+            rerun = getattr(self, '_faction_populate_rerun', False)
+            message = getattr(self, '_faction_populate_rerun_message', None)
+            self._faction_populate_rerun = False
+            self._faction_populate_rerun_message = None
+            if rerun:
+                self._populate_faction_tab(done_message=message)
+
+        self._faction_populate_handle = start_gui_task(
+            self,
+            task=_task,
+            completed=_completed,
+            failed=_failed,
+            finished=_finished,
+        )
+
+    @staticmethod
+    def _extract_bond_entries(raw: bytes, result, name_lookup) -> list:
+        CHAR_NAMES = {
+            1: "Kliff", 4: "Damiane", 6: "Oongka",
+            1003918: "Silver Fang (Wolf)", 1003917: "White Bear",
+            1001173: "Damiane's Horse", 1001172: "Oongka's Horse",
+            1003120: "Kliff's Horse", 1000799: "Dragon",
+        }
+
+        entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'FriendlySaveData':
+                continue
+            for f in obj.fields:
+                if f.name != '_friendlyDataList' or not f.list_elements:
                     continue
-                for f in obj.fields:
-                    if f.name == '_factionElementSaveDataList' and f.list_elements:
-                        for elem in f.list_elements:
-                            if not elem.child_fields:
-                                continue
-                            entry = {}
-                            for cf in elem.child_fields:
-                                if cf.present:
-                                    sz = cf.end_offset - cf.start_offset
-                                    if sz <= 4:
-                                        entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                                    elif sz == 1:
-                                        entry[cf.name] = raw[cf.start_offset]
-                            elem_entries.append(entry)
+                for elem in f.list_elements:
+                    if not elem.child_fields:
+                        continue
+                    char_key = 0
+                    level = 0
+                    exp = 0
+                    for cf in elem.child_fields:
+                        if cf.name == '_characterKey' and cf.present:
+                            char_key = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                        elif cf.name == '_levelData' and cf.child_fields:
+                            for lcf in cf.child_fields:
+                                if not lcf.present:
+                                    continue
+                                sz = lcf.end_offset - lcf.start_offset
+                                if lcf.name == '_level':
+                                    level = struct.unpack_from('<I', raw, lcf.start_offset)[0] if sz == 4 else raw[lcf.start_offset]
+                                elif lcf.name == '_exp':
+                                    exp = struct.unpack_from('<Q', raw, lcf.start_offset)[0] if sz == 8 else struct.unpack_from('<I', raw, lcf.start_offset)[0]
+                    exp_offset = 0
+                    level_offset = 0
+                    for cf in elem.child_fields:
+                        if cf.name == '_levelData' and cf.child_fields:
+                            for lcf in cf.child_fields:
+                                if lcf.present:
+                                    if lcf.name == '_exp':
+                                        exp_offset = lcf.start_offset
+                                    elif lcf.name == '_level':
+                                        level_offset = lcf.start_offset
+                    name = CHAR_NAMES.get(char_key, name_lookup(char_key))
+                    entries.append((name, char_key, level, exp, exp_offset, level_offset))
+        return entries
 
-                    elif f.name == '_factionNodeElementSaveDataList' and f.list_elements:
-                        for elem in f.list_elements:
-                            if not elem.child_fields:
-                                continue
-                            entry = {}
-                            offsets = {}
-                            for cf in elem.child_fields:
-                                if cf.present:
-                                    sz = cf.end_offset - cf.start_offset
-                                    offsets[cf.name] = (cf.start_offset, sz)
-                                    if sz == 1:
-                                        entry[cf.name] = raw[cf.start_offset]
-                                    elif sz == 2:
-                                        entry[cf.name] = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                                    elif sz == 4:
-                                        entry[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        entry[cf.name] = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                            entry['_offsets'] = offsets
-                            node_entries.append(entry)
-
-            table = self._faction_elem_table
-            table.setRowCount(len(elem_entries))
-            for r, entry in enumerate(elem_entries):
-                owner = entry.get('_ownerFactionKey', 0)
-                fname = faction_names.get(owner, '')
-                display = f"{fname} ({owner})" if fname else str(owner)
-                table.setItem(r, 0, QTableWidgetItem(display))
-
-                leader = entry.get('_leaderCharacterKey', 0)
-                lname = char_names.get(leader, '')
-                table.setItem(r, 1, QTableWidgetItem(f"{lname} ({leader})" if lname and leader else str(leader) if leader else "—"))
-
-                parent = entry.get('_parentFactionKey', 0)
-                pname = faction_names.get(parent, '')
-                table.setItem(r, 2, QTableWidgetItem(f"{pname} ({parent})" if pname else str(parent) if parent else "—"))
-
-                rg = entry.get('_relationGroupKey', 0)
-                table.setItem(r, 3, QTableWidgetItem(str(rg) if rg else "—"))
-
-            STATE_LABELS = {0: "Undiscovered", 1: "Discovered", 2: "Active", 3: "Conquered", 4: "Lost"}
-            self._faction_node_entries = node_entries
-
-            table2 = self._faction_node_table
-            table2.setRowCount(len(node_entries))
-            for r, entry in enumerate(node_entries):
-                owner = entry.get('_ownerFactionKey', 0)
-                nname = node_names.get(owner, faction_names.get(owner, ''))
-                display = f"{nname} ({owner})" if nname else str(owner)
-                owner_w = QTableWidgetItem(display)
-                owner_w.setData(Qt.UserRole, r)
-                table2.setItem(r, 0, owner_w)
-
-                state = entry.get('_factionState', 0)
-                state_w = QTableWidgetItem(STATE_LABELS.get(state, str(state)))
-                if state == 2:
-                    state_w.setForeground(QBrush(QColor(COLORS['success'])))
-                elif state == 3:
-                    state_w.setForeground(QBrush(QColor(COLORS['accent'])))
-                table2.setItem(r, 1, state_w)
-
-                conq = entry.get('_conquerorFactionKey', 0)
-                cname = faction_names.get(conq, '')
-                table2.setItem(r, 2, QTableWidgetItem(f"{cname} ({conq})" if cname else str(conq) if conq else "—"))
-
-                is_cap = entry.get('_isCapital', 0)
-                cap_w = QTableWidgetItem("Yes" if is_cap else "")
-                if is_cap:
-                    cap_w.setForeground(QBrush(QColor(COLORS['accent'])))
-                table2.setItem(r, 3, cap_w)
-
-                extras = {k: v for k, v in entry.items()
-                          if k not in ('_ownerFactionKey', '_factionState', '_conquerorFactionKey', '_isCapital')
-                          and v and v != 0}
-                table2.setItem(r, 4, QTableWidgetItem(", ".join(f"{k}={v}" for k, v in extras.items())))
-
-            self._faction_count.setText(
-                f"{len(elem_entries)} factions, {len(node_entries)} nodes"
-            )
-
-        except Exception as exc:
-            import traceback; traceback.print_exc()
-            log.warning("Faction tab populate failed: %s", exc)
-            self._faction_count.setText(f"Parse error: {exc}")
-
-        self._populate_bonds()
-        self._populate_sublevels()
+    def _apply_bond_entries(self, entries: list) -> None:
+        self._bond_entries = entries
+        self._bond_table.setRowCount(len(entries))
+        for r, (name, key, level, exp, exp_off, lvl_off) in enumerate(entries):
+            self._bond_table.setItem(r, 0, QTableWidgetItem(name))
+            self._bond_table.setItem(r, 1, QTableWidgetItem(str(key)))
+            lvl_w = QTableWidgetItem(f"Lv {level}, XP {exp}")
+            lvl_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'level_offset': lvl_off, 'exp': exp, 'level': level})
+            if level > 0:
+                lvl_w.setForeground(QBrush(QColor(COLORS['success'])))
+            self._bond_table.setItem(r, 2, lvl_w)
 
     def _populate_bonds(self) -> None:
         if not hasattr(self, '_bond_table') or not self._save_data:
@@ -15514,64 +15643,63 @@ QCheckBox::indicator {{
             from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
             result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            CHAR_NAMES = {
-                1: "Kliff", 4: "Damiane", 6: "Oongka",
-                1003918: "Silver Fang (Wolf)", 1003917: "White Bear",
-                1001173: "Damiane's Horse", 1001172: "Oongka's Horse",
-                1003120: "Kliff's Horse", 1000799: "Dragon",
-            }
-
-            entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'FriendlySaveData':
-                    continue
-                for f in obj.fields:
-                    if f.name != '_friendlyDataList' or not f.list_elements:
-                        continue
-                    for elem in f.list_elements:
-                        if not elem.child_fields:
-                            continue
-                        char_key = 0
-                        level = 0
-                        exp = 0
-                        for cf in elem.child_fields:
-                            if cf.name == '_characterKey' and cf.present:
-                                char_key = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                            elif cf.name == '_levelData' and cf.child_fields:
-                                for lcf in cf.child_fields:
-                                    if not lcf.present:
-                                        continue
-                                    sz = lcf.end_offset - lcf.start_offset
-                                    if lcf.name == '_level':
-                                        level = struct.unpack_from('<I', raw, lcf.start_offset)[0] if sz == 4 else raw[lcf.start_offset]
-                                    elif lcf.name == '_exp':
-                                        exp = struct.unpack_from('<Q', raw, lcf.start_offset)[0] if sz == 8 else struct.unpack_from('<I', raw, lcf.start_offset)[0]
-                        exp_offset = 0
-                        level_offset = 0
-                        for cf in elem.child_fields:
-                            if cf.name == '_levelData' and cf.child_fields:
-                                for lcf in cf.child_fields:
-                                    if lcf.present:
-                                        if lcf.name == '_exp':
-                                            exp_offset = lcf.start_offset
-                                        elif lcf.name == '_level':
-                                            level_offset = lcf.start_offset
-                        name = CHAR_NAMES.get(char_key, self._name_db.get_name(char_key) if hasattr(self, '_name_db') else f"Char_{char_key}")
-                        entries.append((name, char_key, level, exp, exp_offset, level_offset))
-
-            self._bond_entries = entries
-            self._bond_table.setRowCount(len(entries))
-            for r, (name, key, level, exp, exp_off, lvl_off) in enumerate(entries):
-                self._bond_table.setItem(r, 0, QTableWidgetItem(name))
-                self._bond_table.setItem(r, 1, QTableWidgetItem(str(key)))
-                lvl_w = QTableWidgetItem(f"Lv {level}, XP {exp}")
-                lvl_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'level_offset': lvl_off, 'exp': exp, 'level': level})
-                if level > 0:
-                    lvl_w.setForeground(QBrush(QColor(COLORS['success'])))
-                self._bond_table.setItem(r, 2, lvl_w)
+            if hasattr(self, '_name_db'):
+                name_lookup = self._name_db.get_name
+            else:
+                def name_lookup(key):
+                    return f"Char_{key}"
+            self._apply_bond_entries(self._extract_bond_entries(raw, result, name_lookup))
         except Exception as e:
             log.warning("Bond populate failed: %s", e)
+
+    @staticmethod
+    def _extract_sublevel_entries(raw: bytes, result, sublevel_names: dict) -> list:
+        entries = []
+        for obj in result['objects']:
+            if obj.class_name != 'SubLevelSaveData':
+                continue
+            for f in obj.fields:
+                if not f.list_elements:
+                    continue
+                for elem in f.list_elements:
+                    if not elem.child_fields:
+                        continue
+                    key = 0
+                    exp = 0
+                    for cf in elem.child_fields:
+                        if cf.present:
+                            sz = cf.end_offset - cf.start_offset
+                            if cf.name == '_key':
+                                if sz == 4:
+                                    key = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 2:
+                                    key = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                            elif cf.name in ('_experience', '_currentExp'):
+                                if sz == 4:
+                                    exp = struct.unpack_from('<I', raw, cf.start_offset)[0]
+                                elif sz == 8:
+                                    exp = struct.unpack_from('<Q', raw, cf.start_offset)[0]
+                                elif sz == 2:
+                                    exp = struct.unpack_from('<H', raw, cf.start_offset)[0]
+                    exp_offset = 0
+                    for cf in elem.child_fields:
+                        if cf.present and cf.name in ('_experience', '_currentExp'):
+                            exp_offset = cf.start_offset
+                    name = sublevel_names.get(key, f"SubLevel_{key}")
+                    entries.append((key, name, exp, exp_offset))
+        return entries
+
+    def _apply_sublevel_entries(self, entries: list) -> None:
+        self._sublevel_entries = entries
+        self._sublevel_table.setRowCount(len(entries))
+        for r, (key, name, exp, exp_off) in enumerate(entries):
+            self._sublevel_table.setItem(r, 0, QTableWidgetItem(str(key)))
+            self._sublevel_table.setItem(r, 1, QTableWidgetItem(name))
+            exp_w = QTableWidgetItem(str(exp))
+            exp_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'exp': exp})
+            if exp > 0:
+                exp_w.setForeground(QBrush(QColor(COLORS['success'])))
+            self._sublevel_table.setItem(r, 2, exp_w)
 
     def _populate_sublevels(self) -> None:
         if not hasattr(self, '_sublevel_table') or not self._save_data:
@@ -15583,66 +15711,10 @@ QCheckBox::indicator {{
             from save_parser import build_result_from_raw
             raw = bytes(self._save_data.decompressed_blob)
             result = build_result_from_raw(raw, {'input_kind': 'raw_blob'})
-
-            sublevel_names = {}
-            try:
-                _base = getattr(_sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-                gm_path = os.path.join(_base, 'game_map.json')
-                if os.path.isfile(gm_path):
-                    with open(gm_path, 'r', encoding='utf-8') as f:
-                        gm = json.load(f)
-                    for k, v in gm.get('sublevels', {}).items():
-                        if isinstance(v, dict):
-                            sublevel_names[int(k)] = v.get('name', f'SubLevel_{k}')
-                        else:
-                            sublevel_names[int(k)] = str(v)
-            except Exception:
-                pass
-
-            entries = []
-            for obj in result['objects']:
-                if obj.class_name != 'SubLevelSaveData':
-                    continue
-                for f in obj.fields:
-                    if not f.list_elements:
-                        continue
-                    for elem in f.list_elements:
-                        if not elem.child_fields:
-                            continue
-                        key = 0
-                        exp = 0
-                        for cf in elem.child_fields:
-                            if cf.present:
-                                sz = cf.end_offset - cf.start_offset
-                                if cf.name == '_key':
-                                    if sz == 4:
-                                        key = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 2:
-                                        key = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                                elif cf.name in ('_experience', '_currentExp'):
-                                    if sz == 4:
-                                        exp = struct.unpack_from('<I', raw, cf.start_offset)[0]
-                                    elif sz == 8:
-                                        exp = struct.unpack_from('<Q', raw, cf.start_offset)[0]
-                                    elif sz == 2:
-                                        exp = struct.unpack_from('<H', raw, cf.start_offset)[0]
-                        exp_offset = 0
-                        for cf in elem.child_fields:
-                            if cf.present and cf.name in ('_experience', '_currentExp'):
-                                exp_offset = cf.start_offset
-                        name = sublevel_names.get(key, f"SubLevel_{key}")
-                        entries.append((key, name, exp, exp_offset))
-
-            self._sublevel_entries = entries
-            self._sublevel_table.setRowCount(len(entries))
-            for r, (key, name, exp, exp_off) in enumerate(entries):
-                self._sublevel_table.setItem(r, 0, QTableWidgetItem(str(key)))
-                self._sublevel_table.setItem(r, 1, QTableWidgetItem(name))
-                exp_w = QTableWidgetItem(str(exp))
-                exp_w.setData(Qt.UserRole, {'exp_offset': exp_off, 'exp': exp})
-                if exp > 0:
-                    exp_w.setForeground(QBrush(QColor(COLORS['success'])))
-                self._sublevel_table.setItem(r, 2, exp_w)
+            sublevel_names = self._load_game_map_names()['sublevels']
+            self._apply_sublevel_entries(
+                self._extract_sublevel_entries(raw, result, sublevel_names)
+            )
         except Exception as e:
             log.warning("SubLevel populate failed: %s", e)
 
@@ -15731,8 +15803,9 @@ QCheckBox::indicator {{
                 count += 1
         if count:
             self._dirty = True
-            self._populate_faction_tab()
-            self._faction_count.setText(f"Discovered {count} nodes. Ctrl+S to save.")
+            self._populate_faction_tab(
+                done_message=f"Discovered {count} nodes. Ctrl+S to save."
+            )
         else:
             self._faction_count.setText("All nodes already discovered.")
 
