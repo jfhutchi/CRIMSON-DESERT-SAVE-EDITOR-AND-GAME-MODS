@@ -89,11 +89,13 @@ The completed executables are:
 - `CrimsonSaveEditor\dist\CrimsonSaveEditorStandalone.exe`
 - `CrimsonGameMods\dist\CrimsonGameMods.exe`
 
-The Save Editor spec packs `icons_local\` and `icons_mercenary\` from the
-repository root into a single `icons_bundle.zip` inside the executable
-(roughly 69 MB). On first launch the application extracts the bundle next to
-the executable in the background, so item icons are on by default and work
-offline; later launches reuse the extracted folders.
+Item icons are not packed into the executable to keep the download small.
+Icons are on by default; on first launch the Save Editor offers to download
+the icon set (about 70 MB) from GitHub on a worker pool with a cancelable
+progress dialog, storing it in `icons_local\` next to the executable. The
+"Download Icons…" toolbar button starts or resumes the same download. Placing
+a prebuilt `icons_bundle.zip` (zip of `icons_local/` and `icons_mercenary/`)
+next to the executable seeds the set offline instead.
 
 Launch each executable without a command-line file for the first smoke test.
 Confirm that both display the Blackstar timer panel. If testing Apply or Restore,

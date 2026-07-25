@@ -176,8 +176,103 @@ def test_icons_default_on_in_gui_source() -> None:
     assert 'self._config.get("show_icons", False)' not in source
 
 
-def test_spec_bundles_the_icon_archive() -> None:
+def test_spec_ships_without_the_icon_archive() -> None:
+    # Shipping decision: the exe must stay small; icons are downloaded on
+    # demand with a visible progress dialog. A user-supplied icons_bundle.zip
+    # next to the exe still seeds offline, but the build must not embed one.
     spec = (ROOT / "CrimsonSaveEditor" / "CrimsonSaveEditor.spec").read_text(
         encoding="utf-8"
     )
-    assert "icons_bundle.zip" in spec
+    assert "icons_bundle.zip" not in spec
+
+
+def test_bulk_download_runs_concurrently_and_supports_cancel(tmp_path: Path) -> None:
+    import json
+    import threading
+    import urllib.request
+
+    _app()
+    listing = [
+        {"name": "1.webp"},
+        {"name": "2.webp"},
+        {"name": "3.webp"},
+        {"name": "readme.txt"},
+    ]
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    active = []
+    lock = threading.Lock()
+
+    def fake_urlopen(req, timeout=0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.github.com" in url:
+            return _FakeResponse(json.dumps(listing).encode())
+        with lock:
+            active.append(url)
+        return _FakeResponse(b"w" * 200)
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        cache = IconCache(local_dir=str(tmp_path / "icons_local"))
+        progress: list[tuple] = []
+        stats = cache.bulk_download_all(
+            progress_callback=lambda *args: progress.append(args)
+        )
+    finally:
+        urllib.request.urlopen = original
+
+    assert stats["downloaded"] == 6, "3 webp files in each of the two folders"
+    assert (tmp_path / "icons_local" / "1.webp").is_file()
+    assert (tmp_path / "icons_mercenary" / "2.webp").is_file()
+    assert progress, "progress callback must fire"
+
+    source = (ROOT / "CrimsonSaveEditor" / "icon_cache.py").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "ThreadPoolExecutor" in source, (
+        "6,000 sequential requests take ~15 minutes; downloads must run on a "
+        "worker pool"
+    )
+    assert "cancel_event" in source
+
+
+def test_download_ui_is_discoverable_with_progress() -> None:
+    source = (ROOT / "CrimsonSaveEditor" / "gui.py").read_text(encoding="utf-8-sig")
+    assert "_maybe_offer_icon_download" in source, (
+        "a fresh install with icons enabled must offer the download instead "
+        "of silently showing an empty icon column"
+    )
+    assert "icons_download_declined" in source, "the offer must not nag"
+
+    import ast
+
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "MainWindow":
+            for child in node.body:
+                if (
+                    isinstance(child, ast.FunctionDef)
+                    and child.name == "_bulk_download_icons"
+                ):
+                    segment = ast.get_source_segment(source, child)
+                    assert segment is not None
+                    assert "QProgressDialog" in segment, (
+                        "the download must show a progress dialog so it never "
+                        "looks frozen"
+                    )
+                    assert "QApplication.processEvents" not in segment
+                    return
+    raise AssertionError("MainWindow._bulk_download_icons not found")

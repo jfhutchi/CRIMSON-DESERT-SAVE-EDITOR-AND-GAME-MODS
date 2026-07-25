@@ -68,6 +68,8 @@ class IconCache(QObject):
     _seeded = Signal(int, object)
     _warm_batch = Signal(object)
     _warm_done = Signal(int, object)
+    _bulk_progress = Signal(object, object)
+    _bulk_done = Signal(object, object)
 
     def __init__(self, icon_urls_path: Optional[str] = None, local_dir: Optional[str] = None):
         super().__init__()
@@ -75,12 +77,15 @@ class IconCache(QObject):
         self._pending: set = set()
         self._lock = threading.Lock()
         self._warming = False
+        self._bulk_running = False
         self._local_dir = local_dir or _get_local_icons_dir()
         os.makedirs(self._local_dir, exist_ok=True)
         self._deliver.connect(self._on_deliver)
         self._seeded.connect(self._on_seeded)
         self._warm_batch.connect(self._on_warm_batch)
         self._warm_done.connect(self._on_warm_done)
+        self._bulk_progress.connect(self._on_bulk_progress)
+        self._bulk_done.connect(self._on_bulk_done)
 
     def _on_deliver(self, item_key: int, px: object, callback) -> None:
         callback(item_key, px)
@@ -98,6 +103,14 @@ class IconCache(QObject):
         self._warming = False
         if callback is not None:
             callback(count)
+
+    def _on_bulk_progress(self, args, callback) -> None:
+        callback(*args)
+
+    def _on_bulk_done(self, stats, callback) -> None:
+        self._bulk_running = False
+        if callback is not None:
+            callback(stats)
 
     def peek(self, item_key: int) -> Optional[QPixmap]:
         """Return the cached pixmap without any disk access."""
@@ -330,11 +343,24 @@ class IconCache(QObject):
             if key not in self._pixmaps:
                 self.request_icon(key, callback)
 
-    def bulk_download_all(self, progress_callback=None) -> dict:
-        from urllib.request import urlopen, Request
-        import json as _json
+    def bulk_download_all(
+        self,
+        progress_callback=None,
+        cancel_event: Optional[threading.Event] = None,
+        max_workers: int = 12,
+    ) -> dict:
+        """Download the icon set with a worker pool.
 
-        stats = {'downloaded': 0, 'skipped': 0, 'errors': 0}
+        Sequential downloads take ~15 minutes for 6,000 files; a small pool
+        brings that to about a minute. Safe to call from a worker thread;
+        ``progress_callback`` fires on that same thread (use
+        ``bulk_download_async`` for GUI-marshaled callbacks).
+        """
+        import json as _json
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+
+        stats = {'downloaded': 0, 'skipped': 0, 'errors': 0, 'cancelled': False}
 
         seeded = self.seed_from_bundle_sync(min_files=1_000_000)
         if seeded:
@@ -345,50 +371,103 @@ class IconCache(QObject):
             ("icons_local", self._local_dir),
             ("icons_mercenary", os.path.join(os.path.dirname(self._local_dir), "icons_mercenary")),
         ]
+        stats_lock = threading.Lock()
+
+        def _report(folder_name: str, total: int) -> None:
+            if progress_callback is None:
+                return
+            with stats_lock:
+                snapshot = (stats['downloaded'], stats['skipped'], stats['errors'])
+            progress_callback(folder_name, *snapshot, total)
 
         for folder_name, local_dir in folders:
+            if cancel_event is not None and cancel_event.is_set():
+                stats['cancelled'] = True
+                break
             os.makedirs(local_dir, exist_ok=True)
             base_url = f"https://raw.githubusercontent.com/NattKh/CRIMSON-DESERT-SAVE-EDITOR/main/{folder_name}"
 
             api_url = f"https://api.github.com/repos/NattKh/CRIMSON-DESERT-SAVE-EDITOR/contents/{folder_name}"
             try:
-                req = Request(api_url, headers={"User-Agent": "CrimsonSaveEditor"})
-                with urlopen(req, timeout=30) as resp:
+                req = urllib.request.Request(api_url, headers={"User-Agent": "CrimsonSaveEditor"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     files = _json.loads(resp.read())
             except Exception as e:
                 log.warning("Failed to list %s from GitHub: %s", folder_name, e)
-                stats['errors'] += 1
+                with stats_lock:
+                    stats['errors'] += 1
                 continue
 
-            for i, entry in enumerate(files):
-                fname = entry.get('name', '')
-                if not fname.endswith('.webp'):
-                    continue
+            wanted = [
+                entry.get('name', '')
+                for entry in files
+                if entry.get('name', '').endswith('.webp')
+            ]
+            total = len(wanted)
 
-                local_path = os.path.join(local_dir, fname)
+            def _fetch(fname, _dir=local_dir, _base=base_url, _folder=folder_name, _total=total):
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                local_path = os.path.join(_dir, fname)
                 if os.path.isfile(local_path):
-                    stats['skipped'] += 1
-                    continue
+                    with stats_lock:
+                        stats['skipped'] += 1
+                else:
+                    try:
+                        req = urllib.request.Request(
+                            f"{_base}/{fname}",
+                            headers={"User-Agent": "CrimsonSaveEditor"},
+                        )
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            data = resp.read()
+                        if data and len(data) > 100:
+                            with open(local_path, 'wb') as f:
+                                f.write(data)
+                            with stats_lock:
+                                stats['downloaded'] += 1
+                        else:
+                            with stats_lock:
+                                stats['errors'] += 1
+                    except Exception:
+                        with stats_lock:
+                            stats['errors'] += 1
+                with stats_lock:
+                    done = stats['downloaded'] + stats['skipped'] + stats['errors']
+                if done % 25 == 0 or done >= _total:
+                    _report(_folder, _total)
 
-                try:
-                    dl_url = f"{base_url}/{fname}"
-                    req = Request(dl_url, headers={"User-Agent": "CrimsonSaveEditor"})
-                    with urlopen(req, timeout=15) as resp:
-                        data = resp.read()
-                    if data and len(data) > 100:
-                        with open(local_path, 'wb') as f:
-                            f.write(data)
-                        stats['downloaded'] += 1
-                    else:
-                        stats['errors'] += 1
-                except Exception:
-                    stats['errors'] += 1
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(_fetch, wanted))
 
-                if progress_callback and (stats['downloaded'] + stats['errors']) % 50 == 0:
-                    progress_callback(folder_name, stats['downloaded'], stats['skipped'],
-                                      stats['errors'], len(files))
+            if cancel_event is not None and cancel_event.is_set():
+                stats['cancelled'] = True
+                break
 
         return stats
+
+    def bulk_download_async(
+        self,
+        progress=None,
+        completed=None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Run bulk_download_all on a thread, callbacks on the GUI thread."""
+        if self._bulk_running:
+            return False
+        self._bulk_running = True
+
+        def _worker() -> None:
+            def _cb(*args) -> None:
+                if progress is not None:
+                    self._bulk_progress.emit(args, progress)
+
+            stats = self.bulk_download_all(
+                progress_callback=_cb, cancel_event=cancel_event
+            )
+            self._bulk_done.emit(stats, completed)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
 
     def get_merc_pixmap(self, char_key: int) -> Optional[QPixmap]:
         cache_key = f"merc_{char_key}"

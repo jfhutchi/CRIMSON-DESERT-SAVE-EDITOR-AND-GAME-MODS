@@ -2553,8 +2553,10 @@ class MainWindow(QMainWindow):
             self._set_widget_scale(saved_widget_scale)
 
         self._apply_icon_display_metrics()
+        self._apply_icon_button_labels()
         if not self._icon_seed_pending:
             self._start_icon_warm()
+            QTimer.singleShot(1500, self._maybe_offer_icon_download)
         self._refresh_sidebar()
         last_path = self._config.get("last_save_path", "")
         if last_path and os.path.isfile(last_path):
@@ -32378,12 +32380,54 @@ QCheckBox::indicator {{
             tbl.setColumnWidth(0, (ICON_SIZE + 16) if self._icons_enabled else 0)
             tbl.verticalHeader().setDefaultSectionSize(row_h)
 
+    def _apply_icon_button_labels(self) -> None:
+        if not self._icons_enabled:
+            label = "Show Icons"
+        elif self._icon_cache.coverage < 100:
+            label = "Download Icons…"
+        else:
+            label = "Hide Icons"
+        for name in ('_show_icons_btn', '_db_show_icons_btn', '_global_icons_btn'):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setText(label)
+
+    def _maybe_offer_icon_download(self) -> None:
+        if not self._icons_enabled:
+            return
+        if self._icon_cache.coverage >= 100:
+            return
+        if getattr(self, '_icon_seed_pending', False):
+            return
+        if self._config.get("icons_download_declined"):
+            return
+        reply = QMessageBox.question(
+            self, "Download Item Icons",
+            "Item icons are enabled but not downloaded yet (about 70 MB, one "
+            "time).\n\nDownload them now with a progress bar?\n\n"
+            "You can also start this anytime with the \"Download Icons…\" "
+            "button in the Items toolbar.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._bulk_download_icons()
+        else:
+            self._config["icons_download_declined"] = True
+            self._save_config()
+            self._update_status(
+                'Icons not downloaded — use the "Download Icons…" button in '
+                'the Items toolbar anytime'
+            )
+            self._apply_icon_button_labels()
+
     def _on_icons_seeded(self, count: int) -> None:
         self._icon_seed_pending = False
         if count:
             log.info("Seeded %d bundled icons next to the executable", count)
             self._update_status(f"Item icons installed ({count} from bundle)")
+        self._apply_icon_button_labels()
         self._start_icon_warm()
+        self._maybe_offer_icon_download()
 
     def _start_icon_warm(self) -> None:
         if not self._icons_enabled:
@@ -32410,13 +32454,7 @@ QCheckBox::indicator {{
         self._config["show_icons"] = self._icons_enabled
         self._save_config()
 
-        btn_text = "Hide Icons" if self._icons_enabled else "Show Icons"
-
-        self._show_icons_btn.setText(btn_text)
-        if hasattr(self, '_db_show_icons_btn'):
-            self._db_show_icons_btn.setText(btn_text)
-        if hasattr(self, '_global_icons_btn'):
-            self._global_icons_btn.setText(btn_text)
+        self._apply_icon_button_labels()
 
         if self._icons_enabled and self._icon_cache.coverage < 100:
             reply = QMessageBox.question(
@@ -32442,29 +32480,57 @@ QCheckBox::indicator {{
         self._merc_refresh()
 
     def _bulk_download_icons(self) -> None:
-        self._update_status("Downloading icons from GitHub...")
-        QApplication.processEvents()
+        if getattr(self, '_icon_download_cancel', None) is not None:
+            self._update_status("Icon download is already running")
+            return
 
-        def _progress(folder, downloaded, skipped, errors, total):
-            self._update_status(
-                f"Icons [{folder}]: {downloaded} downloaded, {skipped} cached, "
-                f"{errors} failed ({total} total)")
-            QApplication.processEvents()
+        import threading as _threading
+        cancel_event = _threading.Event()
 
-        import threading
-        def _do_download():
-            stats = self._icon_cache.bulk_download_all(progress_callback=_progress)
-            from PySide6.QtCore import QMetaObject, Qt as _Qt
-            self._update_status(
-                f"Icons: {stats['downloaded']} downloaded, {stats['skipped']} cached, "
-                f"{stats['errors']} failed")
-
-        thread = threading.Thread(target=_do_download, daemon=True)
-        thread.start()
-        self._populate_swap_list(
-            self._swap_search.text().strip() if hasattr(self, '_swap_search') else "",
-            self._swap_category.currentText() if hasattr(self, '_swap_category') else "All",
+        progress = QProgressDialog(
+            "Contacting GitHub for the icon list...", "Cancel", 0, 100, self
         )
+        progress.setWindowTitle("Downloading Item Icons")
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.canceled.connect(cancel_event.set)
+        progress.show()
+
+        def _on_progress(folder, downloaded, skipped, errors, total) -> None:
+            done = downloaded + skipped + errors
+            progress.setLabelText(
+                f"Downloading item icons [{folder}]\n"
+                f"{downloaded} downloaded, {skipped} cached, {errors} failed "
+                f"of {total}"
+            )
+            progress.setValue(min(99, int(done / max(1, total) * 100)))
+
+        def _on_finished(stats) -> None:
+            self._icon_download_cancel = None
+            progress.setValue(100)
+            progress.close()
+            if stats.get('cancelled'):
+                self._update_status(
+                    f"Icon download cancelled after {stats['downloaded']} files; "
+                    "run it again anytime to resume"
+                )
+            else:
+                self._config.pop("icons_download_declined", None)
+                self._save_config()
+                self._update_status(
+                    f"Icons ready: {stats['downloaded']} downloaded, "
+                    f"{stats['skipped']} cached, {stats['errors']} failed"
+                )
+            self._apply_icon_button_labels()
+            self._start_icon_warm()
+
+        if self._icon_cache.bulk_download_async(
+            progress=_on_progress, completed=_on_finished, cancel_event=cancel_event
+        ):
+            self._icon_download_cancel = cancel_event
+        else:
+            progress.close()
 
     def _on_icon_loaded(self, item_key: int, pixmap) -> None:
         self._icon_ready.emit(item_key)
@@ -34085,9 +34151,6 @@ QCheckBox::indicator {{
         QMessageBox.information(self, "GitHub Sync", msg)
 
     def _sync_all_icons(self) -> None:
-        import json as _json
-        from urllib.request import urlopen, Request
-
         keys = set()
         for item in self._name_db._items.values():
             keys.add(item.item_key)
@@ -34112,37 +34175,7 @@ QCheckBox::indicator {{
         if reply != QMessageBox.Yes:
             return
 
-        self._update_status(f"Downloading {needed} icons...")
-        QApplication.processEvents()
-
-        from icon_cache import _GITHUB_ICON_BASE
-        downloaded = 0
-        errors = 0
-        for i, key in enumerate(sorted(keys)):
-            local_path = os.path.join(local_dir, f"{key}.webp")
-            if os.path.isfile(local_path):
-                continue
-            try:
-                url = f"{_GITHUB_ICON_BASE}/{key}.webp"
-                req = Request(url, headers={"User-Agent": "CrimsonSaveEditor"})
-                with urlopen(req, timeout=15) as resp:
-                    data = resp.read()
-                if data and len(data) > 100:
-                    with open(local_path, 'wb') as f:
-                        f.write(data)
-                    downloaded += 1
-                else:
-                    errors += 1
-            except Exception:
-                errors += 1
-
-            if (downloaded + errors) % 100 == 0:
-                self._update_status(f"Icons: {downloaded} downloaded, {errors} failed, {needed - downloaded - errors} remaining...")
-                QApplication.processEvents()
-
-        msg = f"Downloaded {downloaded} icons, {errors} not available on GitHub.\nTotal cached: {already + downloaded}"
-        self._update_status(msg)
-        QMessageBox.information(self, "Sync Complete", msg)
+        self._bulk_download_icons()
 
 
     def _get_backup_dir(self) -> str:
