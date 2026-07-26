@@ -901,6 +901,147 @@ _BAG_KEY_NAMES = {
 }
 
 
+def _item_from_child_fields(raw: bytes, child_fields, source: str, bag: str = ""):
+    start = None
+    offsets = {}
+    values = {}
+    for cf in child_fields:
+        if not cf.present:
+            continue
+        if start is None:
+            start = cf.start_offset
+        offsets[cf.name] = cf.start_offset
+        size = cf.end_offset - cf.start_offset
+        try:
+            if size == 1:
+                values[cf.name] = raw[cf.start_offset]
+            elif size == 2:
+                values[cf.name] = struct.unpack_from('<H', raw, cf.start_offset)[0]
+            elif size == 4:
+                values[cf.name] = struct.unpack_from('<I', raw, cf.start_offset)[0]
+            elif size == 8:
+                values[cf.name] = struct.unpack_from('<q', raw, cf.start_offset)[0]
+        except struct.error:
+            continue
+    if start is None or '_itemKey' not in values:
+        return None
+    end = max(cf.end_offset for cf in child_fields if cf.present)
+    enchant = values.get('_enchantLevel', 0)
+    return SaveItem(
+        offset=start,
+        item_no=values.get('_itemNo', 0),
+        item_key=values.get('_itemKey', 0),
+        slot_no=values.get('_slotNo', 0),
+        stack_count=values.get('_stackCount', 0),
+        enchant_level=enchant,
+        endurance=values.get('_endurance', 0),
+        sharpness=values.get('_sharpness', 0),
+        has_enchant=enchant > 0,
+        is_equipment=(source == "Equipment"),
+        source=source,
+        bag=bag,
+        block_size=end - start,
+        field_offsets=offsets,
+        parc_parsed=True,
+    )
+
+
+def scan_items_from_parse(
+    data: bytes | bytearray,
+    result,
+) -> Tuple[List[SaveItem], List[Tuple[int, int]]]:
+    """Extract items by walking the parsed save tree.
+
+    Every inventory container (`InventorySaveData._inventorylist[*]._itemList`)
+    and equipped piece (`EquipmentSaveData._list[*]._item`) is emitted with
+    exact per-field offsets. Records keep the classic fixed deltas (_itemNo at
+    +4, _itemKey at +12, _slotNo at +16, _stackCount at +18) so record-relative
+    editing code keeps working. Returns (items, covered_byte_spans).
+    """
+    raw = bytes(data)
+    items: List[SaveItem] = []
+    spans: List[Tuple[int, int]] = []
+    for obj in result['objects']:
+        if obj.class_name == 'InventorySaveData':
+            for f in obj.fields:
+                if f.name != '_inventorylist' or not f.list_elements:
+                    continue
+                for bag_elem in f.list_elements:
+                    if not bag_elem.child_fields:
+                        continue
+                    inv_key = -1
+                    for cf in bag_elem.child_fields:
+                        if cf.name == '_inventoryKey' and cf.present:
+                            try:
+                                inv_key = int(cf.value_repr or -1)
+                            except (ValueError, TypeError):
+                                inv_key = -1
+                    bag_name = (
+                        _BAG_KEY_NAMES.get(inv_key, f"Bag_{inv_key}")
+                        if inv_key >= 0 else ""
+                    )
+                    for cf in bag_elem.child_fields:
+                        if cf.name == '_itemList' and cf.list_elements:
+                            spans.append((
+                                cf.list_elements[0].start_offset,
+                                cf.list_elements[-1].end_offset,
+                            ))
+                            for elem in cf.list_elements:
+                                if not elem.child_fields:
+                                    continue
+                                item = _item_from_child_fields(
+                                    raw, elem.child_fields, "Inventory", bag_name
+                                )
+                                if item:
+                                    items.append(item)
+        elif obj.class_name == 'EquipmentSaveData':
+            for f in obj.fields:
+                if f.name == '_list' and f.list_elements:
+                    spans.append((
+                        f.list_elements[0].start_offset,
+                        f.list_elements[-1].end_offset,
+                    ))
+                    for elem in f.list_elements:
+                        for cf in elem.child_fields or []:
+                            if cf.name == '_item' and cf.child_fields:
+                                item = _item_from_child_fields(
+                                    raw, cf.child_fields, "Equipment"
+                                )
+                                if item:
+                                    items.append(item)
+    return items, spans
+
+
+def scan_items_smart(data: bytes | bytearray, result=None) -> List[SaveItem]:
+    """Best-available item extraction: parse tree first, pattern scan to fill.
+
+    The pattern scanner recognizes records by byte signature and misses most
+    nested container items (32-77% coverage depending on save generation).
+    Legacy-scanned items outside the parsed containers (mercenary gear, vendor
+    blocks) are kept; on any parse failure the legacy result is returned.
+    """
+    legacy = scan_items(data)
+    if result is None:
+        try:
+            from save_parser import build_result_from_raw
+            result = build_result_from_raw(bytes(data), {'input_kind': 'raw_blob'})
+        except Exception:
+            return legacy
+    try:
+        parsed, spans = scan_items_from_parse(data, result)
+    except Exception:
+        return legacy
+    if not parsed:
+        return legacy
+
+    def _covered(offset: int) -> bool:
+        return any(start <= offset < end for start, end in spans)
+
+    merged = parsed + [item for item in legacy if not _covered(item.offset)]
+    merged.sort(key=lambda item: item.offset)
+    return merged
+
+
 def enrich_items_with_parc(
     data: bytes | bytearray,
     items: List[SaveItem],

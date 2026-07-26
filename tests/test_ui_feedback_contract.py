@@ -83,6 +83,39 @@ def test_dye_swatch_cell_shows_color_not_hex_text() -> None:
     assert "swatch.setToolTip(" in segment
 
 
+def test_mod_editor_parity_with_save_editor() -> None:
+    gm_root = ROOT / "CrimsonGameMods"
+    window = (gm_root / "gui" / "main_window.py").read_text(encoding="utf-8-sig")
+
+    assert "scan_items_smart(" in window, (
+        "Mod Editor item views must use parse-tree extraction, not the lossy "
+        "pattern scan that leaves bag tabs empty"
+    )
+    assert "QTimer.singleShot(0, lambda: self._load_save(last_path))" not in window, (
+        "never auto-load the previous save at launch; it is stale after play"
+    )
+    assert 'self._config.get("show_icons", False)' in window, (
+        "icons are opt-in; the remembered config key turns them back on"
+    )
+    assert "_start_icon_warm(" in window
+
+    scanner = (gm_root / "item_scanner.py").read_text(encoding="utf-8-sig")
+    assert "def scan_items_smart(" in scanner
+    assert "def scan_items_from_parse(" in scanner
+
+    import hashlib
+    gm_icons = hashlib.sha256(
+        (gm_root / "icon_cache.py").read_bytes()
+    ).hexdigest()
+    se_icons = hashlib.sha256(
+        (ROOT / "CrimsonSaveEditor" / "icon_cache.py").read_bytes()
+    ).hexdigest()
+    assert gm_icons == se_icons, (
+        "icon_cache.py copies must stay in sync; drift caused the stale "
+        "has_icon/thread-safety bugs"
+    )
+
+
 def test_repopulates_cancel_superseded_row_jobs() -> None:
     path = ROOT / "CrimsonSaveEditor" / "gui.py"
     for method_name in (
@@ -104,13 +137,24 @@ def test_repopulates_cancel_superseded_row_jobs() -> None:
 
 
 def test_blocking_task_helper_pairs_worker_with_modal_progress() -> None:
+    # The implementation is shared by both apps from crimson_common.
+    shared = (ROOT / "crimson_common" / "progress_ui.py").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "start_gui_task" in shared, "the work must leave the GUI thread"
+    assert "QProgressDialog" in shared, "the user must see a busy dialog"
+    assert "WindowModal" in shared, (
+        "interaction must be blocked while save bytes are being rewritten"
+    )
     segment = _method_source(
         ROOT / "CrimsonSaveEditor" / "gui.py", "MainWindow", "_run_blocking_task"
     )
-    assert "start_gui_task" in segment, "the work must leave the GUI thread"
-    assert "QProgressDialog" in segment, "the user must see a busy dialog"
-    assert "WindowModal" in segment, (
-        "interaction must be blocked while save bytes are being rewritten"
+    assert "run_blocking_task(" in segment, "SaveEditor must delegate"
+    gm = (ROOT / "CrimsonGameMods" / "gui" / "main_window.py").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "download_icons_with_progress(" in gm, (
+        "the Mod Editor icon download must show the shared progress bar"
     )
 
 

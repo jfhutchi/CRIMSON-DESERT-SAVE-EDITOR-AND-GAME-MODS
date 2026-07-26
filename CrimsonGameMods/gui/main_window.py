@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from models import SaveItem, SaveData, UndoEntry, QuestState
 from save_crypto import load_save_file, load_raw_stream, write_save_file
 from item_scanner import (
-    scan_items, apply_stack_edit, apply_enchant_edit,
+    scan_items, scan_items_smart, apply_stack_edit, apply_enchant_edit,
     apply_endurance_edit, apply_sharpness_edit, apply_item_swap, apply_item_swap_all,
     enrich_items_with_parc, smart_item_swap,
     apply_itemno_edit, get_max_itemno,
@@ -306,27 +306,16 @@ class MainWindow(QMainWindow):
             self._toggle_global_info(True)
 
         self._refresh_sidebar()
+        self._start_icon_warm()
 
         try:
             from updater import APP_VARIANT as _variant
         except Exception:
             _variant = "full"
-        _autoload = _variant != "gamemods"
-
-        last_path = self._config.get("last_save_path", "")
-        if _autoload and last_path and os.path.isfile(last_path):
-            try:
-                from gui_i18n import needs_language_picker
-                if needs_language_picker():
-                    self._pending_autoload_path = last_path
-                    self._update_status("Waiting for language choice…")
-                else:
-                    self._update_status(f"Loading: {os.path.basename(last_path)}...")
-                    QTimer.singleShot(0, lambda: self._load_save(last_path))
-            except Exception:
-                self._update_status(f"Loading: {os.path.basename(last_path)}...")
-                QTimer.singleShot(0, lambda: self._load_save(last_path))
-        elif _variant == "gamemods":
+        # Never auto-load the previous save: after playing, the file on disk has
+        # moved on, so silently reopening the last one risks editing stale data.
+        # The sidebar still highlights the last-used slot for one-click access.
+        if _variant == "gamemods":
             self._update_status(
                 f"Ready. Item DB: {len(self._name_db.items)} items. "
                 "Load a save only when needed — e.g. 'My Inventory' in ItemBuffs."
@@ -3349,9 +3338,17 @@ QCheckBox::indicator {{
         def _task(report):
             report("Decrypting save file...", 10)
             save_data = load_save_file(path)
-            report("Scanning items...", 45)
-            items = scan_items(save_data.decompressed_blob)
-            report("Resolving item names...", 65)
+            report("Parsing save structure...", 35)
+            try:
+                from save_parser import build_result_from_raw
+                parse_result = build_result_from_raw(
+                    bytes(save_data.decompressed_blob), {'input_kind': 'raw_blob'}
+                )
+            except Exception:
+                parse_result = None
+            report("Scanning items...", 55)
+            items = scan_items_smart(save_data.decompressed_blob, parse_result)
+            report("Resolving item names...", 70)
             for item in items:
                 item.name = self._name_db.get_name(item.item_key)
                 item.category = self._name_db.get_category(item.item_key)
@@ -3579,7 +3576,7 @@ QCheckBox::indicator {{
 
         self._quest_entries = []
         self._mission_entries = []
-        self._items = scan_items(self._save_data.decompressed_blob)
+        self._items = scan_items_smart(self._save_data.decompressed_blob)
 
         for item in self._items:
             item.name = self._name_db.get_name(item.item_key)
@@ -3814,8 +3811,9 @@ QCheckBox::indicator {{
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
-                if hasattr(self, '_inventory_tab'):
-                    self._inventory_tab._bulk_download_icons()
+                self._download_icons()
+        elif self._icons_enabled:
+            self._start_icon_warm()
 
         if hasattr(self, '_inventory_tab'):
             self._inventory_tab.set_icons_enabled(self._icons_enabled)
@@ -3830,6 +3828,24 @@ QCheckBox::indicator {{
         if hasattr(self, '_mercenary_tab'):
             self._mercenary_tab.set_icons_enabled(self._icons_enabled)
 
+
+    def _download_icons(self) -> None:
+        """Fetch the icon set behind a cancelable progress bar (shared helper)."""
+        from crimson_common.progress_ui import download_icons_with_progress
+
+        download_icons_with_progress(
+            self,
+            self._icon_cache,
+            status=self._update_status,
+            finished=lambda _stats: self._start_icon_warm(),
+        )
+
+    def _start_icon_warm(self) -> None:
+        """Decode cached icons off the GUI thread so tables paint instantly."""
+        if not self._icons_enabled:
+            return
+        keys = [info.item_key for info in self._name_db.get_all_sorted()]
+        self._icon_cache.warm_cache_async(keys)
 
     def _on_icon_loaded(self, item_key: int, pixmap) -> None:
         self._icon_ready.emit(item_key)

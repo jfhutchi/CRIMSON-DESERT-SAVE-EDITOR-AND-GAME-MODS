@@ -170,10 +170,13 @@ def test_startup_bulk_populates_never_load_icons_from_disk() -> None:
     assert seen == wanted
 
 
-def test_icons_default_on_in_gui_source() -> None:
+def test_icons_are_opt_in_and_remembered() -> None:
+    # Off for fresh installs; the toggle persists show_icons in the config, so
+    # anyone who clicked Show Icons in a previous session gets them back.
     source = (ROOT / "CrimsonSaveEditor" / "gui.py").read_text(encoding="utf-8-sig")
-    assert 'self._config.get("show_icons", True)' in source
-    assert 'self._config.get("show_icons", False)' not in source
+    assert 'self._config.get("show_icons", False)' in source
+    assert 'self._config.get("show_icons", True)' not in source
+    assert '_config["show_icons"] = self._icons_enabled' in source
 
 
 def test_spec_ships_without_the_icon_archive() -> None:
@@ -269,9 +272,9 @@ def test_download_ui_is_discoverable_with_progress() -> None:
                 ):
                     segment = ast.get_source_segment(source, child)
                     assert segment is not None
-                    assert "QProgressDialog" in segment, (
-                        "the download must show a progress dialog so it never "
-                        "looks frozen"
+                    assert "download_icons_with_progress(" in segment, (
+                        "the download must go through the shared progress "
+                        "dialog so it never looks frozen"
                     )
                     assert "QApplication.processEvents" not in segment
                     return

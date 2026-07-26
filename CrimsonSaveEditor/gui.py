@@ -2644,7 +2644,7 @@ class MainWindow(QMainWindow):
         browse_btn.setToolTip("Set save folder path")
         browse_btn.clicked.connect(self._browse_save_root)
         path_row.addWidget(browse_btn)
-        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
+        self._global_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
         self._global_icons_btn.setFixedHeight(22)
         self._global_icons_btn.setToolTip("Toggle item icons on all tabs")
         self._global_icons_btn.clicked.connect(self._toggle_icons)
@@ -4400,11 +4400,11 @@ QCheckBox::indicator {{
         top.addWidget(self._inv_group)
         self._inv_group.setVisible(False)
 
-        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", True) else "Show Icons")
+        self._show_icons_btn = QPushButton("Hide Icons" if self._config.get("show_icons", False) else "Show Icons")
         self._show_icons_btn.setToolTip("Download and display item icons (requires internet first time)")
         self._show_icons_btn.clicked.connect(self._toggle_icons)
         top.addWidget(self._show_icons_btn)
-        self._icons_enabled = self._config.get("show_icons", True)
+        self._icons_enabled = self._config.get("show_icons", False)
 
         layout.addLayout(top)
 
@@ -14544,39 +14544,15 @@ QCheckBox::indicator {{
         dialog closes. Use for every operation that can take more than a
         moment: injections, scans, exports.
         """
-        from crimson_common.gui_task_worker import start_gui_task
+        from crimson_common.progress_ui import run_blocking_task
 
-        progress = QProgressDialog(message, "", 0, 100, self)
-        progress.setWindowTitle(title)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
-
-        def _on_progress(text: str, value: int) -> None:
-            progress.setLabelText(text)
-            progress.setValue(max(0, min(99, int(value))))
-
-        def _on_completed(result) -> None:
-            progress.setValue(100)
-            progress.close()
-            completed(result)
-
-        def _on_failed(message_text: str, details: str) -> None:
-            progress.close()
-            if failed is not None:
-                failed(message_text, details)
-            else:
-                log.error("%s failed: %s\n%s", title, message_text, details)
-                QMessageBox.critical(self, title, f"{message_text}\n\n{details}")
-
-        start_gui_task(
+        run_blocking_task(
             self,
+            title=title,
+            message=message,
             task=task,
-            completed=_on_completed,
-            failed=_on_failed,
-            progress=_on_progress,
+            completed=completed,
+            failed=failed,
         )
 
     def _know_inject_keys(self, keys: list) -> None:
@@ -32611,53 +32587,22 @@ QCheckBox::indicator {{
             self._update_status("Icon download is already running")
             return
 
-        import threading as _threading
-        cancel_event = _threading.Event()
-
-        progress = QProgressDialog(
-            "Contacting GitHub for the icon list...", "Cancel", 0, 100, self
-        )
-        progress.setWindowTitle("Downloading Item Icons")
-        progress.setWindowModality(Qt.NonModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.canceled.connect(cancel_event.set)
-        progress.show()
-
-        def _on_progress(folder, downloaded, skipped, errors, total) -> None:
-            done = downloaded + skipped + errors
-            progress.setLabelText(
-                f"Downloading item icons [{folder}]\n"
-                f"{downloaded} downloaded, {skipped} cached, {errors} failed "
-                f"of {total}"
-            )
-            progress.setValue(min(99, int(done / max(1, total) * 100)))
+        from crimson_common.progress_ui import download_icons_with_progress
 
         def _on_finished(stats) -> None:
             self._icon_download_cancel = None
-            progress.setValue(100)
-            progress.close()
-            if stats.get('cancelled'):
-                self._update_status(
-                    f"Icon download cancelled after {stats['downloaded']} files; "
-                    "run it again anytime to resume"
-                )
-            else:
+            if not stats.get('cancelled'):
                 self._config.pop("icons_download_declined", None)
                 self._save_config()
-                self._update_status(
-                    f"Icons ready: {stats['downloaded']} downloaded, "
-                    f"{stats['skipped']} cached, {stats['errors']} failed"
-                )
             self._apply_icon_button_labels()
             self._start_icon_warm()
 
-        if self._icon_cache.bulk_download_async(
-            progress=_on_progress, completed=_on_finished, cancel_event=cancel_event
-        ):
-            self._icon_download_cancel = cancel_event
-        else:
-            progress.close()
+        self._icon_download_cancel = download_icons_with_progress(
+            self,
+            self._icon_cache,
+            status=self._update_status,
+            finished=_on_finished,
+        )
 
     def _on_icon_loaded(self, item_key: int, pixmap) -> None:
         self._icon_ready.emit(item_key)
