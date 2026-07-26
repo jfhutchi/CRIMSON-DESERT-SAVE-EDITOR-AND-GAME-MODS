@@ -3576,13 +3576,35 @@ QCheckBox::indicator {{
 
         self._quest_entries = []
         self._mission_entries = []
-        self._items = scan_items_smart(self._save_data.decompressed_blob)
+        save_data = self._save_data
+        blob = save_data.decompressed_blob
 
-        for item in self._items:
-            item.name = self._name_db.get_name(item.item_key)
-            item.category = self._name_db.get_category(item.item_key)
+        # Extraction re-parses the whole save; keep it off the GUI thread so a
+        # rescan after an edit shows progress instead of freezing the window.
+        def _task(report):
+            report("Scanning items...", 40)
+            items = scan_items_smart(blob)
+            report("Resolving item names...", 80)
+            for item in items:
+                item.name = self._name_db.get_name(item.item_key)
+                item.category = self._name_db.get_category(item.item_key)
+            return items
 
-        self._populate_scanned_items(incremental=True)
+        def _done(items) -> None:
+            if self._save_data is not save_data:
+                return
+            self._items = items
+            self._populate_scanned_items(incremental=True)
+
+        from crimson_common.progress_ui import run_blocking_task
+
+        run_blocking_task(
+            self,
+            title="Rescanning Save",
+            message="Rescanning items...",
+            task=_task,
+            completed=_done,
+        )
 
     def _populate_scanned_items(
         self,
