@@ -1,6 +1,11 @@
+import socket
 import sys
 import os
 from pathlib import Path
+
+# urlretrieve takes no timeout argument, so a stalled server would hang the
+# window forever. One default covers every download path in the app.
+socket.setdefaulttimeout(30)
 
 if not getattr(sys, "frozen", False):
     REPO_ROOT = Path(__file__).resolve().parents[1]
