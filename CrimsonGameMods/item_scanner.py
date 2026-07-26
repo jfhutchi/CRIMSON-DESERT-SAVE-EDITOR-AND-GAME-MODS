@@ -893,11 +893,20 @@ def _skip_inline_payload(blob: bytes, payload_start: int) -> int:
 
 
 _BAG_KEY_NAMES = {
-    1: "Equipment",
-    2: "General",
-    5: "Materials",
-    8: "Consumables",
-    14: "Housing",
+    1: "Money",
+    2: "Character",
+    3: "PearlUser",
+    4: "PearlCharacter",
+    5: "Quest",
+    6: "Wagon",
+    7: "PetAndVehicle",
+    8: "CampWarehouse",
+    9: "Warehouse",
+    10: "Bank",
+    11: "CampStraw",
+    12: "Recovery",
+    13: "Kuku",
+    14: "Invisible",
 }
 
 
@@ -924,6 +933,11 @@ def _item_from_child_fields(raw: bytes, child_fields, source: str, bag: str = ""
         except struct.error:
             continue
     if start is None or '_itemKey' not in values:
+        return None
+    # The editors write by fixed delta (_itemKey at +12, _stackCount at +18).
+    # Mercenary _equipItemList uses a different schema; surfacing those would
+    # let an edit land on the wrong bytes, so only emit editable records.
+    if offsets['_itemKey'] != start + 12:
         return None
     end = max(cf.end_offset for cf in child_fields if cf.present)
     enchant = values.get('_enchantLevel', 0)
@@ -1009,6 +1023,31 @@ def scan_items_from_parse(
                                 )
                                 if item:
                                     items.append(item)
+        elif obj.class_name == 'MercenaryClanSaveData':
+            for f in obj.fields:
+                if f.name != '_mercenaryDataList' or not f.list_elements:
+                    continue
+                for merc in f.list_elements:
+                    for cf in merc.child_fields or []:
+                        if not cf.list_elements or not cf.list_elements[0].child_fields:
+                            continue
+                        if not any(
+                            c.name == '_itemKey'
+                            for c in cf.list_elements[0].child_fields
+                        ):
+                            continue
+                        spans.append((
+                            cf.list_elements[0].start_offset,
+                            cf.list_elements[-1].end_offset,
+                        ))
+                        for elem in cf.list_elements:
+                            if not elem.child_fields:
+                                continue
+                            item = _item_from_child_fields(
+                                raw, elem.child_fields, "Mercenary"
+                            )
+                            if item:
+                                items.append(item)
     return items, spans
 
 
@@ -1037,7 +1076,13 @@ def scan_items_smart(data: bytes | bytearray, result=None) -> List[SaveItem]:
     def _covered(offset: int) -> bool:
         return any(start <= offset < end for start, end in spans)
 
-    merged = parsed + [item for item in legacy if not _covered(item.offset)]
+    # The parse tree is authoritative for the sources it actually produced;
+    # keeping legacy hits for those only re-adds pattern-scan false positives.
+    parsed_sources = {item.source for item in parsed}
+    merged = parsed + [
+        item for item in legacy
+        if not _covered(item.offset) and item.source not in parsed_sources
+    ]
     merged.sort(key=lambda item: item.offset)
     return merged
 

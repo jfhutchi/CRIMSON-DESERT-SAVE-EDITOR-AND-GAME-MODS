@@ -54,14 +54,17 @@ def test_current_patch_save_is_supported_and_writable(loaded) -> None:
 
 
 def test_smart_scan_extracts_the_complete_inventory(smart_items) -> None:
-    assert len(smart_items) == 1374, (
+    assert len(smart_items) == 1416, (
         "the pattern scanner alone surfaced 375 of these items"
+    )
+    assert all(i.parc_parsed for i in smart_items), (
+        "every item comes from the parse tree, not signature guessing"
     )
     from collections import Counter
 
     sources = Counter(i.source for i in smart_items)
     assert sources["Equipment"] == 19
-    assert sources["Mercenary"] == 215
+    assert sources["Mercenary"] == 259
     bags = dict(Counter(i.bag for i in smart_items if i.bag))
     assert bags == EXPECTED_BAGS
 
