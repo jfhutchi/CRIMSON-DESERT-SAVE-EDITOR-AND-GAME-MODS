@@ -67,6 +67,8 @@ a = Analysis(
         'crimson_common.blackstar_timer_worker',
         'crimson_common.blackstar_timer_ui',
         'crimson_common.crimson_theme',
+        'crimson_common.icon_cache',
+        'crimson_common.progress_ui',
         'crimson_common.crimson_icons',
         'crimson_common.crimson_shell',
         'crimson_common.gui_population',

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 from gui.theme import COLORS, CATEGORY_COLORS
 from gui.dialogs import ItemSearchDialog
-from icon_cache import ICON_SIZE
+from crimson_common.icon_cache import ICON_SIZE
 from gui.utils import make_scope_label, make_help_btn
 from i18n import tr
 

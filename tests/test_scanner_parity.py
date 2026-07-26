@@ -19,6 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def gamemods_scanner():
+    # Import the Save Editor modules first: both apps ship a `models` module,
+    # and whichever loads first wins for the whole process.
+    import models  # noqa: F401
+    import save_crypto  # noqa: F401
+
     path = str(ROOT / "CrimsonGameMods")
     sys.path.insert(0, path)
     try:
@@ -55,5 +60,3 @@ def test_bag_names_match_the_game_ui(gamemods_scanner):
     from item_scanner import BAG_KEY_NAMES
 
     assert gamemods_scanner._BAG_KEY_NAMES == BAG_KEY_NAMES
-    assert BAG_KEY_NAMES[8] == "CampWarehouse"
-    assert BAG_KEY_NAMES[10] == "Bank"

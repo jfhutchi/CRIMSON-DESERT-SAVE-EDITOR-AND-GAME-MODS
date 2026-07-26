@@ -48,7 +48,7 @@ try:
 except Exception:
     insert_item_to_inventory = insert_item_to_store = clone_block_section = insert_items_batch = None
 from updater import APP_VERSION, check_for_update, download_update, apply_update_and_restart
-from icon_cache import IconCache, ICON_SIZE
+from crimson_common.icon_cache import IconCache, ICON_SIZE
 from localization import tr, set_language, get_language, get_available_languages
 
 
@@ -3833,7 +3833,11 @@ QCheckBox::indicator {{
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
-                self._download_icons()
+                from crimson_common.progress_ui import download_icons_with_progress
+                download_icons_with_progress(
+                    self, self._icon_cache, status=self._update_status,
+                    finished=lambda _stats: self._start_icon_warm(),
+                )
         elif self._icons_enabled:
             self._start_icon_warm()
 
@@ -3850,17 +3854,6 @@ QCheckBox::indicator {{
         if hasattr(self, '_mercenary_tab'):
             self._mercenary_tab.set_icons_enabled(self._icons_enabled)
 
-
-    def _download_icons(self) -> None:
-        """Fetch the icon set behind a cancelable progress bar (shared helper)."""
-        from crimson_common.progress_ui import download_icons_with_progress
-
-        download_icons_with_progress(
-            self,
-            self._icon_cache,
-            status=self._update_status,
-            finished=lambda _stats: self._start_icon_warm(),
-        )
 
     def _start_icon_warm(self) -> None:
         """Decode cached icons off the GUI thread so tables paint instantly."""

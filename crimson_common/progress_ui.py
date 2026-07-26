@@ -73,11 +73,11 @@ def download_icons_with_progress(
     *,
     status: Optional[Callable[[str], None]] = None,
     finished: Optional[Callable] = None,
-) -> Optional[threading.Event]:
+) -> None:
     """Download the icon set on a worker pool behind a cancelable progress bar.
 
-    Returns the cancel event while a download is running, or None when one was
-    already in flight. The dialog is non-modal so the app stays usable.
+    IconCache refuses a second concurrent download itself; the dialog is
+    non-modal so the app stays usable.
     """
     cancel_event = threading.Event()
 
@@ -117,9 +117,7 @@ def download_icons_with_progress(
         if finished is not None:
             finished(stats)
 
-    if icon_cache.bulk_download_async(
+    if not icon_cache.bulk_download_async(
         progress=_on_progress, completed=_on_finished, cancel_event=cancel_event
     ):
-        return cancel_event
-    progress.close()
-    return None
+        progress.close()

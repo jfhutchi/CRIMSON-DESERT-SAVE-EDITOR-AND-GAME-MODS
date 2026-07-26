@@ -989,6 +989,14 @@ def _item_from_child_fields(raw: bytes, child_fields, source: str, bag: str = ""
     )
 
 
+# Owners that hold item records in nested per-entry lists. "Sold to Vendor"
+# matches the source name the Vendor tab filters on.
+_NESTED_ITEM_OWNERS = {
+    'MercenaryClanSaveData': ('_mercenaryDataList', 'Mercenary'),
+    'StoreSaveData': ('_storeDataList', 'Sold to Vendor'),
+}
+
+
 def scan_items_from_parse(
     data: bytes | bytearray,
     result,
@@ -1052,12 +1060,13 @@ def scan_items_from_parse(
                                 )
                                 if item:
                                     items.append(item)
-        elif obj.class_name == 'MercenaryClanSaveData':
+        elif obj.class_name in _NESTED_ITEM_OWNERS:
+            owner_list, source = _NESTED_ITEM_OWNERS[obj.class_name]
             for f in obj.fields:
-                if f.name != '_mercenaryDataList' or not f.list_elements:
+                if f.name != owner_list or not f.list_elements:
                     continue
-                for merc in f.list_elements:
-                    for cf in merc.child_fields or []:
+                for owner in f.list_elements:
+                    for cf in owner.child_fields or []:
                         if not cf.list_elements or not cf.list_elements[0].child_fields:
                             continue
                         if not any(
@@ -1073,7 +1082,7 @@ def scan_items_from_parse(
                             if not elem.child_fields:
                                 continue
                             item = _item_from_child_fields(
-                                raw, elem.child_fields, "Mercenary"
+                                raw, elem.child_fields, source
                             )
                             if item:
                                 items.append(item)
@@ -1085,8 +1094,9 @@ def scan_items_smart(data: bytes | bytearray, result=None) -> List[SaveItem]:
 
     The pattern scanner recognizes records by byte signature and misses most
     nested container items (32-77% coverage depending on save generation).
-    Legacy-scanned items outside the parsed containers (mercenary gear, vendor
-    blocks) are kept; on any parse failure the legacy result is returned.
+    Inventory, equipment, mercenary, and vendor items all come from the tree;
+    legacy hits are kept only for sources the tree did not produce, and on any
+    parse failure the legacy result is returned unchanged.
     """
     legacy = scan_items(data)
     if result is None:

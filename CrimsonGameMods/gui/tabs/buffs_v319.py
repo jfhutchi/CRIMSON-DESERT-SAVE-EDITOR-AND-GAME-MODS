@@ -83,7 +83,7 @@ from paz_patcher import (
     ItemBuffPatcher, ItemRecord, StatTriplet, BUFF_HASHES, BUFF_NAMES,
     ItemEffectPatcher,
 )
-from icon_cache import IconCache, ICON_SIZE
+from crimson_common.icon_cache import IconCache, ICON_SIZE
 
 try:
     from gui.utils import make_help_btn

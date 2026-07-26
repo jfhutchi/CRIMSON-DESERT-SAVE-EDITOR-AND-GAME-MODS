@@ -25,9 +25,9 @@ from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 
 EXPECTED_TABS = {
-    "All": 1416, "Equipment": 19, "Inventory": 204, "Quest": 122,
+    "All": 1662, "Equipment": 19, "Inventory": 204, "Quest": 122,
     "Camp Warehouse": 253, "Warehouse": 23, "Bank": 50, "Kuku": 165,
-    "Money": 15, "Mercenary": 259,
+    "Money": 15, "Mercenary": 259, "Vendor": 246,
 }
 
 
@@ -96,5 +96,5 @@ def test_window_fills_every_inventory_tab(editor_window) -> None:
 
 
 def test_window_shows_every_item_in_the_table(editor_window) -> None:
-    assert len(editor_window._items) == 1416
-    assert editor_window._inv_table.rowCount() == 1416
+    assert len(editor_window._items) == 1662
+    assert editor_window._inv_table.rowCount() == 1662

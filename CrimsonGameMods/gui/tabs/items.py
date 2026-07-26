@@ -29,7 +29,7 @@ except Exception:
 from gui.dialogs import ItemSearchDialog
 from item_db import ItemNameDB
 from localization import tr
-from icon_cache import ICON_SIZE
+from crimson_common.icon_cache import ICON_SIZE
 from gui.theme import COLORS, CATEGORY_COLORS
 from gui.utils import make_scope_label, make_help_btn, _num_item
 
@@ -497,7 +497,7 @@ class DatabaseBrowserTab(QWidget):
         self.status_message.emit(f"Downloading {needed} icons...")
         QApplication.processEvents()
 
-        from icon_cache import _GITHUB_ICON_BASE
+        from crimson_common.icon_cache import _GITHUB_ICON_BASE
         downloaded = 0
         errors = 0
         for i, key in enumerate(sorted(keys)):

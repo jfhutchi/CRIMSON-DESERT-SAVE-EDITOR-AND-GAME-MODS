@@ -54,7 +54,7 @@ try:
 except Exception:
     insert_item_to_inventory = insert_item_to_store = clone_block_section = insert_items_batch = None
 from updater import APP_VERSION, check_for_update, download_update, apply_update_and_restart
-from icon_cache import IconCache, ICON_SIZE
+from crimson_common.icon_cache import IconCache, ICON_SIZE
 from localization import tr, set_language, get_language, get_available_languages
 
 
@@ -11881,7 +11881,10 @@ QCheckBox::indicator {{
             dl.addWidget(copy_btn)
             dlg.exec()
 
-        self._run_blocking_task(
+        from crimson_common.progress_ui import run_blocking_task
+
+        run_blocking_task(
+            self,
             title="Cross-Slot Scan",
             message=f"Scanning save slots for quest {quest_key}...",
             task=_task,
@@ -14526,34 +14529,6 @@ QCheckBox::indicator {{
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Pack Error", str(e))
 
-    def _run_blocking_task(
-        self,
-        *,
-        title: str,
-        message: str,
-        task,
-        completed,
-        failed=None,
-    ) -> None:
-        """Run a long task off the GUI thread behind a modal busy dialog.
-
-        The WindowModal dialog blocks interaction, so save state cannot be
-        edited while the worker runs; ``task(report)`` executes on a worker
-        thread and ``completed``/``failed`` run on the GUI thread after the
-        dialog closes. Use for every operation that can take more than a
-        moment: injections, scans, exports.
-        """
-        from crimson_common.progress_ui import run_blocking_task
-
-        run_blocking_task(
-            self,
-            title=title,
-            message=message,
-            task=task,
-            completed=completed,
-            failed=failed,
-        )
-
     def _know_inject_keys(self, keys: list) -> None:
         self._know_status.setText(f"Injecting {len(keys)} entries...")
         save_data = self._save_data
@@ -14593,7 +14568,10 @@ QCheckBox::indicator {{
             self._know_status.setText(f"Error: {message}")
             QMessageBox.critical(self, "Error", message)
 
-        self._run_blocking_task(
+        from crimson_common.progress_ui import run_blocking_task
+
+        run_blocking_task(
+            self,
             title="Injecting Knowledge",
             message=f"Injecting {len(keys)} knowledge entries...",
             task=_task,
@@ -32582,21 +32560,16 @@ QCheckBox::indicator {{
         self._merc_refresh()
 
     def _bulk_download_icons(self) -> None:
-        if getattr(self, '_icon_download_cancel', None) is not None:
-            self._update_status("Icon download is already running")
-            return
-
         from crimson_common.progress_ui import download_icons_with_progress
 
         def _on_finished(stats) -> None:
-            self._icon_download_cancel = None
             if not stats.get('cancelled'):
                 self._config.pop("icons_download_declined", None)
                 self._save_config()
             self._apply_icon_button_labels()
             self._start_icon_warm()
 
-        self._icon_download_cancel = download_icons_with_progress(
+        download_icons_with_progress(
             self,
             self._icon_cache,
             status=self._update_status,

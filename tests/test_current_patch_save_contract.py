@@ -54,7 +54,7 @@ def test_current_patch_save_is_supported_and_writable(loaded) -> None:
 
 
 def test_smart_scan_extracts_the_complete_inventory(smart_items) -> None:
-    assert len(smart_items) == 1416, (
+    assert len(smart_items) == 1662, (
         "the pattern scanner alone surfaced 375 of these items"
     )
     assert all(i.parc_parsed for i in smart_items), (
@@ -65,6 +65,10 @@ def test_smart_scan_extracts_the_complete_inventory(smart_items) -> None:
     sources = Counter(i.source for i in smart_items)
     assert sources["Equipment"] == 19
     assert sources["Mercenary"] == 259
+    assert sources["Sold to Vendor"] == 246, (
+        "items sold to vendors live in StoreSaveData._storeSoldItemDataList "
+        "and feed the Vendor tab"
+    )
     bags = dict(Counter(i.bag for i in smart_items if i.bag))
     assert bags == EXPECTED_BAGS
 

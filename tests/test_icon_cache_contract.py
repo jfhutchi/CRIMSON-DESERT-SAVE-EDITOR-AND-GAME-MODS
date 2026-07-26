@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from icon_cache import IconCache  # noqa: E402
+from crimson_common.icon_cache import IconCache  # noqa: E402
 
 
 def _app() -> QApplication:
@@ -242,7 +242,7 @@ def test_bulk_download_runs_concurrently_and_supports_cancel(tmp_path: Path) -> 
     assert (tmp_path / "icons_mercenary" / "2.webp").is_file()
     assert progress, "progress callback must fire"
 
-    source = (ROOT / "CrimsonSaveEditor" / "icon_cache.py").read_text(
+    source = (ROOT / "crimson_common" / "icon_cache.py").read_text(
         encoding="utf-8-sig"
     )
     assert "ThreadPoolExecutor" in source, (
