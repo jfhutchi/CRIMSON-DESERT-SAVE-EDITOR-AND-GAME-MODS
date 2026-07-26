@@ -1130,6 +1130,16 @@ def enrich_items_with_parc(
         if progress_cb:
             progress_cb(step, TOTAL_STEPS)
 
+    # scan_items_smart already gives every item its exact field offsets and
+    # bag from the parse tree; re-deriving them here would run a second full
+    # parse (seconds) on whatever thread called us.
+    if items and all(item.parc_parsed and item.field_offsets for item in items):
+        _report(TOTAL_STEPS)
+        return len(items), (
+            f"PARC mode: {len(items)}/{len(items)} items enriched with exact "
+            "field offsets"
+        )
+
     parc_items, status = scan_items_parc(data)
     _report(1)
     if not parc_items:

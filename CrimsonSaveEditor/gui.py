@@ -13284,10 +13284,9 @@ QCheckBox::indicator {{
             import save_parser as sp
 
             self._waypoint_count.setText("Parsing save data...")
-            QApplication.processEvents()
 
             raw = self._save_data.decompressed_blob
-            result = sp.build_result_from_raw(bytes(raw), {'input_kind': 'raw_blob'})
+            result = self._get_parse_result()
 
             for obj in result['objects']:
                 if 'Discover' not in obj.class_name:
