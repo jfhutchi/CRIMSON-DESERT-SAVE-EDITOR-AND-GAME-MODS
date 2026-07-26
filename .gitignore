@@ -17,3 +17,6 @@ CrimsonGameMods/icons_local/
 .pi/
 CrimsonGameMods/_dmm_parser/
 .superpowers/
+
+# Claude Code local state
+.claude/
