@@ -1,4 +1,5 @@
 #include "save_parser_cpp.h"
+#include "save_keys.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -29,7 +30,6 @@ constexpr uint32_t NONCE_OFF = 0x1A;
 constexpr uint32_t NONCE_SIZE = 0x10;
 constexpr uint32_t HMAC_OFF = 0x2A;
 constexpr uint32_t HMAC_SIZE = 0x20;
-constexpr const char* DEFAULT_KEY_HEX = "9a4beb127f9e748b148d6690c25cc9379a315bd56c28af6319fd559f1152ac00";
 
 void ReportProgress(const ProgressCallback& progress, std::string stage, uint32_t current, uint32_t total) {
     if (progress) {
@@ -1619,7 +1619,9 @@ ParseResult ParseFile(const std::string& path, const std::string& key_hex, Progr
         throw std::runtime_error("SAVE payload size does not match file length");
     }
 
-    const std::vector<uint8_t> key = HexToBytes(key_hex.empty() ? DEFAULT_KEY_HEX : key_hex);
+    const std::vector<uint8_t> key = key_hex.empty()
+        ? SaveKeys::GenerateSaveKey(U16(blob, 0x04))
+        : HexToBytes(key_hex);
     if (key.size() != 32) {
         throw std::runtime_error("Save key must be 32 bytes");
     }
