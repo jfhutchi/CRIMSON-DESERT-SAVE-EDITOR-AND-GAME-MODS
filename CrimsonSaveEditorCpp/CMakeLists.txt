@@ -11,6 +11,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(BUILD_GUI "Build Qt GUI editor" OFF)
+include(CTest)
 
 if(BUILD_GUI)
     set(CMAKE_AUTOMOC ON)
@@ -85,6 +86,19 @@ add_library(save_writer STATIC
 )
 target_include_directories(save_writer PUBLIC src)
 target_link_libraries(save_writer PUBLIC bcrypt lz4_lib)
+
+if(BUILD_TESTING)
+    add_executable(save_container_tests tests/save_container_tests.cpp)
+    target_link_libraries(save_container_tests PRIVATE save_writer save_parser_core)
+    foreach(version IN ITEMS 1 2)
+        add_test(NAME save_container_v${version}
+            COMMAND save_container_tests ${version}
+                "${CMAKE_CURRENT_BINARY_DIR}/container-v${version}.save")
+    endforeach()
+    add_test(NAME save_container_unsupported
+        COMMAND save_container_tests unsupported
+            "${CMAKE_CURRENT_BINARY_DIR}/container-unsupported.save")
+endif()
 
 # parc_dump â€” CLI save tree dumper
 add_executable(parc_dump src/parc_dump.cpp)
