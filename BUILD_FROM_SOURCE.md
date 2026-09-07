@@ -20,10 +20,19 @@ python -m PyInstaller CrimsonGameMods.spec --noconfirm
 :: Build Save Editor
 cd ..\CrimsonSaveEditor
 python -m PyInstaller CrimsonSaveEditor.spec --noconfirm
-:: Output: CrimsonSaveEditor\dist\CrimsonSaveEditor.exe
+:: Output: CrimsonSaveEditor\dist\CrimsonSaveEditorStandalone.exe
 ```
 
 Or use `build.bat` inside `CrimsonGameMods/` — it clears caches and runs PyInstaller for you.
+
+The Python Save Editor's save validation and writes use `parc_parser.dll`. When
+changing native code, build `CrimsonSaveEditorCpp` first (see its README), then
+copy `CrimsonSaveEditorCpp/build/Release/parc_parser.dll` into
+`CrimsonSaveEditor/parc_parser.dll` before packaging. The spec bundles that file;
+it does not rebuild the DLL. Do not commit generated DLLs as part of a source fix.
+
+For synthetic Python/C++ regression tests and real DLL integration checks, see
+`TESTING.md`. These checks do not require a game installation.
 
 ## Linux / SteamOS
 
