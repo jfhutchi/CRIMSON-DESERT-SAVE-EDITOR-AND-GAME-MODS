@@ -159,7 +159,9 @@ class NativeSaveBackend:
             if out_json:
                 dll.parc_free(out_json)
 
-        if return_code != 0 or not result.get("ok", False):
+        if not isinstance(result, dict):
+            raise NativeBackendError("Invalid response from native backend: expected a JSON object")
+        if return_code != 0 or result.get("ok") is not True:
             error = result.get("error")
             if not error:
                 errors = result.get("errors") or []
@@ -204,7 +206,6 @@ class NativeSaveBackend:
             prefix=".cse_validated_", suffix=".save", dir=output_dir
         )
         os.close(handle)
-        os.unlink(temp_path)
 
         out_json = ctypes.c_char_p()
         out_size = ctypes.c_uint32()
@@ -218,6 +219,12 @@ class NativeSaveBackend:
                 ctypes.byref(out_size),
             )
             result = self._decode_result(code, out_json, out_size)
+            # A native stream close alone does not make the candidate durable.
+            # Flush the reopened file before replacing the user's destination.
+            with open(temp_path, "r+b") as candidate:
+                if os.fstat(candidate.fileno()).st_size == 0:
+                    raise NativeBackendError("Native backend produced an empty candidate")
+                os.fsync(candidate.fileno())
             os.replace(temp_path, output)
             result["output_path"] = output
             return result
