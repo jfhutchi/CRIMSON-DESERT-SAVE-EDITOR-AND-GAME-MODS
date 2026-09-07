@@ -3,6 +3,8 @@ import importlib.util
 import ctypes
 import os
 import struct
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,3 +92,44 @@ def test_direct_dll_in_place_write(bridge, crypto, tmp_path, invalid):
         assert backend._decode_result(code, result_json, result_size)["ok"] is True
         assert bytes(crypto.load_save_file(str(destination)).decompressed_blob) == edited
     assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("entry", ["parc_parse_file", "parc_parse_raw_file", "parc_parse_blob"])
+def test_legacy_exports_reject_null_output_pointers(bridge, tmp_path, entry):
+    _, backend = bridge
+    # Isolate a native access violation so it cannot take down the test runner.
+    script = '''
+import ctypes, sys
+ctypes.windll.kernel32.SetErrorMode(3)
+dll = ctypes.CDLL(sys.argv[1])
+name = sys.argv[2]
+function = getattr(dll, name)
+if name == "parc_parse_file": code = function(b"missing.save", None, None, None)
+elif name == "parc_parse_raw_file": code = function(b"missing.bin", None, None)
+else: code = function(None, 0, None, None)
+assert code == -2, code
+'''
+    env = dict(os.environ, TEMP=str(tmp_path), TMP=str(tmp_path))
+    result = subprocess.run([sys.executable, "-c", script, backend.dll_path, entry],
+        env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_legacy_blob_parse_failure_cleans_temporary_file(bridge, tmp_path, monkeypatch):
+    _, backend = bridge
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.setenv("TMP", str(tmp_path))
+    function = backend._dll.parc_parse_blob
+    function.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32)]
+    buffer = (ctypes.c_uint8 * 3)(1, 2, 3)
+    result_json, result_size = ctypes.c_char_p(), ctypes.c_uint32()
+    code = function(buffer, 3, ctypes.byref(result_json), ctypes.byref(result_size))
+    try:
+        assert code != 0
+        assert result_json
+    finally:
+        if result_json:
+            backend._dll.parc_free(result_json)
+    assert list(tmp_path.iterdir()) == []

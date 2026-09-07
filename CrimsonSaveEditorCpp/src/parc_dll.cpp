@@ -219,23 +219,13 @@ EXPORT int parc_parse_file(
     char** out_json,
     uint32_t* out_size
 ) {
+    if (!out_json || !out_size) return -2;
     try {
-        auto result = SaveParserCpp::ParseFile(
-            file_path,
-            key_hex ? key_hex : ""
-        );
-        std::string json = SaveParserCpp::ToJson(result);
-        *out_size = static_cast<uint32_t>(json.size());
-        *out_json = static_cast<char*>(std::malloc(json.size() + 1));
-        if (!*out_json) return -1;
-        std::memcpy(*out_json, json.c_str(), json.size() + 1);
-        return 0;
-    } catch (const std::exception& e) {
-        std::string err = std::string("{\"error\":\"") + e.what() + "\"}";
-        *out_size = static_cast<uint32_t>(err.size());
-        *out_json = static_cast<char*>(std::malloc(err.size() + 1));
-        if (*out_json) std::memcpy(*out_json, err.c_str(), err.size() + 1);
-        return -1;
+        if (!file_path || !*file_path) throw std::runtime_error("Save path is empty");
+        auto result = SaveParserCpp::ParseFile(file_path, key_hex ? key_hex : "");
+        return ReturnJson(SaveParserCpp::ToJson(result), out_json, out_size);
+    } catch (const std::exception& error) {
+        return ReturnError(error, out_json, out_size);
     }
 }
 
@@ -244,20 +234,13 @@ EXPORT int parc_parse_raw_file(
     char** out_json,
     uint32_t* out_size
 ) {
+    if (!out_json || !out_size) return -2;
     try {
+        if (!file_path || !*file_path) throw std::runtime_error("Raw save path is empty");
         auto result = SaveParserCpp::ParseRawFile(file_path);
-        std::string json = SaveParserCpp::ToJson(result);
-        *out_size = static_cast<uint32_t>(json.size());
-        *out_json = static_cast<char*>(std::malloc(json.size() + 1));
-        if (!*out_json) return -1;
-        std::memcpy(*out_json, json.c_str(), json.size() + 1);
-        return 0;
-    } catch (const std::exception& e) {
-        std::string err = std::string("{\"error\":\"") + e.what() + "\"}";
-        *out_size = static_cast<uint32_t>(err.size());
-        *out_json = static_cast<char*>(std::malloc(err.size() + 1));
-        if (*out_json) std::memcpy(*out_json, err.c_str(), err.size() + 1);
-        return -1;
+        return ReturnJson(SaveParserCpp::ToJson(result), out_json, out_size);
+    } catch (const std::exception& error) {
+        return ReturnError(error, out_json, out_size);
     }
 }
 
@@ -267,32 +250,12 @@ EXPORT int parc_parse_blob(
     char** out_json,
     uint32_t* out_size
 ) {
+    if (!out_json || !out_size) return -2;
     try {
-        // Write blob to temp file and parse it (reuse existing file-based parser)
-        char temp_path[MAX_PATH];
-        GetTempPathA(MAX_PATH, temp_path);
-        std::string temp_file = std::string(temp_path) + "parc_dll_temp.bin";
-
-        {
-            std::ofstream ofs(temp_file, std::ios::binary);
-            ofs.write(reinterpret_cast<const char*>(blob_data), blob_size);
-        }
-
-        auto result = SaveParserCpp::ParseRawFile(temp_file);
-        DeleteFileA(temp_file.c_str());
-
-        std::string json = SaveParserCpp::ToJson(result);
-        *out_size = static_cast<uint32_t>(json.size());
-        *out_json = static_cast<char*>(std::malloc(json.size() + 1));
-        if (!*out_json) return -1;
-        std::memcpy(*out_json, json.c_str(), json.size() + 1);
-        return 0;
-    } catch (const std::exception& e) {
-        std::string err = std::string("{\"error\":\"") + e.what() + "\"}";
-        *out_size = static_cast<uint32_t>(err.size());
-        *out_json = static_cast<char*>(std::malloc(err.size() + 1));
-        if (*out_json) std::memcpy(*out_json, err.c_str(), err.size() + 1);
-        return -1;
+        auto result = ParseRawBytes(blob_data, blob_size);
+        return ReturnJson(SaveParserCpp::ToJson(result), out_json, out_size);
+    } catch (const std::exception& error) {
+        return ReturnError(error, out_json, out_size);
     }
 }
 
