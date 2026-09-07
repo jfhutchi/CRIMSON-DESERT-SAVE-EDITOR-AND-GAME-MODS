@@ -14405,7 +14405,8 @@ QCheckBox::indicator {{
                 nonlocal result
                 try:
                     from parc_inserter3 import inject_knowledge_fast
-                    result = inject_knowledge_fast(bytearray(source_blob), keys_filter=inject_keys)
+                    ok, new_blob, msg = inject_knowledge_fast(bytearray(source_blob), keys_filter=inject_keys)
+                    result = (ok, new_blob, msg)
                 except Exception as e:
                     result = (False, None, str(e))
                 finally:

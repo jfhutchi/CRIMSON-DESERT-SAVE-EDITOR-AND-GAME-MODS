@@ -90,3 +90,14 @@ def test_success_refreshes_offsets_and_invalidates_old_undo(job):
     assert job.owner._know_learned_keys == {1}
     job.owner._scan_and_populate.assert_called_once()
     assert job.owner._undo_stack == []
+
+
+def test_malformed_worker_result_reports_failure_without_mutating_save(job):
+    sys.modules["parc_inserter3"].inject_knowledge_fast = lambda *args, **kwargs: None
+    job.start()
+    job.workers.pop()()
+    job.timers.pop()()
+    job.dialogs.critical.assert_called_once()
+    assert job.owner._save_data.decompressed_blob == b"source"
+    assert not job.owner._dirty
+    assert not job.owner._fast_inject_active
