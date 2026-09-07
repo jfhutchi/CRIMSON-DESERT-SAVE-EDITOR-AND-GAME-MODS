@@ -17,7 +17,7 @@ def native():
     return module
 
 
-def bridge_with_result(native, result, code=0):
+def bridge_with_result(native, result, code=0, candidate=b"candidate"):
     bridge = native.NativeSaveBackend.__new__(native.NativeSaveBackend)
     dll = Mock()
     bridge._dll = dll
@@ -25,7 +25,8 @@ def bridge_with_result(native, result, code=0):
     buffer = ctypes.create_string_buffer(payload)
 
     def write(source, blob, size, output, out_json, out_size):
-        Path(output.decode()).write_bytes(b"candidate")
+        if candidate is not None:
+            Path(output.decode()).write_bytes(candidate)
         ctypes.cast(out_json, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(buffer)
         ctypes.cast(out_size, ctypes.POINTER(ctypes.c_uint32))[0] = len(payload)
         return code
@@ -33,6 +34,18 @@ def bridge_with_result(native, result, code=0):
     dll.parc_write_validated_save.side_effect = write
     dll._result_buffer = buffer
     return bridge, dll
+
+
+@pytest.mark.parametrize("candidate", [None, b""])
+def test_success_without_output_preserves_destination(native, tmp_path, candidate):
+    bridge, dll = bridge_with_result(native, {"ok": True}, candidate=candidate)
+    destination = tmp_path / "save.save"
+    destination.write_bytes(b"original")
+    with pytest.raises(native.NativeBackendError, match="empty candidate"):
+        bridge.write_validated_save(destination, b"blob", destination)
+    assert destination.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [destination]
+    dll.parc_free.assert_called_once()
 
 
 @pytest.mark.parametrize("result", [[], None, {"ok": "false"}, {"ok": 1}, {"ok": False}])

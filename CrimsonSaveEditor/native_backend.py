@@ -222,6 +222,8 @@ class NativeSaveBackend:
             # A native stream close alone does not make the candidate durable.
             # Flush the reopened file before replacing the user's destination.
             with open(temp_path, "r+b") as candidate:
+                if os.fstat(candidate.fileno()).st_size == 0:
+                    raise NativeBackendError("Native backend produced an empty candidate")
                 os.fsync(candidate.fileno())
             os.replace(temp_path, output)
             result["output_path"] = output
