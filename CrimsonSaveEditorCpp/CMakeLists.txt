@@ -95,6 +95,9 @@ if(BUILD_TESTING)
             COMMAND save_container_tests ${version}
                 "${CMAKE_CURRENT_BINARY_DIR}/container-v${version}.save")
     endforeach()
+    add_test(NAME save_container_unsupported
+        COMMAND save_container_tests unsupported
+            "${CMAKE_CURRENT_BINARY_DIR}/container-unsupported.save")
 endif()
 
 # parc_dump â€” CLI save tree dumper

@@ -1619,9 +1619,9 @@ ParseResult ParseFile(const std::string& path, const std::string& key_hex, Progr
         throw std::runtime_error("SAVE payload size does not match file length");
     }
 
-    const std::vector<uint8_t> key = key_hex.empty()
-        ? SaveKeys::GenerateSaveKey(U16(blob, 0x04))
-        : HexToBytes(key_hex);
+    // Validate the version even when a diagnostic caller supplies a custom key.
+    const auto version_key = SaveKeys::GenerateSaveKey(U16(blob, 0x04));
+    const std::vector<uint8_t> key = key_hex.empty() ? version_key : HexToBytes(key_hex);
     if (key.size() != 32) {
         throw std::runtime_error("Save key must be 32 bytes");
     }
