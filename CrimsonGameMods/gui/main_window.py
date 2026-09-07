@@ -3303,8 +3303,7 @@ QCheckBox::indicator {{
             item.name = self._name_db.get_name(item.item_key)
             item.category = self._name_db.get_category(item.item_key)
 
-        self._fix_duplicate_item_nos()
-
+        # Loading and rescanning must not rewrite item IDs or mark the save dirty.
         self._loaded_tabs.clear()
 
         self._status_parc_label.hide()
