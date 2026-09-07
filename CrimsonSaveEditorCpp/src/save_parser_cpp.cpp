@@ -1242,22 +1242,23 @@ SchemaInfo ParseSchema(const std::vector<uint8_t>& raw, const ProgressCallback& 
 
 TocInfo ParseToc(const std::vector<uint8_t>& raw, uint32_t schema_end, const std::vector<std::string>& type_names, const ProgressCallback& progress) {
     TocInfo out;
-    if (schema_end + 12 > raw.size()) {
-        out.stream_size = static_cast<uint32_t>(raw.size());
-        return out;
+    if (schema_end > raw.size() || raw.size() - schema_end < 12) {
+        throw std::runtime_error("Truncated PARC TOC header");
     }
 
     out.prefix_zero = U32(raw, schema_end);
     out.entry_count = U32(raw, schema_end + 4);
     out.stream_size = U32(raw, schema_end + 8);
     const uint32_t toc_start = schema_end + 12;
+    if (out.entry_count > (raw.size() - toc_start) / 20) {
+        throw std::runtime_error("PARC TOC entry count exceeds the available table bytes");
+    }
+    const uint64_t toc_end = static_cast<uint64_t>(toc_start) +
+        static_cast<uint64_t>(out.entry_count) * 20;
     out.entries.reserve(out.entry_count);
 
     for (uint32_t index = 0; index < out.entry_count; ++index) {
         const uint32_t entry_off = toc_start + index * 20;
-        if (entry_off + 20 > raw.size()) {
-            break;
-        }
         TocEntry entry;
         entry.index = index;
         entry.class_index = U32(raw, entry_off);
@@ -1267,6 +1268,13 @@ TocInfo ParseToc(const std::vector<uint8_t>& raw, uint32_t schema_end, const std
         entry.data_offset = U32(raw, entry_off + 12);
         entry.data_size = U32(raw, entry_off + 16);
         entry.entry_offset = entry_off;
+        if (entry.class_index >= type_names.size()) {
+            throw std::runtime_error("PARC TOC entry " + std::to_string(index) + " has an invalid class index");
+        }
+        if (entry.data_offset < toc_end || entry.data_offset > raw.size() ||
+            entry.data_size > raw.size() - entry.data_offset) {
+            throw std::runtime_error("PARC TOC entry " + std::to_string(index) + " has an invalid object range");
+        }
         out.entries.push_back(std::move(entry));
         if (((index + 1) % 32u) == 0 || (index + 1) == out.entry_count) {
             ReportProgress(progress, "Parsing TOC", index + 1, out.entry_count);
@@ -1301,9 +1309,9 @@ std::vector<ObjectBlock> DecodeObjectBlocks(
         }
         const auto& type_def = *it->second;
         const uint32_t block_start = entry.data_offset;
-        const uint32_t block_end = std::min<uint32_t>(static_cast<uint32_t>(raw.size()), entry.data_offset + entry.data_size);
-        if (block_end <= block_start || block_start + 2 > block_end) {
-            continue;
+        const uint32_t block_end = entry.data_offset + entry.data_size;
+        if (entry.data_size < 2) {
+            throw std::runtime_error("Truncated PARC object header at TOC entry " + std::to_string(entry_index));
         }
 
         const uint16_t expected_mask_bytes = static_cast<uint16_t>(std::max<uint32_t>(1, (static_cast<uint32_t>(type_def.fields.size()) + 7) / 8));
@@ -1319,7 +1327,7 @@ std::vector<ObjectBlock> DecodeObjectBlocks(
 
         const uint32_t header_end = block_start + 2 + mask_byte_count + 4;
         if (header_end > block_end) {
-            continue;
+            throw std::runtime_error("Truncated PARC object mask at TOC entry " + std::to_string(entry_index));
         }
 
         std::vector<uint8_t> mask_bytes(raw.begin() + block_start + 2, raw.begin() + block_start + 2 + mask_byte_count);
