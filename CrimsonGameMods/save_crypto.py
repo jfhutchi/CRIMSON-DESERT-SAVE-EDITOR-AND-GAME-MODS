@@ -236,7 +236,7 @@ def write_save_file(
         header[:0x12] = original_header[:0x12]
 
     header[0:4] = b"SAVE"
-    struct.pack_into("<H", header, VERSION_OFFSET, 2)
+    struct.pack_into("<H", header, VERSION_OFFSET, version)
     struct.pack_into("<H", header, FLAGS_OFFSET, 0x0080)
 
     struct.pack_into("<I", header, UNCOMP_SIZE_OFFSET, len(edited_blob))
