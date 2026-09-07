@@ -11,6 +11,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(BUILD_GUI "Build Qt GUI editor" OFF)
+include(CTest)
 
 if(BUILD_GUI)
     set(CMAKE_AUTOMOC ON)
@@ -93,6 +94,17 @@ target_link_libraries(parc_dump PRIVATE save_parser_core)
 # PARC serializer (full reserialize from tree)
 add_library(parc_serializer STATIC src/parc_serializer.cpp)
 target_include_directories(parc_serializer PUBLIC src)
+
+if(BUILD_TESTING)
+    add_executable(parc_bounds_tests tests/parc_bounds_tests.cpp)
+    target_link_libraries(parc_bounds_tests PRIVATE save_parser_core parc_serializer)
+    foreach(scenario IN ITEMS roundtrip missing_header truncated_table invalid_class
+            out_of_bounds wrapped_range overlapping_table truncated_object)
+        add_test(NAME parc_bounds_${scenario}
+            COMMAND parc_bounds_tests ${scenario}
+                "${CMAKE_CURRENT_BINARY_DIR}/bounds-${scenario}.bin")
+    endforeach()
+endif()
 
 # Item factory (construct items from scratch)
 add_library(item_factory STATIC src/item_factory.cpp)
