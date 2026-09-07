@@ -14346,6 +14346,9 @@ QCheckBox::indicator {{
         self._know_inject_keys(all_keys)
 
     def _know_inject_pack_fast(self) -> None:
+        if getattr(self, "_fast_inject_active", False):
+            self._know_status.setText("A knowledge injection is already running. Please wait...")
+            return
         if not self._save_data:
             QMessageBox.warning(self, "Knowledge", "Load a save first.")
             return
@@ -14387,40 +14390,53 @@ QCheckBox::indicator {{
             if reply != QMessageBox.Yes:
                 return
 
-            self._know_status.setText(f"Fast injecting {len(to_inject)} entries...")
-            QApplication.processEvents()
-
             import threading
 
-            self._fast_inject_keys = to_inject
-            self._fast_inject_done = False
-            self._fast_inject_result = (False, None, "")
+            source_save = self._save_data
+            source_path = self._loaded_path
+            source_blob = bytes(source_save.decompressed_blob)
+            inject_keys = tuple(to_inject)
+            finished = threading.Event()
+            result = (False, None, "")
+            self._fast_inject_active = True
+            self._know_status.setText(f"Fast injecting {len(to_inject)} entries...")
 
             def _do_fast_inject():
+                nonlocal result
                 try:
                     from parc_inserter3 import inject_knowledge_fast
-                    blob = bytearray(self._save_data.decompressed_blob)
-                    ok, new_blob, msg = inject_knowledge_fast(blob, keys_filter=self._fast_inject_keys)
-                    self._fast_inject_result = (ok, new_blob, msg)
+                    ok, new_blob, msg = inject_knowledge_fast(bytearray(source_blob), keys_filter=inject_keys)
+                    result = (ok, new_blob, msg)
                 except Exception as e:
-                    self._fast_inject_result = (False, None, str(e))
-                self._fast_inject_done = True
+                    result = (False, None, str(e))
+                finally:
+                    finished.set()
 
             thread = threading.Thread(target=_do_fast_inject, daemon=True)
             thread.start()
 
             from PySide6.QtCore import QTimer
             def _check_done():
-                if not self._fast_inject_done:
+                if not finished.is_set():
                     self._know_status.setText(f"Fast injecting {len(to_inject)} entries... (working)")
                     QTimer.singleShot(200, _check_done)
                     return
 
-                ok, new_blob, msg = self._fast_inject_result
+                self._fast_inject_active = False
+                if (self._save_data is not source_save or self._loaded_path != source_path
+                        or bytes(source_save.decompressed_blob) != source_blob):
+                    self._know_status.setText(
+                        "Discarded knowledge result because the loaded save changed. Run the operation again.")
+                    return
+
+                ok, new_blob, msg = result
                 if ok and new_blob is not None:
-                    self._save_data.decompressed_blob = bytearray(new_blob)
+                    source_save.decompressed_blob = bytearray(new_blob)
                     self._dirty = True
-                    self._know_learned_keys.update(self._fast_inject_keys)
+                    # Structural insertion invalidates offsets in the old undo patches.
+                    self._undo_stack.clear()
+                    self._scan_and_populate()
+                    self._know_learned_keys.update(inject_keys)
                     self._know_all_entries = [
                         (k, n, c, k in self._know_learned_keys, d)
                         for k, n, c, _, d in self._know_all_entries
@@ -14430,7 +14446,7 @@ QCheckBox::indicator {{
                         f"{msg} | {learned_count}/{len(self._know_all_entries)} learned")
                     QMessageBox.information(self, "Fast Inject Complete",
                         f"{msg}\n\nSave (Ctrl+S) for changes to take effect.\n"
-                        f"Table will refresh when you switch tabs.")
+                        "Item offsets were refreshed; previous undo history was cleared.")
                 else:
                     self._know_status.setText(f"Failed: {msg}")
                     QMessageBox.critical(self, "Injection Failed", msg)
@@ -14438,6 +14454,7 @@ QCheckBox::indicator {{
             QTimer.singleShot(200, _check_done)
 
         except Exception as e:
+            self._fast_inject_active = False
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Pack Error", str(e))
 
