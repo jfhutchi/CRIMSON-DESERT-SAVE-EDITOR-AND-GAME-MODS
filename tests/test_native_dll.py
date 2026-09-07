@@ -3,6 +3,7 @@ import importlib.util
 import ctypes
 import os
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -107,6 +108,54 @@ def test_direct_dll_in_place_write(bridge, crypto, tmp_path, invalid):
         assert backend._decode_result(code, result_json, result_size)["ok"] is True
         assert bytes(crypto.load_save_file(str(destination)).decompressed_blob) == edited
     assert list(tmp_path.iterdir()) == [destination]
+
+@pytest.mark.parametrize("null_output", ["out_json", "out_size", "both"])
+def test_direct_dll_rejects_null_output_pointers(bridge, crypto, tmp_path, null_output):
+    _, backend = bridge
+    source = tmp_path / "source.save"
+    crypto.write_save_file(str(source), raw_blob())
+    original_source = source.read_bytes()
+    destination = tmp_path / "destination.save"
+    original_destination = b"original destination"
+    destination.write_bytes(original_destination)
+    # Isolate access violations from malformed C ABI calls from the pytest process.
+    script = '''
+import ctypes
+import os
+import sys
+
+ctypes.windll.kernel32.SetErrorMode(3)
+dll = ctypes.CDLL(sys.argv[1])
+write = dll.parc_write_validated_save
+write.argtypes = [
+    ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32),
+]
+write.restype = ctypes.c_int
+blob = bytes.fromhex(sys.argv[5])
+buffer = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
+out_json, out_size = ctypes.c_char_p(), ctypes.c_uint32(123)
+null_output = sys.argv[4]
+code = write(
+    os.fsencode(sys.argv[2]), buffer, len(blob), os.fsencode(sys.argv[3]),
+    None if null_output in ("out_json", "both") else ctypes.byref(out_json),
+    None if null_output in ("out_size", "both") else ctypes.byref(out_size),
+)
+assert code == -2, code
+assert not out_json, "Invalid output pointers must not receive an allocation"
+assert out_size.value == 123, "Invalid output pointers must leave outputs untouched"
+'''
+    env = dict(os.environ, TEMP=str(tmp_path), TMP=str(tmp_path))
+    result = subprocess.run(
+        [sys.executable, "-c", script, backend.dll_path, str(source),
+         str(destination), null_output, raw_blob().hex()],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, f"Child exited {result.returncode}: {result.stderr}"
+    assert source.read_bytes() == original_source
+    assert destination.read_bytes() == original_destination
+    assert set(tmp_path.iterdir()) == {source, destination}
+
 
 @pytest.mark.parametrize("in_place", [False, True])
 def test_direct_dll_replacement_failure_preserves_destination(bridge, crypto, tmp_path, in_place):
