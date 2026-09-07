@@ -88,6 +88,13 @@ target_include_directories(save_writer PUBLIC src)
 target_link_libraries(save_writer PUBLIC bcrypt lz4_lib)
 
 if(BUILD_TESTING)
+    add_executable(save_write_transaction_tests tests/save_write_transaction_tests.cpp)
+    target_link_libraries(save_write_transaction_tests PRIVATE save_writer)
+    foreach(kind IN ITEMS raw save validation long_name)
+        add_test(NAME save_write_transaction_${kind}
+            COMMAND save_write_transaction_tests ${kind}
+                "${CMAKE_CURRENT_BINARY_DIR}/write-transaction-${kind}")
+    endforeach()
     add_executable(save_container_tests tests/save_container_tests.cpp)
     target_link_libraries(save_container_tests PRIVATE save_writer save_parser_core)
     foreach(version IN ITEMS 1 2)
